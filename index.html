@@ -180,11 +180,11 @@
       <div class="filters">
         <div>
           <label>Статус</label>
-          <select id="filterStatus" onchange="renderOrdersGrid()"><option value="">Все статусы</option></select>
+          <select id="filterStatus" onchange="window.onOrdersFilterChange()"><option value="">Все статусы</option></select>
         </div>
         <div>
           <label>Поиск (№ заявки, контрагент, клиент, артикул, телефон)</label>
-          <input type="text" id="filterSearch" placeholder="Начните вводить…" oninput="renderOrdersGrid()" onkeydown="if(event.key==='Enter') renderOrdersGrid()">
+          <input type="text" id="filterSearch" placeholder="Начните вводить…" oninput="window.onOrdersFilterChange()" onkeydown="if(event.key==='Enter') applyOrdersFilter()">
         </div>
         <div>
           <label>&nbsp;</label>
@@ -192,6 +192,7 @@
         </div>
       </div>
       <div id="ordersGrid"></div>
+      <div class="btn-row" id="ordersPager" style="align-items:center; justify-content:center; gap:14px;"></div>
       <div class="btn-row">
         <button class="btn" id="ordersSaveBtn" onclick="saveOrdersChanges()" disabled>💾 Сохранить изменения</button>
         <span class="hint" id="ordersSaveHint">Все изменения сохранены</span>
@@ -416,6 +417,13 @@ const API_KEY_KEY = 'crm_google_api_key';
 
 let STATE = { statuses: JSON.parse(JSON.stringify(DEFAULT_STATUSES)), orders: [], sellerPayments: [] };
 let ORDERS_GRID = null, PRICE_GRID = null, REPORT_GRID = null, DEBT_GRID = null, DEBT_PAYMENTS_GRID = null;
+// Grid.js's own pagination turned out to lose track of the current page across data updates in
+// practice (see renderGridInto's comment) even after two attempts to make it behave. Orders is the
+// one grid people edit constantly while paging through it, so it gets its own, fully manual
+// pagination instead: we slice the filtered/sorted array ourselves and hand Grid.js only the
+// current page's rows with pagination:false -- no more relying on any internal Grid.js page state.
+let ordersPage = 0; // 0-indexed
+const ORDERS_PAGE_SIZE = 12;
 let STATS_WEEK_KEY = null; // "isoYear-isoWeek" of the week selected in the dashboard; null = current week
 let accessToken = null, tokenClient = null;
 
@@ -441,8 +449,21 @@ function destroyGrid(gridInstance){
 // to refresh a grid and avoids whatever stale internal state destroy()+new was leaving behind.
 // Pass `null` as gridInstance the first time (or right after showing an empty-state placeholder,
 // which must also null out the caller's reference) to create it.
+//
+// `pagination.resetPageOnUpdate:false` (set by callers below) turned out not to be enough on its
+// own -- Grid.js's current page lives inside the Pagination sub-component's own internal Preact
+// state, not something updateConfig() reliably feeds back on every version. So on top of that
+// flag, read the actually-displayed page number straight from the DOM (the active page button
+// gets the class "gridjs-currentPage") before re-rendering, and pass it back explicitly as
+// pagination.page -- that way a status/logistics/etc. edit can never visibly bounce you back to
+// page 1, regardless of whether the internal flag alone would have prevented it.
 function renderGridInto(gridInstance, container, config){
   if(gridInstance){
+    if(config.pagination && typeof config.pagination === 'object'){
+      const activeBtn = container.querySelector('.gridjs-currentPage');
+      const pageNum = activeBtn ? parseInt((activeBtn.textContent||'').trim(), 10) : NaN;
+      if(!isNaN(pageNum) && pageNum > 0) config.pagination = Object.assign({}, config.pagination, { page: pageNum - 1 });
+    }
     gridInstance.updateConfig(config).forceRender();
     return gridInstance;
   }
@@ -719,6 +740,8 @@ async function refreshAll(){
       if(o.address === undefined) o.address = '';
       if(o.bitrixId === undefined) o.bitrixId = null;
       if(o.managerComment === undefined) o.managerComment = '';
+      if(o.delivery === undefined) o.delivery = null;
+      if(o.email === undefined) o.email = '';
     });
     ordersDirty = false;
     { const btn = document.getElementById('ordersSaveBtn'), hint = document.getElementById('ordersSaveHint');
@@ -1118,8 +1141,8 @@ async function addOrder(){
   const now = new Date().toISOString();
   const order = {
     id: uuid(), bitrixId: null, orderNumber, orderDate: orderDateRaw || todayStr(), contragent, inn, clientName, phone,
-    price: price ? Number(price) : null, cc: null, logistics: logistics ? Number(logistics) : null, link, article, address, comment,
-    managerComment: '',
+    price: price ? Number(price) : null, cc: null, logistics: logistics ? Number(logistics) : null, delivery: null, link, article, address, comment,
+    managerComment: '', email: '',
     statusId: statusId || (STATE.statuses[0] && STATE.statuses[0].id) || 'new',
     source: 'manual', createdAt: now, updatedAt: now,
   };
@@ -1174,6 +1197,17 @@ window.setOrderPrice = function(id, val){
   renderOrderStats();
   renderOrdersGrid();
 };
+// Доставка — what the customer is charged for delivery on this specific order, entered manually.
+// Separate from Логистика (internal cost used for profit/Размещение calc) -- Доставка only feeds
+// "Сумма в чеке" (Сумма + Доставка) in the order details popup. Always editable, no shipped lock.
+window.setOrderDelivery = function(id, val){
+  const o = STATE.orders.find(x=>x.id===id); if(!o) return;
+  const v = parseFloat(val);
+  o.delivery = isNaN(v) ? null : v;
+  o.updatedAt = new Date().toISOString();
+  markOrdersDirty();
+  renderOrdersGrid();
+};
 
 window.changeOrderStatus = async function(id, statusId){
   const o = STATE.orders.find(x=>x.id===id);
@@ -1194,21 +1228,60 @@ window.deleteOrder = async function(id){
   renderOrderStats(); renderOrdersGrid();
   try { await saveState(); toast('Заявка удалена', 'ok'); } catch(e){ toast('Ошибка сохранения: '+e.message, 'err'); }
 };
+// СС/Логистика/Размещение and ИНН were removed from the main list on request but still feed
+// Отчёты/Долг продавца/Дашборд, so they're edited from here instead. The receipt info block
+// ("Сумма в чеке" = Сумма + Доставка) is display-only -- it just reflects whatever's already set
+// elsewhere -- meant to be read off when preparing a shipment/receipt for the customer.
 window.viewOrderDetails = function(id){
   const o = STATE.orders.find(x=>x.id===id); if(!o) return;
   const modalBg = document.getElementById('modalBg'), modalBody = document.getElementById('modalBody');
+  const placement = orderPlacement(o);
+  const receiptTotal = (o.price!=null || o.delivery!=null) ? +((o.price||0) + (o.delivery||0)).toFixed(2) : null;
+  const logLocked = isLogisticsLocked(o);
   modalBody.innerHTML = `
     <button class="close" onclick="closeModal()">✕</button>
     <h2>Заявка № ${escapeHtml(o.orderNumber||'—')}</h2>
     <p class="muted">${escapeHtml(o.contragent)} — ${escapeHtml(o.clientName)}${o.phone?', '+escapeHtml(o.phone):''}</p>
+    <div class="grid-3">
+      <div class="field"><label>ИНН</label><input type="text" value="${escapeHtml(o.inn)}" onchange="window.setOrderInn('${o.id}', this.value)"></div>
+      <div class="field"><label>Email</label><input type="email" value="${escapeHtml(o.email)}" placeholder="client@example.com" onchange="window.setOrderEmail('${o.id}', this.value)"></div>
+    </div>
     <p><strong>Адрес доставки:</strong><br>${escapeHtml(o.address)||'—'}</p>
     <p><strong>Комментарий:</strong><br>${escapeHtml(o.comment)||'—'}</p>
     <div class="field"><label>Комментарий менеджера продаж</label>
       <textarea onchange="window.setOrderManagerComment('${o.id}', this.value)" placeholder="Заметка для внутреннего использования">${escapeHtml(o.managerComment)}</textarea>
     </div>
-    <p class="hint">Сохранится вместе с остальными правками — кнопкой «Сохранить изменения» в списке заявок.</p>
+
+    <h3 style="margin-top:16px;">Финансовые данные</h3>
+    <div class="grid-3">
+      <div class="field"><label>СС (закупка), ₽</label><input type="number" step="0.01" value="${o.cc!=null?o.cc:''}" placeholder="—" onchange="window.setOrderCC('${o.id}', this.value); window.viewOrderDetails('${o.id}');"></div>
+      <div class="field"><label>Логистика, ₽${logLocked?' (зафиксировано)':''}</label><input type="number" step="0.01" value="${o.logistics!=null?o.logistics:''}" ${logLocked?'disabled':''} placeholder="0.00" onchange="window.setOrderLogistics('${o.id}', this.value); window.viewOrderDetails('${o.id}');"></div>
+      <div class="field"><label>Размещение, ₽ (расчётно)</label><input type="text" value="${placement!=null?fmtMoney(placement)+' ₽':'—'}" disabled></div>
+    </div>
+
+    <h3 style="margin-top:16px;">Информация для отгрузки</h3>
+    <table class="preview">
+      <tr><th>Номер заявки</th><td>${escapeHtml(o.orderNumber||'—')}</td></tr>
+      <tr><th>Артикул</th><td>${escapeHtml(o.article)||'—'}</td></tr>
+      <tr><th>Ссылка на товар</th><td>${o.link?`<a class="link" href="${escapeHtml(o.link)}" target="_blank">${escapeHtml(o.link)}</a>`:'—'}</td></tr>
+      <tr><th>Сумма в чеке</th><td><strong>${receiptTotal!=null?fmtMoney(receiptTotal)+' ₽':'—'}</strong> <span class="hint">(Сумма ${o.price!=null?fmtMoney(o.price)+' ₽':'—'} + Доставка ${o.delivery!=null?fmtMoney(o.delivery)+' ₽':'—'})</span></td></tr>
+    </table>
+
+    <p class="hint">Правки здесь сохраняются вместе с остальными — кнопкой «Сохранить изменения» в списке заявок.</p>
   `;
   modalBg.classList.add('show');
+};
+window.setOrderInn = function(id, val){
+  const o = STATE.orders.find(x=>x.id===id); if(!o) return;
+  o.inn = val.trim();
+  o.updatedAt = new Date().toISOString();
+  markOrdersDirty();
+};
+window.setOrderEmail = function(id, val){
+  const o = STATE.orders.find(x=>x.id===id); if(!o) return;
+  o.email = val.trim();
+  o.updatedAt = new Date().toISOString();
+  markOrdersDirty();
 };
 window.setOrderManagerComment = function(id, val){
   const o = STATE.orders.find(x=>x.id===id); if(!o) return;
@@ -1245,52 +1318,52 @@ function getFilteredOrders(){
   }).sort(compareOrdersDefault);
 }
 
+// СС, Размещение, Логистика and ИНН were removed from this table on request (kept fully intact
+// in STATE.orders and still used by Отчёты/Долг продавца/Дашборд — just edited from the order
+// details popup now instead of cluttering the day-to-day list). "Действия" now only ever shows
+// the product link; the delete button was removed from here entirely (deleteOrder() itself still
+// exists, just isn't wired to any button anymore).
 function renderOrdersGrid(){
-  const data = getFilteredOrders();
+  const filtered = getFilteredOrders();
   const el = document.getElementById('ordersGrid');
-  if(!data.length){
+  const totalPages = Math.max(1, Math.ceil(filtered.length / ORDERS_PAGE_SIZE));
+  if(ordersPage > totalPages - 1) ordersPage = totalPages - 1;
+  if(ordersPage < 0) ordersPage = 0;
+  if(!filtered.length){
     destroyGrid(ORDERS_GRID); ORDERS_GRID = null;
     el.innerHTML = '<div class="empty">Заявок нет</div>';
+    renderOrdersPager(0, 1, 0);
     return;
   }
+  const data = filtered.slice(ordersPage * ORDERS_PAGE_SIZE, (ordersPage + 1) * ORDERS_PAGE_SIZE);
   ORDERS_GRID = renderGridInto(ORDERS_GRID, el, {
     columns: [
-      { name:'№ заявки', width:'90px', sort:{ compare:(a,b)=>{
-          const na = Number(JSON.parse(a).orderNumber), nb = Number(JSON.parse(b).orderNumber);
-          if(!isNaN(na) && !isNaN(nb)) return na - nb;
-          return String(JSON.parse(a).orderNumber||'').localeCompare(String(JSON.parse(b).orderNumber||''));
-        }}, formatter:(cell)=>{
+      { name:'№ заявки', width:'90px', formatter:(cell)=>{
           const d = JSON.parse(cell);
-          return gridjs.html(`<a class="link" href="javascript:void(0)" onclick="window.viewOrderDetails('${d.id}')" title="Адрес доставки и комментарий" style="cursor:pointer;">${escapeHtml(d.orderNumber||'—')}</a>`);
+          return gridjs.html(`<a class="link" href="javascript:void(0)" onclick="window.viewOrderDetails('${d.id}')" title="Подробнее о заявке" style="cursor:pointer;">${escapeHtml(d.orderNumber||'—')}</a>`);
         }},
-      { name:'Дата заявки', width:'130px', sort:false, formatter:(cell)=>{
+      { name:'Дата заявки', width:'130px', formatter:(cell)=>{
           const d = JSON.parse(cell);
           return gridjs.html(`<input type="date" value="${d.orderDate||''}" style="font-size:11px;padding:3px;border:1px solid var(--border);border-radius:6px;width:118px;" onchange="window.setOrderDate('${d.id}', this.value)">`);
         }},
       { name:'Клиент' }, { name:'Телефон', width:'120px' },
-      { name:'Статус', width:'160px', sort:false, formatter:(cell)=>{
+      { name:'Статус', width:'160px', formatter:(cell)=>{
           const d = JSON.parse(cell);
           return gridjs.html(`<select onchange="window.changeOrderStatus('${d.id}', this.value)" style="font-size:11px; padding:3px;">${STATE.statuses.map(s=>`<option value="${s.id}" ${s.id===d.statusId?'selected':''}>${escapeHtml(s.label)}</option>`).join('')}</select>`);
         }},
-      { name:'Сумма', width:'100px', sort:false, formatter:(cell)=>{
+      { name:'Сумма', width:'100px', formatter:(cell)=>{
           const d = JSON.parse(cell);
           return gridjs.html(`<input type="number" value="${d.price!=null?d.price:''}" placeholder="0.00" step="0.01" style="width:85px;font-size:12px;padding:4px;border:1px solid var(--border);border-radius:6px;" onchange="window.setOrderPrice('${d.id}', this.value)">`);
         }},
-      { name:'СС, ₽', width:'100px', sort:false, formatter:(cell)=>{
+      { name:'Доставка, ₽', width:'100px', formatter:(cell)=>{
           const d = JSON.parse(cell);
-          return gridjs.html(`<input type="number" value="${d.cc!=null?d.cc:''}" placeholder="—" step="0.01" style="width:80px;font-size:12px;padding:4px;border:1px solid var(--border);border-radius:6px;" onchange="window.setOrderCC('${d.id}', this.value)">`);
+          return gridjs.html(`<input type="number" value="${d.delivery!=null?d.delivery:''}" placeholder="0.00" step="0.01" style="width:85px;font-size:12px;padding:4px;border:1px solid var(--border);border-radius:6px;" onchange="window.setOrderDelivery('${d.id}', this.value)">`);
         }},
-      { name:'Логистика, ₽', width:'110px', sort:false, formatter:(cell)=>{
-          const d = JSON.parse(cell);
-          if(d.locked) return d.logistics!=null ? fmtMoney(d.logistics)+' ₽' : '—';
-          return gridjs.html(`<input type="number" value="${d.logistics!=null?d.logistics:''}" placeholder="0.00" step="0.01" style="width:80px;font-size:12px;padding:4px;border:1px solid var(--border);border-radius:6px;" onchange="window.setOrderLogistics('${d.id}', this.value)">`);
-        }},
-      { name:'Размещение, ₽', width:'105px', formatter:(cell)=> cell!=null ? fmtMoney(cell)+' ₽' : '—' },
       { name:'Артикул', width:'90px' },
-      { name:'Контрагент' }, { name:'ИНН', width:'100px' },
-      { name:'Действия', width:'80px', sort:false, formatter:(cell)=>{
+      { name:'Контрагент' },
+      { name:'Действия', width:'60px', formatter:(cell)=>{
           const d = JSON.parse(cell);
-          return gridjs.html(`${d.link?`<a class="link" href="${escapeHtml(d.link)}" target="_blank" title="Ссылка на товар">🔗</a> `:''}<button class="btn danger" style="padding:3px 8px;" onclick="window.deleteOrder('${d.id}')">✕</button>`);
+          return d.link ? gridjs.html(`<a class="link" href="${escapeHtml(d.link)}" target="_blank" title="Ссылка на товар">🔗</a>`) : '';
         }},
     ],
     data: data.map(o=>[
@@ -1299,19 +1372,32 @@ function renderOrdersGrid(){
       o.clientName, o.phone,
       JSON.stringify({ id:o.id, statusId:o.statusId }),
       JSON.stringify({ id:o.id, price:o.price }),
-      JSON.stringify({ id:o.id, cc:o.cc }),
-      JSON.stringify({ id:o.id, logistics:o.logistics, locked:isLogisticsLocked(o) }),
-      orderPlacement(o),
+      JSON.stringify({ id:o.id, delivery:o.delivery }),
       o.article,
-      o.contragent, o.inn,
+      o.contragent,
       JSON.stringify({ id:o.id, link:o.link }),
     ]),
-    search:false, sort:true, pagination:{ limit:12, resetPageOnUpdate:false }, className:{ table:'gridjs-wrapper' },
+    search:false, sort:false, pagination:false, className:{ table:'gridjs-wrapper' },
   });
+  renderOrdersPager(ordersPage, totalPages, filtered.length);
 }
+function renderOrdersPager(page, totalPages, totalCount){
+  const el = document.getElementById('ordersPager');
+  if(!el) return;
+  el.innerHTML = `
+    <button class="btn secondary" ${page<=0?'disabled':''} onclick="window.ordersGoPage(${page-1})">← Назад</button>
+    <span class="hint">Страница ${page+1} из ${totalPages}${totalCount?` (всего заявок: ${totalCount})`:''}</span>
+    <button class="btn secondary" ${page>=totalPages-1?'disabled':''} onclick="window.ordersGoPage(${page+1})">Вперёд →</button>
+  `;
+}
+window.ordersGoPage = function(p){
+  ordersPage = p;
+  renderOrdersGrid();
+};
 // Wraps renderOrdersGrid() with a visible count, so it's obvious right away whether the filter
 // actually narrowed anything down -- rather than having to eyeball 12 rows out of 165 and guess.
 window.applyOrdersFilter = function(){
+  ordersPage = 0;
   renderOrdersGrid();
   const total = STATE.orders.length;
   const shown = getFilteredOrders().length;
@@ -1319,13 +1405,19 @@ window.applyOrdersFilter = function(){
   const label = (sel.selectedOptions && sel.selectedOptions[0] && sel.selectedOptions[0].textContent) || 'Все статусы';
   toast(`Показано ${shown} из ${total} (статус: ${label})`, 'ok');
 };
+// Live typing/status-select filter changes (not the explicit "Искать" button) -- also jump back
+// to page 1 of the new filtered set, just without the toast popping up on every keystroke.
+window.onOrdersFilterChange = function(){
+  ordersPage = 0;
+  renderOrdersGrid();
+};
 
 function exportOrders(fmt){
   const data = getFilteredOrders();
   if(!data.length){ toast('Нет данных для экспорта', 'err'); return; }
   const rows = data.map(o=>({
-    '№ заявки': o.orderNumber, 'Дата заявки': o.orderDate, Клиент: o.clientName, Телефон: o.phone,
-    Статус: statusOf(o.statusId).label, Сумма: o.price, 'СС, ₽': o.cc, 'Логистика, ₽': o.logistics, 'Размещение, ₽': orderPlacement(o),
+    '№ заявки': o.orderNumber, 'Дата заявки': o.orderDate, Клиент: o.clientName, Телефон: o.phone, Email: o.email,
+    Статус: statusOf(o.statusId).label, Сумма: o.price, 'Доставка, ₽': o.delivery, 'СС, ₽': o.cc, 'Логистика, ₽': o.logistics, 'Размещение, ₽': orderPlacement(o),
     Артикул: o.article, Контрагент: o.contragent, ИНН: o.inn,
     Ссылка: o.link, 'Адрес доставки': o.address, Комментарий: o.comment, 'Комментарий менеджера': o.managerComment,
   }));
