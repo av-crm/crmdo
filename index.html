@@ -198,7 +198,7 @@
         <span class="hint" id="ordersSaveHint">Все изменения сохранены</span>
       </div>
       <div class="btn-row">
-        <button class="btn secondary" onclick="refillMissingCC()">Подтянуть СС по датам закупки</button>
+        <button class="btn secondary" onclick="refillMissingCC()">Подтянуть СС и логистику по датам закупки</button>
         <button class="btn secondary" onclick="removeDuplicateOrders()">Удалить дубли (по номеру заявки)</button>
         <button class="btn secondary" onclick="exportOrders('csv')">Экспорт CSV</button>
         <button class="btn secondary" onclick="exportOrders('json')">Экспорт JSON</button>
@@ -1040,6 +1040,16 @@ function costFromSnapshot(snapshot, article){
   for(let i=prices.length-1;i>=0;i--){ if(prices[i] && prices[i].value!=null) return prices[i].value; }
   return null;
 }
+// Логистика is computed in the "Прайсы → Калькулятор" step (cost + logistics % or ₽/шт per item,
+// with optional per-item overrides) and persisted to Drive only when the person clicks "Сохранить
+// в историю на Диске" there, as a sell_price_snapshot file named sellprice_<ип>_<дата>_<время>.json.
+// This reads that already-computed amount for one article, mirroring costFromSnapshot above.
+function logisticsFromSnapshot(snapshot, article){
+  if(!snapshot || !article) return null;
+  const item = (snapshot.items||[]).find(it=>String(it.article||'').trim().toLowerCase() === String(article).trim().toLowerCase());
+  if(!item || !item.logistics || item.logistics.amount==null) return null;
+  return item.logistics.amount;
+}
 // Listing (not downloading) every price_upload_ snapshot, deduped to the latest upload per
 // calendar day. Filenames already encode the date (price_upload_YYYY-MM-DD_HHMMSS.json), so this
 // needs no downloads — cheap enough to call once per autofill batch.
@@ -1049,6 +1059,26 @@ async function loadAllPriceUploadDates(){
   const byDate = new Map();
   files.forEach(f=>{
     const date = f.title.slice('price_upload_'.length, 'price_upload_'.length+10);
+    const existing = byDate.get(date);
+    if(!existing || new Date(f.createdTime) > new Date(existing.createdTime)) byDate.set(date, f);
+  });
+  return Array.from(byDate.entries())
+    .map(([date, f])=>({ date, fileId: f.id }))
+    .sort((a,b)=> a.date.localeCompare(b.date));
+}
+// Same idea as loadAllPriceUploadDates, but over saved calculator snapshots (sellprice_*.json),
+// which is the only place logistics amounts actually exist. Filename is
+// sellprice_<slug-of-ip-name>_<YYYY-MM-DD>_<HHMMSS>.json — the slug can contain hyphens/letters
+// but never the date pattern itself, so anchoring the regex to the end of the filename is safe
+// regardless of what the ИП name slugified to.
+async function loadAllSellPriceSnapshotDates(){
+  const r = await driveSearch(`'${FOLDERS.prices}' in parents and name contains 'sellprice_'`, 500);
+  const files = (r.files||[]).filter(f=>/^sellprice_.+_\d{4}-\d{2}-\d{2}_\d{6}\.json$/.test(f.title));
+  const byDate = new Map();
+  files.forEach(f=>{
+    const m = f.title.match(/_(\d{4}-\d{2}-\d{2})_\d{6}\.json$/);
+    if(!m) return;
+    const date = m[1];
     const existing = byDate.get(date);
     if(!existing || new Date(f.createdTime) > new Date(existing.createdTime)) byDate.set(date, f);
   });
@@ -1093,31 +1123,63 @@ async function autofillOrdersCC(orders){
   }
   return stats;
 }
+// Логистика mirrors autofillOrdersCC exactly (same date-matching rule, same "never overwrite a
+// value that's already there" rule), only the source snapshot differs: it reads the amount the
+// calculator already computed and saved (sellprice_*.json) instead of a raw purchase price. Orders
+// past the "Отгружена" status are skipped outright — their logistics is locked in by
+// isLogisticsLocked and editing it is refused elsewhere, so there's no point trying to fill it.
+async function autofillOrdersLogistics(orders){
+  const stats = { filled:0, uploadsCount:0, candidates:0, skippedNoArticle:0, skippedNoUpload:0, skippedNoMatch:0, skippedLocked:0, error:null };
+  const withoutLog = orders.filter(o=>o.logistics==null);
+  stats.skippedLocked = withoutLog.filter(o=>isLogisticsLocked(o)).length;
+  const editable = withoutLog.filter(o=>!isLogisticsLocked(o));
+  stats.skippedNoArticle = editable.filter(o=>!o.article).length;
+  const targets = editable.filter(o=>o.article && o.orderDate);
+  stats.candidates = targets.length;
+  if(!targets.length) return stats;
+  let snapshots;
+  try { snapshots = await loadAllSellPriceSnapshotDates(); } catch(e){ console.error(e); stats.error = e.message; return stats; }
+  stats.uploadsCount = snapshots.length;
+  if(!snapshots.length) return stats;
+  const snapshotCache = new Map();
+  for(const o of targets){
+    const best = findUploadForOrderDate(snapshots, o.orderDate);
+    if(!best){ stats.skippedNoUpload++; continue; }
+    let snap = snapshotCache.get(best.fileId);
+    if(snap === undefined){
+      try { snap = await driveDownloadJSON(best.fileId); } catch(e){ console.error(e); snap = null; }
+      snapshotCache.set(best.fileId, snap);
+    }
+    const log = logisticsFromSnapshot(snap, o.article);
+    if(log != null){ o.logistics = log; stats.filled++; } else { stats.skippedNoMatch++; }
+  }
+  return stats;
+}
 window.refillMissingCC = async function(){
   const hint = document.getElementById('ordersSaveHint');
-  if(hint) hint.textContent = 'Ищу цены закупки по датам заявок…';
+  if(hint) hint.textContent = 'Ищу цены закупки и логистику по датам заявок…';
   try {
-    const stats = await autofillOrdersCC(STATE.orders);
-    if(stats.filled) markOrdersDirty();
+    const ccStats = await autofillOrdersCC(STATE.orders);
+    const logStats = await autofillOrdersLogistics(STATE.orders);
+    if(ccStats.filled || logStats.filled) markOrdersDirty();
     renderOrdersGrid();
-    if(stats.error){
-      toast('Ошибка запроса к Google Диску: ' + stats.error, 'err');
-    } else if(stats.filled){
-      toast(`СС подтянута для ${stats.filled} заявок`, 'ok');
-    } else if(stats.candidates === 0){
-      toast(stats.skippedNoArticle ? `У ${stats.skippedNoArticle} заявок без СС не указан артикул — заполните его вручную` : 'Все заявки уже с заполненной СС', 'err');
-    } else if(stats.uploadsCount === 0){
-      toast('На Google Диске нет ни одной загрузки прайса — сначала загрузите файл в «Прайсы»', 'err');
-    } else if(stats.skippedNoUpload > 0 && stats.skippedNoMatch === 0){
-      toast(`Для ${stats.skippedNoUpload} заявок нет ни одной загрузки прайса на их дату или раньше (самая ранняя загрузка позже даты заявки)`, 'err');
-    } else if(stats.skippedNoMatch > 0){
-      toast(`Для ${stats.skippedNoMatch} заявок артикул не найден в подходящем прайсе — проверьте написание артикула`, 'err');
+    if(ccStats.error || logStats.error){
+      toast('Ошибка запроса к Google Диску: ' + (ccStats.error || logStats.error), 'err');
+    } else if(ccStats.filled || logStats.filled){
+      const parts = [];
+      if(ccStats.filled) parts.push(`СС для ${ccStats.filled} заявок`);
+      if(logStats.filled) parts.push(`логистика для ${logStats.filled} заявок`);
+      toast(`Подтянуто: ${parts.join(', ')}`, 'ok');
+    } else if(ccStats.candidates === 0 && logStats.candidates === 0){
+      toast('Все заявки уже с заполненной СС и логистикой (или это уже отгруженные заявки)', 'err');
+    } else if(ccStats.uploadsCount === 0 && logStats.uploadsCount === 0){
+      toast('На Google Диске нет ни загрузок прайса, ни сохранённых расчётов логистики — сначала загрузите файл и сохраните расчёт в «Прайсы»', 'err');
     } else {
-      toast('Не нашлось новых совпадений по датам', 'err');
+      toast('Не нашлось новых совпадений по датам/артикулам', 'err');
     }
-    if(hint && !stats.filled) hint.textContent = ordersDirty ? 'Есть несохранённые изменения' : 'Все изменения сохранены';
+    if(hint && !ccStats.filled && !logStats.filled) hint.textContent = ordersDirty ? 'Есть несохранённые изменения' : 'Все изменения сохранены';
   } catch(e){
-    toast('Ошибка подтягивания СС: ' + e.message, 'err');
+    toast('Ошибка подтягивания СС/логистики: ' + e.message, 'err');
   }
 };
 async function addOrder(){
@@ -1152,6 +1214,7 @@ async function addOrder(){
   renderOrderStats(); renderOrdersGrid();
   try {
     await autofillOrdersCC([order]);
+    await autofillOrdersLogistics([order]);
     await saveState();
     renderOrdersGrid();
     document.getElementById('orderFormHint').textContent = 'Заявка сохранена';
@@ -1235,9 +1298,12 @@ window.deleteOrder = async function(id){
 window.viewOrderDetails = function(id){
   const o = STATE.orders.find(x=>x.id===id); if(!o) return;
   const modalBg = document.getElementById('modalBg'), modalBody = document.getElementById('modalBody');
-  const placement = orderPlacement(o);
+  // Финансовые данные (СС/Логистика/Размещение) is hidden from this popup on request -- it's now
+  // only editable via importOrdersRows/autofillOrdersCC (СС) — there's no manual entry point left
+  // for Логистика anywhere in the UI. Отчёты/Долг продавца/Дашборд still read whatever's in
+  // STATE.orders, so nothing breaks, but Логистика effectively stays whatever it already was
+  // (usually null) unless a field for it gets added back somewhere.
   const receiptTotal = (o.price!=null || o.delivery!=null) ? +((o.price||0) + (o.delivery||0)).toFixed(2) : null;
-  const logLocked = isLogisticsLocked(o);
   modalBody.innerHTML = `
     <button class="close" onclick="closeModal()">✕</button>
     <h2>Заявка № ${escapeHtml(o.orderNumber||'—')}</h2>
@@ -1250,13 +1316,6 @@ window.viewOrderDetails = function(id){
     <p><strong>Комментарий:</strong><br>${escapeHtml(o.comment)||'—'}</p>
     <div class="field"><label>Комментарий менеджера продаж</label>
       <textarea onchange="window.setOrderManagerComment('${o.id}', this.value)" placeholder="Заметка для внутреннего использования">${escapeHtml(o.managerComment)}</textarea>
-    </div>
-
-    <h3 style="margin-top:16px;">Финансовые данные</h3>
-    <div class="grid-3">
-      <div class="field"><label>СС (закупка), ₽</label><input type="number" step="0.01" value="${o.cc!=null?o.cc:''}" placeholder="—" onchange="window.setOrderCC('${o.id}', this.value); window.viewOrderDetails('${o.id}');"></div>
-      <div class="field"><label>Логистика, ₽${logLocked?' (зафиксировано)':''}</label><input type="number" step="0.01" value="${o.logistics!=null?o.logistics:''}" ${logLocked?'disabled':''} placeholder="0.00" onchange="window.setOrderLogistics('${o.id}', this.value); window.viewOrderDetails('${o.id}');"></div>
-      <div class="field"><label>Размещение, ₽ (расчётно)</label><input type="text" value="${placement!=null?fmtMoney(placement)+' ₽':'—'}" disabled></div>
     </div>
 
     <h3 style="margin-top:16px;">Информация для отгрузки</h3>
@@ -1359,6 +1418,15 @@ function renderOrdersGrid(){
           const d = JSON.parse(cell);
           return gridjs.html(`<input type="number" value="${d.delivery!=null?d.delivery:''}" placeholder="0.00" step="0.01" style="width:85px;font-size:12px;padding:4px;border:1px solid var(--border);border-radius:6px;" onchange="window.setOrderDelivery('${d.id}', this.value)">`);
         }},
+      // Временно возвращено для ручного ввода, пока автоподтяжка логистики из расчёта прайса не
+      // станет надёжной регулярной практикой (см. autofillOrdersLogistics) — планируется снова
+      // убрать, когда прайсы будут стабильно и правильно загружаться каждый раз.
+      { name:'Логистика, ₽', width:'100px', formatter:(cell)=>{
+          const d = JSON.parse(cell);
+          const lockedAttrs = d.locked ? 'disabled title="Заявка отгружена — логистика зафиксирована"' : '';
+          const lockedStyle = d.locked ? 'opacity:.5;' : '';
+          return gridjs.html(`<input type="number" value="${d.logistics!=null?d.logistics:''}" placeholder="0.00" step="0.01" ${lockedAttrs} style="width:85px;font-size:12px;padding:4px;border:1px solid var(--border);border-radius:6px;${lockedStyle}" onchange="window.setOrderLogistics('${d.id}', this.value)">`);
+        }},
       { name:'Артикул', width:'90px' },
       { name:'Контрагент' },
       { name:'Действия', width:'60px', formatter:(cell)=>{
@@ -1373,6 +1441,7 @@ function renderOrdersGrid(){
       JSON.stringify({ id:o.id, statusId:o.statusId }),
       JSON.stringify({ id:o.id, price:o.price }),
       JSON.stringify({ id:o.id, delivery:o.delivery }),
+      JSON.stringify({ id:o.id, logistics:o.logistics, locked: isLogisticsLocked(o) }),
       o.article,
       o.contragent,
       JSON.stringify({ id:o.id, link:o.link }),
@@ -1480,6 +1549,7 @@ function parseBitrixOrdersHtml(text){
       bitrixId, orderNumber: bitrixId, article: get('UF_ARTICUL'),
       inn: get('UF_INN') || seller.inn || '', orderDate: convertDMYtoISO(get('UF_DATE')),
       clientName: body.name || '', phone: body.phone || '', address: body.address || '', comment: body.comment || '',
+      email: body.email || '',
       contragent, price: (price!=null && !isNaN(price)) ? price : null,
     });
   }
@@ -1532,8 +1602,8 @@ async function importOrdersRows(rows){
     const order = {
       id: uuid(), bitrixId: r.bitrixId, orderNumber: r.orderNumber,
       orderDate: r.orderDate || todayStr(), contragent: r.contragent, inn: r.inn,
-      clientName: r.clientName, phone: r.phone,
-      price: r.price, cc: null, logistics: null, link: '', article: r.article,
+      clientName: r.clientName, phone: r.phone, email: r.email || '',
+      price: r.price, cc: null, logistics: null, delivery: null, link: '', article: r.article,
       address: r.address, comment: r.comment, managerComment: '',
       statusId, source: 'import', createdAt: now, updatedAt: now,
     };
@@ -1543,8 +1613,9 @@ async function importOrdersRows(rows){
     added++;
   });
   if(newOrders.length){
-    hint.textContent = `Добавлено ${added}, пропущено ${skipped}. Подтягиваю СС по датам закупки…`;
+    hint.textContent = `Добавлено ${added}, пропущено ${skipped}. Подтягиваю СС и логистику по датам закупки…`;
     await autofillOrdersCC(newOrders);
+    await autofillOrdersLogistics(newOrders);
   }
   hint.textContent = `Готово: добавлено ${added}, пропущено (уже есть в CRM) ${skipped}.`;
   toast(`Импортировано заявок: ${added}${skipped?(', пропущено: '+skipped):''}`, 'ok');
