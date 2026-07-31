@@ -320,6 +320,7 @@
   <div class="panel" id="panel-settings">
     <div class="card">
       <h2>Статусы заявок</h2>
+      <p class="hint">Порядок статусов ниже — это и порядок в выпадающих списках, и порядок первых 4 статусов на дашборде. Стрелками ↑/↓ можно переставить вручную в любой момент.</p>
       <div id="statusList"></div>
       <div class="grid-3" style="margin-top:12px;">
         <div class="field"><label>Название статуса</label><input type="text" id="s_label" placeholder="Например: На согласовании"></div>
@@ -328,6 +329,10 @@
       </div>
       <div class="field" style="margin-top:4px;">
         <label style="display:flex; align-items:center; gap:6px; font-weight:400;"><input type="checkbox" id="s_excludeStats" style="width:auto;"> Не учитывать заявки с этим статусом в статистике и дашбордах</label>
+      </div>
+      <div class="btn-row" style="margin-top:10px;">
+        <button class="btn secondary" onclick="if(confirm('Переставить статусы в порядке: Новая / В обработке / Подтверждена / Отгружена / Оплачена / Выставлен счёт / Сделка завершена / Отменена / Отмена. недозвон / Отмена. некорректный номер / Хотел рассрочку / Тест / Дубль?')) applyRequestedStatusOrder()">Применить порядок (по запросу)</button>
+        <span class="hint">Сопоставляет по названию — если что-то не найдётся или встанет не туда, поправьте стрелками ↑/↓ выше.</span>
       </div>
     </div>
     <div class="card">
@@ -342,6 +347,10 @@
       <div class="field" style="margin-top:8px;">
         <label>Разрешённые статусы для перехода (для не-администраторов)</label>
         <div id="sr_allowedNext" class="btn-row" style="flex-wrap:wrap;"></div>
+      </div>
+      <div class="field" style="margin-top:8px; max-width:420px;">
+        <label>Статус «Сделка завершена» (используется в Долге продавца и в «Стоимости размещения» на дашборде)</label>
+        <select id="sr_dealDoneStatus"></select>
       </div>
       <div class="btn-row" style="margin-top:8px;">
         <button class="btn" onclick="saveStatusRules()">Сохранить правило</button>
@@ -423,7 +432,8 @@
   <div class="panel" id="panel-debt">
     <div class="card">
       <h2>Долг продавца (ДП)</h2>
-      <p class="hint">Считается только по завершённым заявкам (статус «Завершена»): ДП = сумма поля «Размещение» всех завершённых заказов продавца − сумма оплат, введённых вручную ниже.</p>
+      <p class="hint">ДП = сумма поля «Размещение» всех заказов продавца в статусе «сделка завершена» − сумма оплат, введённых вручную ниже. Какой именно статус считается завершением сделки — задаётся в Настройки → «Права на смену статуса заявки».</p>
+      <p class="hint" id="debtDoneStatusHint"></p>
       <div id="debtGrid"></div>
     </div>
     <div class="card">
@@ -499,7 +509,11 @@ let currentUserEmail = null;
 // the seed "Завершена") that this file can't know the IDs of in advance, so this is left unset by
 // default and configured once from Настройки, where it's populated from whatever statuses actually
 // exist in STATE.statuses at that point.
-let STATE = { statuses: JSON.parse(JSON.stringify(DEFAULT_STATUSES)), orders: [], sellerPayments: [], users: [], statusRules: { restrictedStatusId: null, allowedNextIds: [] } };
+// dealDoneStatusId: which status counts as "сделка завершена" for Долг продавца and the all-time
+// "Стоимость размещения" card. Used to hardcode the seed id 'done' in three places, but AV deleted
+// that status and replaced it with a differently-named custom one -- same "can't know the real ID
+// in advance" situation as statusRules above, so this is also configured once from Настройки.
+let STATE = { statuses: JSON.parse(JSON.stringify(DEFAULT_STATUSES)), orders: [], sellerPayments: [], users: [], statusRules: { restrictedStatusId: null, allowedNextIds: [] }, dealDoneStatusId: null };
 let ORDERS_GRID = null, PRICE_GRID = null, REPORT_GRID = null, DEBT_GRID = null, DEBT_PAYMENTS_GRID = null;
 // Grid.js's own pagination turned out to lose track of the current page across data updates in
 // practice (see renderGridInto's comment) even after two attempts to make it behave. Orders is the
@@ -906,7 +920,7 @@ async function loadLatestLegacyCombinedState(){
   return {
     orders: data.orders || [], sellerPayments: data.sellerPayments || [],
     statuses: data.statuses || null, users: data.users || [],
-    statusRules: data.statusRules || null, _legacy: true,
+    statusRules: data.statusRules || null, dealDoneStatusId: data.dealDoneStatusId || null, _legacy: true,
   };
 }
 async function loadLatestState(){
@@ -928,6 +942,7 @@ async function loadLatestState(){
       statuses: (settingsData && settingsData.statuses && settingsData.statuses.length) ? settingsData.statuses : null,
       users: (settingsData && settingsData.users) || [],
       statusRules: (settingsData && settingsData.statusRules) || null,
+      dealDoneStatusId: (settingsData && settingsData.dealDoneStatusId) || null,
     };
   }
   // Nothing in the new locations at all -- either a brand-new Drive folder, or data that was only
@@ -941,7 +956,7 @@ async function saveState(){
   await Promise.all([
     driveCreateJSON(`orders_${ts}.json`, FOLDERS.orders, { orders: STATE.orders, savedAt: STATE.savedAt }),
     driveCreateJSON(`debt_${ts}.json`, FOLDERS.debt, { sellerPayments: STATE.sellerPayments, savedAt: STATE.savedAt }),
-    driveCreateJSON(`settings_${ts}.json`, FOLDERS.config, { statuses: STATE.statuses, users: STATE.users, statusRules: STATE.statusRules, savedAt: STATE.savedAt }),
+    driveCreateJSON(`settings_${ts}.json`, FOLDERS.config, { statuses: STATE.statuses, users: STATE.users, statusRules: STATE.statusRules, dealDoneStatusId: STATE.dealDoneStatusId, savedAt: STATE.savedAt }),
   ]);
 }
 
@@ -956,8 +971,16 @@ async function refreshAll(){
       STATE.sellerPayments = loaded.sellerPayments || [];
       STATE.users = loaded.users || [];
       STATE.statusRules = loaded.statusRules || { restrictedStatusId: null, allowedNextIds: [] };
+      STATE.dealDoneStatusId = loaded.dealDoneStatusId || null;
     } else {
-      STATE = { statuses: JSON.parse(JSON.stringify(DEFAULT_STATUSES)), orders: [], sellerPayments: [], users: [], statusRules: { restrictedStatusId: null, allowedNextIds: [] } };
+      STATE = { statuses: JSON.parse(JSON.stringify(DEFAULT_STATUSES)), orders: [], sellerPayments: [], users: [], statusRules: { restrictedStatusId: null, allowedNextIds: [] }, dealDoneStatusId: null };
+    }
+    // Back-compat one-time guess: if it's never been configured but a status literally called
+    // 'done' still exists (i.e. AV never renamed/removed it), assume that's still "завершена" so
+    // Долг продавца/Стоимость размещения don't silently go to zero for anyone who didn't touch
+    // this. If he DID remove/rename it (as he has), this stays null until set in Настройки.
+    if(!STATE.dealDoneStatusId && STATE.statuses.some(s=>s.id==='done')){
+      STATE.dealDoneStatusId = 'done';
     }
     // One-time upgrade: data was only found in the old combined state_*.json (pre-split format).
     // Immediately re-save in the new split-by-folder format so every save from now on goes to the
@@ -1023,14 +1046,97 @@ function renderStatusSelects(){
 function renderStatusList(){
   const el = document.getElementById('statusList');
   if(!STATE.statuses.length){ el.innerHTML = '<div class="empty">Статусы не заданы</div>'; return; }
-  el.innerHTML = STATE.statuses.map(s=>`
+  el.innerHTML = STATE.statuses.map((s,i)=>`
     <div class="status-list-row">
+      <span class="btn-row" style="gap:2px;">
+        <button class="btn secondary" style="padding:2px 7px;" title="Выше" ${i===0?'disabled':''} onclick="window.moveStatus('${s.id}', -1)">↑</button>
+        <button class="btn secondary" style="padding:2px 7px;" title="Ниже" ${i===STATE.statuses.length-1?'disabled':''} onclick="window.moveStatus('${s.id}', 1)">↓</button>
+      </span>
       <span class="swatch" style="background:${escapeHtml(s.color)}"></span>
       <span style="flex:1">${escapeHtml(s.label)}${s.excludeStats ? ' <span class="hint" style="font-weight:400;">(не в статистике)</span>' : ''}</span>
       <label style="display:flex; align-items:center; gap:4px; font-size:11px; font-weight:400; color:var(--muted);"><input type="checkbox" ${s.excludeStats?'checked':''} onchange="window.toggleStatusExcludeStats('${s.id}', this.checked)" style="width:auto;"> не в статистике</label>
       <button class="btn danger" style="padding:4px 10px;" onclick="deleteStatus('${s.id}')">Удалить</button>
     </div>`).join('');
 }
+// Permanent manual-correction tool: swaps a status with its immediate neighbour. This is the
+// reliable fallback whenever the fuzzy "Применить порядок" button below guesses wrong (typos,
+// statuses that don't exist yet, etc.) -- always works regardless of exact labels/ids.
+window.moveStatus = async function(id, dir){
+  const idx = STATE.statuses.findIndex(s=>s.id===id);
+  if(idx===-1) return;
+  const newIdx = idx + dir;
+  if(newIdx<0 || newIdx>=STATE.statuses.length) return;
+  const tmp = STATE.statuses[idx];
+  STATE.statuses[idx] = STATE.statuses[newIdx];
+  STATE.statuses[newIdx] = tmp;
+  renderStatusList(); renderStatusSelects(); renderOrdersGrid(); renderOrderStats();
+  try { await saveState(); } catch(e){ toast('Ошибка сохранения: '+e.message, 'err'); }
+};
+// --- Fuzzy label matching for the one-click "Применить порядок" button ---
+// AV's real status list has custom statuses this file has never seen, and he types their names
+// from memory (already caught one typo: "Отгуржена" for "Отгружена"). Exact string matching would
+// silently fail on both counts, so this tries progressively looser matches: exact normalized text,
+// then word-order-independent, then small-edit-distance. Anything it still can't match is reported,
+// never guessed -- the ↑/↓ buttons above are there to fix up whatever this doesn't get exactly right.
+function normalizeStatusLabel(s){
+  return String(s||'').trim().toLowerCase().replace(/ё/g,'е').replace(/\./g,'').replace(/\s+/g,' ');
+}
+function levenshteinDistance(a,b){
+  const m=a.length,n=b.length;
+  const dp=[];
+  for(let i=0;i<=m;i++){ dp.push([i]); }
+  for(let j=1;j<=n;j++){ dp[0][j]=j; }
+  for(let i=1;i<=m;i++){
+    for(let j=1;j<=n;j++){
+      dp[i][j] = a[i-1]===b[j-1] ? dp[i-1][j-1] : 1+Math.min(dp[i-1][j-1], dp[i-1][j], dp[i][j-1]);
+    }
+  }
+  return dp[m][n];
+}
+function findStatusByFuzzyLabel(targetLabel, excludeIds){
+  const norm = normalizeStatusLabel(targetLabel);
+  const candidates = STATE.statuses.filter(s=>!excludeIds.has(s.id));
+  let best = candidates.find(s=>normalizeStatusLabel(s.label)===norm);
+  if(best) return best;
+  const targetTokens = norm.split(' ').filter(Boolean).sort().join(' ');
+  best = candidates.find(s=>normalizeStatusLabel(s.label).split(' ').filter(Boolean).sort().join(' ')===targetTokens);
+  if(best) return best;
+  let bestDist = Infinity, bestMatch = null;
+  candidates.forEach(s=>{
+    const sNorm = normalizeStatusLabel(s.label);
+    const d = levenshteinDistance(norm, sNorm);
+    const threshold = Math.max(2, Math.ceil(Math.max(norm.length, sNorm.length) * 0.3));
+    if(d <= threshold && d < bestDist){ bestDist = d; bestMatch = s; }
+  });
+  return bestMatch;
+}
+// The exact sequence AV asked for, in his own wording -- matched fuzzily against whatever's
+// actually in STATE.statuses (see findStatusByFuzzyLabel above).
+const REQUESTED_STATUS_ORDER = [
+  'Новая', 'В обработке', 'Подтверждена', 'Отгружена', 'Оплачена', 'Выставлен счет', 'Сделка завершена',
+  'Отменена', 'Отмена. недозвон', 'Отмена. некорректный номер', 'Хотел рассрочку', 'Тест', 'Дубль',
+];
+window.applyRequestedStatusOrder = async function(){
+  const matchedIds = [];
+  const unmatched = [];
+  const usedIds = new Set();
+  REQUESTED_STATUS_ORDER.forEach(label=>{
+    const st = findStatusByFuzzyLabel(label, usedIds);
+    if(st){ matchedIds.push(st.id); usedIds.add(st.id); }
+    else unmatched.push(label);
+  });
+  const remaining = STATE.statuses.filter(s=>!usedIds.has(s.id));
+  STATE.statuses = [...matchedIds.map(id=>STATE.statuses.find(s=>s.id===id)), ...remaining];
+  renderStatusList(); renderStatusSelects(); renderOrdersGrid(); renderOrderStats(); renderStatusRulesForm();
+  try {
+    await saveState();
+    if(unmatched.length){
+      toast(`Порядок применён, но не нашлось: ${unmatched.join(', ')} — при необходимости добавьте статус или поправьте позицию стрелками ↑/↓`, 'err');
+    } else {
+      toast('Порядок статусов обновлён', 'ok');
+    }
+  } catch(e){ toast('Ошибка сохранения: '+e.message, 'err'); }
+};
 async function addStatus(){
   const label = document.getElementById('s_label').value.trim();
   const color = document.getElementById('s_color').value.trim() || '#2563eb';
@@ -1071,12 +1177,18 @@ function isStatsExcluded(o){
   const st = STATE.statuses.find(s=>s.id===o.statusId);
   return !!(st && st.excludeStats);
 }
+// Which status counts as "сделка завершена" for Долг продавца / Стоимость размещения -- see
+// STATE.dealDoneStatusId's comment near the top of the file for why this isn't just a hardcoded id.
+function isDealDoneStatus(o){
+  return !!STATE.dealDoneStatusId && o.statusId === STATE.dealDoneStatusId;
+}
 // Renders the "Права на смену статуса" form from whatever's actually in STATE.statuses right now
 // (including any custom/renamed statuses AV added himself) -- deliberately never hardcodes which
 // status IDs these are, since that's exactly what can't be known from this file alone.
 function renderStatusRulesForm(){
   const sel = document.getElementById('sr_restrictedStatus');
   const box = document.getElementById('sr_allowedNext');
+  const doneSel = document.getElementById('sr_dealDoneStatus');
   if(!sel || !box) return;
   const rules = STATE.statusRules || { restrictedStatusId: null, allowedNextIds: [] };
   sel.innerHTML = '<option value="">— не ограничивать —</option>' +
@@ -1085,12 +1197,32 @@ function renderStatusRulesForm(){
     <label style="display:flex; align-items:center; gap:4px; font-size:12px; font-weight:400;">
       <input type="checkbox" class="sr_allowed_cb" value="${s.id}" ${(rules.allowedNextIds||[]).includes(s.id)?'checked':''} style="width:auto;"> ${escapeHtml(s.label)}
     </label>`).join('');
+  if(doneSel){
+    doneSel.innerHTML = '<option value="">— не задано —</option>' +
+      STATE.statuses.map(s=>`<option value="${s.id}" ${s.id===STATE.dealDoneStatusId?'selected':''}>${escapeHtml(s.label)}</option>`).join('');
+  }
+  renderDebtDoneStatusHint();
+}
+function renderDebtDoneStatusHint(){
+  const el = document.getElementById('debtDoneStatusHint');
+  if(!el) return;
+  if(!STATE.dealDoneStatusId){
+    el.innerHTML = '⚠ Статус «сделка завершена» ещё не выбран в Настройках — до этого ДП всегда будет показывать 0.';
+    return;
+  }
+  const st = STATE.statuses.find(s=>s.id===STATE.dealDoneStatusId);
+  el.innerHTML = st ? `Сейчас считается по статусу «${escapeHtml(st.label)}».` : '⚠ Выбранный статус больше не существует — выберите заново в Настройках.';
 }
 async function saveStatusRules(){
   const restrictedStatusId = document.getElementById('sr_restrictedStatus').value || null;
   const allowedNextIds = Array.from(document.querySelectorAll('.sr_allowed_cb:checked')).map(cb=>cb.value);
+  const dealDoneSel = document.getElementById('sr_dealDoneStatus');
   STATE.statusRules = { restrictedStatusId, allowedNextIds };
+  if(dealDoneSel) STATE.dealDoneStatusId = dealDoneSel.value || null;
   renderOrdersGrid();
+  renderDebtGrid();
+  renderDebtDoneStatusHint();
+  renderOrderStats();
   const hint = document.getElementById('statusRulesHint');
   if(hint) hint.textContent = 'Сохранение…';
   try {
@@ -1235,7 +1367,7 @@ function weekMetrics(start, end){
   const paid = orders.filter(o=>o.statusId==='paid');
   const paidCount = paid.length;
   const paidSum = paid.reduce((a,o)=>a+(Number(o.price)||0),0);
-  const paidOrDone = orders.filter(o=>o.statusId==='paid' || o.statusId==='done');
+  const paidOrDone = orders.filter(o=>o.statusId==='paid' || isDealDoneStatus(o));
   const placementSum = paidOrDone.reduce((a,o)=>a+(orderPlacement(o)||0),0);
   return { count, sum, paidCount, paidSum, placementSum };
 }
@@ -1249,13 +1381,20 @@ function renderOrderStats(){
   const paidOrders = statsOrders.filter(o=>o.statusId==='paid');
   const paidCount = paidOrders.length;
   const paidSum = paidOrders.reduce((a,o)=>a+(Number(o.price)||0),0);
+  // All-time (not week-scoped) -- distinct from weekMetrics().placementSum used further down in the
+  // "за неделю" row. Same paid+сделка-завершена definition as Долг продавца (see isDealDoneStatus).
+  const placementSumAllTime = statsOrders
+    .filter(o=>o.statusId==='paid' || isDealDoneStatus(o))
+    .reduce((a,o)=>a+(orderPlacement(o)||0),0);
   const byStatus = {};
   statsOrders.forEach(o=>{ byStatus[o.statusId] = (byStatus[o.statusId]||0)+1; });
   let cards = `
     <div class="stat"><div class="n">${total}</div><div class="l">Всего заявок</div></div>
     <div class="stat"><div class="n">${fmtMoneyInt(sum)} ₽</div><div class="l">Сумма заявок</div></div>
     <div class="stat"><div class="n">${paidCount}</div><div class="l">Оплаченных заявок</div></div>
-    <div class="stat"><div class="n">${fmtMoneyInt(paidSum)} ₽</div><div class="l">Сумма оплаченных заявок</div></div>`;
+    <div class="stat"><div class="n">${fmtMoneyInt(paidSum)} ₽</div><div class="l">Сумма оплаченных заявок</div></div>
+    <div class="stat"><div class="n">${fmtMoneyInt(placementSumAllTime)} ₽</div><div class="l">Стоимость размещения</div></div>
+    <div class="stat" style="grid-column:1/-1;background:transparent;border:none;padding:0;"></div>`;
   STATE.statuses.slice(0,4).forEach(s=>{
     cards += `<div class="stat"><div class="n">${byStatus[s.id]||0}</div><div class="l">${escapeHtml(s.label)}</div></div>`;
   });
@@ -2133,7 +2272,7 @@ function exportSalesReportCsv(){
 // ДП per seller (grouped by ИНН) = sum of "Размещение" across that seller's completed (done)
 // orders, minus the sum of manually-entered placement payments for that ИНН.
 function computeSellerDebts(){
-  const doneOrders = STATE.orders.filter(o=>o.statusId==='done' && !isStatsExcluded(o));
+  const doneOrders = STATE.orders.filter(o=>isDealDoneStatus(o) && !isStatsExcluded(o));
   const byInn = new Map();
   doneOrders.forEach(o=>{
     const key = (o.inn||'').trim() || '(без ИНН)';
