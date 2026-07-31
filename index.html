@@ -331,6 +331,24 @@
       </div>
     </div>
     <div class="card">
+      <h2>Права на смену статуса заявки</h2>
+      <p class="hint">Ваш аккаунт (администратор) всегда может менять статус заявки на любой другой. Здесь можно ограничить остальных пользователей: пока заявка находится в выбранном ниже статусе, они смогут перевести её только в отмеченные статусы. Для всех прочих статусов ограничений нет.</p>
+      <div class="grid-3">
+        <div class="field" style="grid-column:span 2;">
+          <label>Ограниченный статус</label>
+          <select id="sr_restrictedStatus"></select>
+        </div>
+      </div>
+      <div class="field" style="margin-top:8px;">
+        <label>Разрешённые статусы для перехода (для не-администраторов)</label>
+        <div id="sr_allowedNext" class="btn-row" style="flex-wrap:wrap;"></div>
+      </div>
+      <div class="btn-row" style="margin-top:8px;">
+        <button class="btn" onclick="saveStatusRules()">Сохранить правило</button>
+        <span class="hint" id="statusRulesHint"></span>
+      </div>
+    </div>
+    <div class="card">
       <h2>Подключение к Google</h2>
       <p class="hint">Client ID: <code class="small" id="clientIdShown"></code></p>
       <div class="btn-row">
@@ -382,7 +400,18 @@
     <div class="card">
       <h2>Отчёт по продажам (оплаченные заявки)</h2>
       <p class="hint">Заявки в статусе «Оплачена»: номер заявки, артикул, сумма заказа, СС, логистика, стоимость размещения, ИНН.</p>
+      <div class="grid-3" style="margin-bottom:10px;">
+        <div class="field"><label>Дата заявки с</label><input type="date" id="reportDateFrom"></div>
+        <div class="field"><label>Дата заявки по</label><input type="date" id="reportDateTo"></div>
+        <div class="field"><label>&nbsp;</label>
+          <div class="btn-row">
+            <button class="btn" onclick="applyReportDateFilter()">Применить</button>
+            <button class="btn secondary" onclick="resetReportDateFilter()">Сбросить</button>
+          </div>
+        </div>
+      </div>
       <div id="reportSalesGrid"></div>
+      <div id="reportSalesTotals"></div>
       <div class="btn-row">
         <button class="btn" onclick="exportSalesReportXlsx()">Выгрузить в Excel (.xlsx)</button>
         <button class="btn secondary" onclick="exportSalesReportCsv()">Экспорт CSV</button>
@@ -464,7 +493,13 @@ const ACCESS_SECTIONS = [
 ];
 let currentUserEmail = null;
 
-let STATE = { statuses: JSON.parse(JSON.stringify(DEFAULT_STATUSES)), orders: [], sellerPayments: [], users: [] };
+// statusRules: restricts non-admin users to a fixed set of NEXT statuses whenever an order is
+// currently in restrictedStatusId. Deliberately references status IDs, not labels -- AV's actual
+// status list has custom/renamed statuses (e.g. "Счёт выставлен", "Сделка завершена" instead of
+// the seed "Завершена") that this file can't know the IDs of in advance, so this is left unset by
+// default and configured once from Настройки, where it's populated from whatever statuses actually
+// exist in STATE.statuses at that point.
+let STATE = { statuses: JSON.parse(JSON.stringify(DEFAULT_STATUSES)), orders: [], sellerPayments: [], users: [], statusRules: { restrictedStatusId: null, allowedNextIds: [] } };
 let ORDERS_GRID = null, PRICE_GRID = null, REPORT_GRID = null, DEBT_GRID = null, DEBT_PAYMENTS_GRID = null;
 // Grid.js's own pagination turned out to lose track of the current page across data updates in
 // practice (see renderGridInto's comment) even after two attempts to make it behave. Orders is the
@@ -688,6 +723,24 @@ function applyAccessControl(){
     if(firstVisible) switchTab(firstVisible.dataset.tab);
   }
 }
+function isAdmin(){ return currentUserEmail === ADMIN_EMAIL; }
+// Status transition rule: the admin can move any order between any statuses. Everyone else is
+// unrestricted too, EXCEPT while an order sits in STATE.statusRules.restrictedStatusId (configured
+// in Настройки, since AV's real status list has custom/renamed statuses whose IDs this file can't
+// know in advance) -- from there, non-admins may only move it to one of allowedNextIds. If the
+// rule isn't configured yet (restrictedStatusId is null), nobody is restricted -- same as before
+// this feature existed. The order's current status is always included, so a restricted dropdown
+// never ends up with zero options.
+function allowedNextStatusIds(order){
+  const all = STATE.statuses.map(s=>s.id);
+  if(isAdmin()) return all;
+  const rules = STATE.statusRules;
+  if(!rules || !rules.restrictedStatusId) return all;
+  if(order.statusId !== rules.restrictedStatusId) return all;
+  const allowed = (rules.allowedNextIds||[]).slice();
+  if(!allowed.includes(order.statusId)) allowed.push(order.statusId);
+  return allowed;
+}
 
 /* ================= GOOGLE PICKER (one-time shared-folder access, drive.file scope) ================= */
 let pickerLoaded = false;
@@ -852,7 +905,8 @@ async function loadLatestLegacyCombinedState(){
   const data = await driveDownloadJSON(f.id);
   return {
     orders: data.orders || [], sellerPayments: data.sellerPayments || [],
-    statuses: data.statuses || null, users: data.users || [], _legacy: true,
+    statuses: data.statuses || null, users: data.users || [],
+    statusRules: data.statusRules || null, _legacy: true,
   };
 }
 async function loadLatestState(){
@@ -873,6 +927,7 @@ async function loadLatestState(){
       sellerPayments: (debtData && debtData.sellerPayments) || [],
       statuses: (settingsData && settingsData.statuses && settingsData.statuses.length) ? settingsData.statuses : null,
       users: (settingsData && settingsData.users) || [],
+      statusRules: (settingsData && settingsData.statusRules) || null,
     };
   }
   // Nothing in the new locations at all -- either a brand-new Drive folder, or data that was only
@@ -886,7 +941,7 @@ async function saveState(){
   await Promise.all([
     driveCreateJSON(`orders_${ts}.json`, FOLDERS.orders, { orders: STATE.orders, savedAt: STATE.savedAt }),
     driveCreateJSON(`debt_${ts}.json`, FOLDERS.debt, { sellerPayments: STATE.sellerPayments, savedAt: STATE.savedAt }),
-    driveCreateJSON(`settings_${ts}.json`, FOLDERS.config, { statuses: STATE.statuses, users: STATE.users, savedAt: STATE.savedAt }),
+    driveCreateJSON(`settings_${ts}.json`, FOLDERS.config, { statuses: STATE.statuses, users: STATE.users, statusRules: STATE.statusRules, savedAt: STATE.savedAt }),
   ]);
 }
 
@@ -900,8 +955,9 @@ async function refreshAll(){
       STATE.orders = loaded.orders || [];
       STATE.sellerPayments = loaded.sellerPayments || [];
       STATE.users = loaded.users || [];
+      STATE.statusRules = loaded.statusRules || { restrictedStatusId: null, allowedNextIds: [] };
     } else {
-      STATE = { statuses: JSON.parse(JSON.stringify(DEFAULT_STATUSES)), orders: [], sellerPayments: [], users: [] };
+      STATE = { statuses: JSON.parse(JSON.stringify(DEFAULT_STATUSES)), orders: [], sellerPayments: [], users: [], statusRules: { restrictedStatusId: null, allowedNextIds: [] } };
     }
     // One-time upgrade: data was only found in the old combined state_*.json (pre-split format).
     // Immediately re-save in the new split-by-folder format so every save from now on goes to the
@@ -934,6 +990,7 @@ async function refreshAll(){
     renderDebtGrid();
     renderDebtPaymentsGrid();
     renderUsersList();
+    renderStatusRulesForm();
     await loadPriceHistory();
     await loadIpList();
   } catch(e){
@@ -983,7 +1040,7 @@ async function addStatus(){
   STATE.statuses.push({ id, label, color, excludeStats });
   document.getElementById('s_label').value = '';
   document.getElementById('s_excludeStats').checked = false;
-  renderStatusList(); renderStatusSelects(); renderOrdersGrid(); renderOrderStats();
+  renderStatusList(); renderStatusSelects(); renderOrdersGrid(); renderOrderStats(); renderStatusRulesForm();
   toast('Сохранение…');
   try { await saveState(); toast('Статус добавлен', 'ok'); } catch(e){ toast('Ошибка сохранения: '+e.message, 'err'); }
 }
@@ -998,7 +1055,13 @@ window.toggleStatusExcludeStats = async function(id, checked){
 async function deleteStatus(id){
   if(!confirm('Удалить статус? Заявки с этим статусом останутся, но статус будет показан как «неизвестный».')) return;
   STATE.statuses = STATE.statuses.filter(s=>s.id!==id);
-  renderStatusList(); renderStatusSelects(); renderOrdersGrid();
+  // A deleted status can't stay referenced by the status-change rule below -- drop it from either
+  // side so the rule doesn't silently point at a status that no longer exists.
+  if(STATE.statusRules){
+    if(STATE.statusRules.restrictedStatusId === id) STATE.statusRules.restrictedStatusId = null;
+    if(STATE.statusRules.allowedNextIds) STATE.statusRules.allowedNextIds = STATE.statusRules.allowedNextIds.filter(x=>x!==id);
+  }
+  renderStatusList(); renderStatusSelects(); renderOrdersGrid(); renderStatusRulesForm();
   try { await saveState(); toast('Статус удалён', 'ok'); } catch(e){ toast('Ошибка сохранения: '+e.message, 'err'); }
 }
 function statusOf(id){ return STATE.statuses.find(s=>s.id===id) || { id, label:'Неизвестно', color:'#94a3b8' }; }
@@ -1007,6 +1070,37 @@ function statusOf(id){ return STATE.statuses.find(s=>s.id===id) || { id, label:'
 function isStatsExcluded(o){
   const st = STATE.statuses.find(s=>s.id===o.statusId);
   return !!(st && st.excludeStats);
+}
+// Renders the "Права на смену статуса" form from whatever's actually in STATE.statuses right now
+// (including any custom/renamed statuses AV added himself) -- deliberately never hardcodes which
+// status IDs these are, since that's exactly what can't be known from this file alone.
+function renderStatusRulesForm(){
+  const sel = document.getElementById('sr_restrictedStatus');
+  const box = document.getElementById('sr_allowedNext');
+  if(!sel || !box) return;
+  const rules = STATE.statusRules || { restrictedStatusId: null, allowedNextIds: [] };
+  sel.innerHTML = '<option value="">— не ограничивать —</option>' +
+    STATE.statuses.map(s=>`<option value="${s.id}" ${s.id===rules.restrictedStatusId?'selected':''}>${escapeHtml(s.label)}</option>`).join('');
+  box.innerHTML = STATE.statuses.map(s=>`
+    <label style="display:flex; align-items:center; gap:4px; font-size:12px; font-weight:400;">
+      <input type="checkbox" class="sr_allowed_cb" value="${s.id}" ${(rules.allowedNextIds||[]).includes(s.id)?'checked':''} style="width:auto;"> ${escapeHtml(s.label)}
+    </label>`).join('');
+}
+async function saveStatusRules(){
+  const restrictedStatusId = document.getElementById('sr_restrictedStatus').value || null;
+  const allowedNextIds = Array.from(document.querySelectorAll('.sr_allowed_cb:checked')).map(cb=>cb.value);
+  STATE.statusRules = { restrictedStatusId, allowedNextIds };
+  renderOrdersGrid();
+  const hint = document.getElementById('statusRulesHint');
+  if(hint) hint.textContent = 'Сохранение…';
+  try {
+    await saveState();
+    if(hint) hint.textContent = 'Сохранено';
+    toast('Правило смены статуса сохранено', 'ok');
+  } catch(e){
+    if(hint) hint.textContent = 'Ошибка сохранения: ' + e.message;
+    toast('Ошибка сохранения', 'err');
+  }
 }
 
 /* ================= ПОЛЬЗОВАТЕЛИ И ПРАВА ДОСТУПА =================
@@ -1150,11 +1244,18 @@ function renderOrderStats(){
   const statsOrders = STATE.orders.filter(o=>!isStatsExcluded(o));
   const total = statsOrders.length;
   const sum = statsOrders.reduce((a,o)=>a+(Number(o.price)||0),0);
+  // "Оплачено" here is all-time (not week-scoped) -- distinct from the "Оплачено за неделю" cards
+  // further down, which are scoped to the selected week.
+  const paidOrders = statsOrders.filter(o=>o.statusId==='paid');
+  const paidCount = paidOrders.length;
+  const paidSum = paidOrders.reduce((a,o)=>a+(Number(o.price)||0),0);
   const byStatus = {};
   statsOrders.forEach(o=>{ byStatus[o.statusId] = (byStatus[o.statusId]||0)+1; });
   let cards = `
     <div class="stat"><div class="n">${total}</div><div class="l">Всего заявок</div></div>
-    <div class="stat"><div class="n">${fmtMoneyInt(sum)} ₽</div><div class="l">Сумма заявок</div></div>`;
+    <div class="stat"><div class="n">${fmtMoneyInt(sum)} ₽</div><div class="l">Сумма заявок</div></div>
+    <div class="stat"><div class="n">${paidCount}</div><div class="l">Оплаченных заявок</div></div>
+    <div class="stat"><div class="n">${fmtMoneyInt(paidSum)} ₽</div><div class="l">Сумма оплаченных заявок</div></div>`;
   STATE.statuses.slice(0,4).forEach(s=>{
     cards += `<div class="stat"><div class="n">${byStatus[s.id]||0}</div><div class="l">${escapeHtml(s.label)}</div></div>`;
   });
@@ -1511,6 +1612,14 @@ window.setOrderDelivery = function(id, val){
 window.changeOrderStatus = async function(id, statusId){
   const o = STATE.orders.find(x=>x.id===id);
   if(!o) return;
+  // Defense in depth: the <select> in the grid already only lists allowed options, so this should
+  // normally never trigger -- but re-checking here means a stale/cached render can't be used to
+  // slip through a transition that isn't actually allowed.
+  if(!allowedNextStatusIds(o).includes(statusId)){
+    toast('Недостаточно прав для этого перехода статуса', 'err');
+    renderOrdersGrid();
+    return;
+  }
   o.statusId = statusId; o.updatedAt = new Date().toISOString();
   renderOrderStats();
   // This used to skip renderOrdersGrid() entirely: the native <select> visually showed the just-
@@ -1644,7 +1753,9 @@ function renderOrdersGrid(){
       { name:'Клиент' }, { name:'Телефон', width:'120px' },
       { name:'Статус', width:'160px', formatter:(cell)=>{
           const d = JSON.parse(cell);
-          return gridjs.html(`<select onchange="window.changeOrderStatus('${d.id}', this.value)" style="font-size:11px; padding:3px;">${STATE.statuses.map(s=>`<option value="${s.id}" ${s.id===d.statusId?'selected':''}>${escapeHtml(s.label)}</option>`).join('')}</select>`);
+          const allowedIds = new Set(allowedNextStatusIds(d));
+          const options = STATE.statuses.filter(s=>allowedIds.has(s.id));
+          return gridjs.html(`<select onchange="window.changeOrderStatus('${d.id}', this.value)" style="font-size:11px; padding:3px;">${options.map(s=>`<option value="${s.id}" ${s.id===d.statusId?'selected':''}>${escapeHtml(s.label)}</option>`).join('')}</select>`);
         }},
       { name:'Сумма', width:'100px', formatter:(cell)=>{
           const d = JSON.parse(cell);
@@ -1911,16 +2022,61 @@ async function removeDuplicateOrders(){
 window.removeDuplicateOrders = removeDuplicateOrders;
 
 /* ================= SALES REPORT (paid orders) ================= */
+// Session-only UI state (not saved to Drive) -- filters both the on-screen grid/totals and the
+// XLSX/CSV export, so "выгрузить за период" is just "apply the date range, then export" rather
+// than a separate export-only control.
+let REPORT_DATE_FROM = null, REPORT_DATE_TO = null;
 function getPaidOrdersForReport(){
-  return STATE.orders.filter(o=>o.statusId==='paid' && !isStatsExcluded(o));
+  return STATE.orders.filter(o=>{
+    if(o.statusId!=='paid' || isStatsExcluded(o)) return false;
+    if(REPORT_DATE_FROM && (!o.orderDate || o.orderDate < REPORT_DATE_FROM)) return false;
+    if(REPORT_DATE_TO && (!o.orderDate || o.orderDate > REPORT_DATE_TO)) return false;
+    return true;
+  });
+}
+window.applyReportDateFilter = function(){
+  REPORT_DATE_FROM = document.getElementById('reportDateFrom').value || null;
+  REPORT_DATE_TO = document.getElementById('reportDateTo').value || null;
+  renderSalesReportGrid();
+  toast(`Показаны оплаченные заявки: ${getPaidOrdersForReport().length}`, 'ok');
+};
+window.resetReportDateFilter = function(){
+  REPORT_DATE_FROM = null; REPORT_DATE_TO = null;
+  document.getElementById('reportDateFrom').value = '';
+  document.getElementById('reportDateTo').value = '';
+  renderSalesReportGrid();
+};
+function computeSalesReportTotals(data){
+  return {
+    count: data.length,
+    price: data.reduce((a,o)=>a+(Number(o.price)||0),0),
+    cc: data.reduce((a,o)=>a+(o.cc!=null?Number(o.cc):0),0),
+    logistics: data.reduce((a,o)=>a+(o.logistics!=null?Number(o.logistics):0),0),
+    placement: data.reduce((a,o)=>a+(orderPlacement(o)||0),0),
+  };
+}
+function renderSalesReportTotals(data){
+  const el = document.getElementById('reportSalesTotals');
+  if(!el) return;
+  if(!data.length){ el.innerHTML = ''; return; }
+  const t = computeSalesReportTotals(data);
+  el.innerHTML = `
+    <div class="btn-row" style="flex-wrap:wrap; font-size:13px; font-weight:600; border-top:2px solid var(--border); padding-top:8px; margin-top:4px;">
+      <span>Итого (${t.count} заявок):</span>
+      <span>Сумма заказов: ${fmtMoney(t.price)} ₽</span>
+      <span>СС: ${fmtMoney(t.cc)} ₽</span>
+      <span>Логистика: ${fmtMoney(t.logistics)} ₽</span>
+      <span>Размещение: ${fmtMoney(t.placement)} ₽</span>
+    </div>`;
 }
 function renderSalesReportGrid(){
   const el = document.getElementById('reportSalesGrid');
   if(!el) return; // panel not in DOM yet in some test harnesses
   const data = getPaidOrdersForReport();
+  renderSalesReportTotals(data);
   if(!data.length){
     destroyGrid(REPORT_GRID); REPORT_GRID = null;
-    el.innerHTML = '<div class="empty">Нет оплаченных заявок</div>';
+    el.innerHTML = '<div class="empty">Нет оплаченных заявок за выбранный период</div>';
     return;
   }
   REPORT_GRID = renderGridInto(REPORT_GRID, el, {
@@ -1938,11 +2094,25 @@ function renderSalesReportGrid(){
   });
 }
 function buildSalesReportRows(){
-  return getPaidOrdersForReport().map(o=>({
+  const data = getPaidOrdersForReport();
+  const rows = data.map(o=>({
     'Номер заявки': o.orderNumber, 'Артикул': o.article,
     'Сумма заказа': o.price, 'СС': o.cc, 'Логистика': o.logistics,
     'Стоимость размещения': orderPlacement(o), 'ИНН': o.inn,
   }));
+  if(rows.length){
+    const t = computeSalesReportTotals(data);
+    rows.push({
+      'Номер заявки': 'ИТОГО', 'Артикул': '',
+      'Сумма заказа': t.price, 'СС': t.cc, 'Логистика': t.logistics,
+      'Стоимость размещения': t.placement, 'ИНН': '',
+    });
+  }
+  return rows;
+}
+function reportFileStamp(){
+  if(REPORT_DATE_FROM || REPORT_DATE_TO) return `${REPORT_DATE_FROM||'начало'}_${REPORT_DATE_TO||'конец'}`;
+  return new Date().toISOString().slice(0,10);
 }
 function exportSalesReportXlsx(){
   const rows = buildSalesReportRows();
@@ -1950,15 +2120,13 @@ function exportSalesReportXlsx(){
   const ws = XLSX.utils.json_to_sheet(rows);
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, 'Отчёт по продажам');
-  const stamp = new Date().toISOString().slice(0,10);
-  XLSX.writeFile(wb, `Отчет_по_продажам_${stamp}.xlsx`);
+  XLSX.writeFile(wb, `Отчет_по_продажам_${reportFileStamp()}.xlsx`);
 }
 function exportSalesReportCsv(){
   const rows = buildSalesReportRows();
   if(!rows.length){ toast('Нет оплаченных заявок для выгрузки', 'err'); return; }
   const headers = Object.keys(rows[0]);
-  const stamp = new Date().toISOString().slice(0,10);
-  downloadBlob(`Отчет_по_продажам_${stamp}.csv`, toCSV(rows, headers), 'text/csv;charset=utf-8');
+  downloadBlob(`Отчет_по_продажам_${reportFileStamp()}.csv`, toCSV(rows, headers), 'text/csv;charset=utf-8');
 }
 
 /* ================= SELLER DEBT (ДП) ================= */
