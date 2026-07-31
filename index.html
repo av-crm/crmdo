@@ -352,6 +352,10 @@
         <label>Статус «Сделка завершена» (используется в Долге продавца и в «Стоимости размещения» на дашборде)</label>
         <select id="sr_dealDoneStatus"></select>
       </div>
+      <div class="field" style="margin-top:8px;">
+        <label>Какие статусы считать «оплачено» (карточки «Оплаченных заявок» на дашборде + Отчёт по продажам)</label>
+        <div id="sr_paidStatuses" class="btn-row" style="flex-wrap:wrap;"></div>
+      </div>
       <div class="btn-row" style="margin-top:8px;">
         <button class="btn" onclick="saveStatusRules()">Сохранить правило</button>
         <span class="hint" id="statusRulesHint"></span>
@@ -408,7 +412,7 @@
   <div class="panel" id="panel-reports">
     <div class="card">
       <h2>Отчёт по продажам (оплаченные заявки)</h2>
-      <p class="hint">Заявки в статусе «Оплачена»: номер заявки, артикул, сумма заказа, СС, логистика, стоимость размещения, ИНН.</p>
+      <p class="hint">Заявки в статусах, отмеченных как «оплачено» (настраивается в Настройки → «Права на смену статуса заявки»): номер заявки, артикул, сумма заказа, СС, логистика, стоимость размещения, ИНН.</p>
       <div class="grid-3" style="margin-bottom:10px;">
         <div class="field"><label>Дата заявки с</label><input type="date" id="reportDateFrom"></div>
         <div class="field"><label>Дата заявки по</label><input type="date" id="reportDateTo"></div>
@@ -513,7 +517,12 @@ let currentUserEmail = null;
 // "Стоимость размещения" card. Used to hardcode the seed id 'done' in three places, but AV deleted
 // that status and replaced it with a differently-named custom one -- same "can't know the real ID
 // in advance" situation as statusRules above, so this is also configured once from Настройки.
-let STATE = { statuses: JSON.parse(JSON.stringify(DEFAULT_STATUSES)), orders: [], sellerPayments: [], users: [], statusRules: { restrictedStatusId: null, allowedNextIds: [] }, dealDoneStatusId: null };
+// paidStatusIds: which statuses count as "оплачено" for the dashboard's Оплаченных заявок /
+// Сумма оплаченных заявок cards (both all-time and weekly) and for the Отчёт по продажам. AV wants
+// this to include Оплачена + Выставлен счёт + Сделка завершена, not just the single "paid" status
+// -- same reasoning as above, configured via checkboxes rather than hardcoded ids. Defaults to just
+// ['paid'] until set, matching the behaviour before this setting existed.
+let STATE = { statuses: JSON.parse(JSON.stringify(DEFAULT_STATUSES)), orders: [], sellerPayments: [], users: [], statusRules: { restrictedStatusId: null, allowedNextIds: [] }, dealDoneStatusId: null, paidStatusIds: ['paid'] };
 let ORDERS_GRID = null, PRICE_GRID = null, REPORT_GRID = null, DEBT_GRID = null, DEBT_PAYMENTS_GRID = null;
 // Grid.js's own pagination turned out to lose track of the current page across data updates in
 // practice (see renderGridInto's comment) even after two attempts to make it behave. Orders is the
@@ -920,7 +929,8 @@ async function loadLatestLegacyCombinedState(){
   return {
     orders: data.orders || [], sellerPayments: data.sellerPayments || [],
     statuses: data.statuses || null, users: data.users || [],
-    statusRules: data.statusRules || null, dealDoneStatusId: data.dealDoneStatusId || null, _legacy: true,
+    statusRules: data.statusRules || null, dealDoneStatusId: data.dealDoneStatusId || null,
+    paidStatusIds: data.paidStatusIds || null, _legacy: true,
   };
 }
 async function loadLatestState(){
@@ -943,6 +953,7 @@ async function loadLatestState(){
       users: (settingsData && settingsData.users) || [],
       statusRules: (settingsData && settingsData.statusRules) || null,
       dealDoneStatusId: (settingsData && settingsData.dealDoneStatusId) || null,
+      paidStatusIds: (settingsData && settingsData.paidStatusIds) || null,
     };
   }
   // Nothing in the new locations at all -- either a brand-new Drive folder, or data that was only
@@ -956,7 +967,7 @@ async function saveState(){
   await Promise.all([
     driveCreateJSON(`orders_${ts}.json`, FOLDERS.orders, { orders: STATE.orders, savedAt: STATE.savedAt }),
     driveCreateJSON(`debt_${ts}.json`, FOLDERS.debt, { sellerPayments: STATE.sellerPayments, savedAt: STATE.savedAt }),
-    driveCreateJSON(`settings_${ts}.json`, FOLDERS.config, { statuses: STATE.statuses, users: STATE.users, statusRules: STATE.statusRules, dealDoneStatusId: STATE.dealDoneStatusId, savedAt: STATE.savedAt }),
+    driveCreateJSON(`settings_${ts}.json`, FOLDERS.config, { statuses: STATE.statuses, users: STATE.users, statusRules: STATE.statusRules, dealDoneStatusId: STATE.dealDoneStatusId, paidStatusIds: STATE.paidStatusIds, savedAt: STATE.savedAt }),
   ]);
 }
 
@@ -972,8 +983,9 @@ async function refreshAll(){
       STATE.users = loaded.users || [];
       STATE.statusRules = loaded.statusRules || { restrictedStatusId: null, allowedNextIds: [] };
       STATE.dealDoneStatusId = loaded.dealDoneStatusId || null;
+      STATE.paidStatusIds = (loaded.paidStatusIds && loaded.paidStatusIds.length) ? loaded.paidStatusIds : ['paid'];
     } else {
-      STATE = { statuses: JSON.parse(JSON.stringify(DEFAULT_STATUSES)), orders: [], sellerPayments: [], users: [], statusRules: { restrictedStatusId: null, allowedNextIds: [] }, dealDoneStatusId: null };
+      STATE = { statuses: JSON.parse(JSON.stringify(DEFAULT_STATUSES)), orders: [], sellerPayments: [], users: [], statusRules: { restrictedStatusId: null, allowedNextIds: [] }, dealDoneStatusId: null, paidStatusIds: ['paid'] };
     }
     // Back-compat one-time guess: if it's never been configured but a status literally called
     // 'done' still exists (i.e. AV never renamed/removed it), assume that's still "завершена" so
@@ -1182,6 +1194,14 @@ function isStatsExcluded(o){
 function isDealDoneStatus(o){
   return !!STATE.dealDoneStatusId && o.statusId === STATE.dealDoneStatusId;
 }
+// Which statuses count as "оплачено" for the dashboard's Оплаченных заявок / Сумма оплаченных
+// заявок cards (all-time AND weekly) and for Отчёт по продажам -- configurable in Настройки
+// (checkboxes), since AV wants Оплачена + Выставлен счёт + Сделка завершена all counted, not just
+// the single "paid" status, and the latter two are custom statuses with unknown real ids.
+function isPaidLikeStatus(o){
+  const ids = (STATE.paidStatusIds && STATE.paidStatusIds.length) ? STATE.paidStatusIds : ['paid'];
+  return ids.includes(o.statusId);
+}
 // Renders the "Права на смену статуса" form from whatever's actually in STATE.statuses right now
 // (including any custom/renamed statuses AV added himself) -- deliberately never hardcodes which
 // status IDs these are, since that's exactly what can't be known from this file alone.
@@ -1189,6 +1209,7 @@ function renderStatusRulesForm(){
   const sel = document.getElementById('sr_restrictedStatus');
   const box = document.getElementById('sr_allowedNext');
   const doneSel = document.getElementById('sr_dealDoneStatus');
+  const paidBox = document.getElementById('sr_paidStatuses');
   if(!sel || !box) return;
   const rules = STATE.statusRules || { restrictedStatusId: null, allowedNextIds: [] };
   sel.innerHTML = '<option value="">— не ограничивать —</option>' +
@@ -1200,6 +1221,13 @@ function renderStatusRulesForm(){
   if(doneSel){
     doneSel.innerHTML = '<option value="">— не задано —</option>' +
       STATE.statuses.map(s=>`<option value="${s.id}" ${s.id===STATE.dealDoneStatusId?'selected':''}>${escapeHtml(s.label)}</option>`).join('');
+  }
+  if(paidBox){
+    const paidIds = (STATE.paidStatusIds && STATE.paidStatusIds.length) ? STATE.paidStatusIds : ['paid'];
+    paidBox.innerHTML = STATE.statuses.map(s=>`
+      <label style="display:flex; align-items:center; gap:4px; font-size:12px; font-weight:400;">
+        <input type="checkbox" class="sr_paid_cb" value="${s.id}" ${paidIds.includes(s.id)?'checked':''} style="width:auto;"> ${escapeHtml(s.label)}
+      </label>`).join('');
   }
   renderDebtDoneStatusHint();
 }
@@ -1217,12 +1245,15 @@ async function saveStatusRules(){
   const restrictedStatusId = document.getElementById('sr_restrictedStatus').value || null;
   const allowedNextIds = Array.from(document.querySelectorAll('.sr_allowed_cb:checked')).map(cb=>cb.value);
   const dealDoneSel = document.getElementById('sr_dealDoneStatus');
+  const paidIds = Array.from(document.querySelectorAll('.sr_paid_cb:checked')).map(cb=>cb.value);
   STATE.statusRules = { restrictedStatusId, allowedNextIds };
   if(dealDoneSel) STATE.dealDoneStatusId = dealDoneSel.value || null;
+  STATE.paidStatusIds = paidIds.length ? paidIds : ['paid'];
   renderOrdersGrid();
   renderDebtGrid();
   renderDebtDoneStatusHint();
   renderOrderStats();
+  renderSalesReportGrid();
   const hint = document.getElementById('statusRulesHint');
   if(hint) hint.textContent = 'Сохранение…';
   try {
@@ -1364,7 +1395,7 @@ function weekMetrics(start, end){
   const orders = STATE.orders.filter(o=>o.orderDate && o.orderDate>=start && o.orderDate<=end && !isStatsExcluded(o));
   const count = orders.length;
   const sum = orders.reduce((a,o)=>a+(Number(o.price)||0),0);
-  const paid = orders.filter(o=>o.statusId==='paid');
+  const paid = orders.filter(isPaidLikeStatus);
   const paidCount = paid.length;
   const paidSum = paid.reduce((a,o)=>a+(Number(o.price)||0),0);
   const paidOrDone = orders.filter(o=>o.statusId==='paid' || isDealDoneStatus(o));
@@ -1378,7 +1409,7 @@ function renderOrderStats(){
   const sum = statsOrders.reduce((a,o)=>a+(Number(o.price)||0),0);
   // "Оплачено" here is all-time (not week-scoped) -- distinct from the "Оплачено за неделю" cards
   // further down, which are scoped to the selected week.
-  const paidOrders = statsOrders.filter(o=>o.statusId==='paid');
+  const paidOrders = statsOrders.filter(isPaidLikeStatus);
   const paidCount = paidOrders.length;
   const paidSum = paidOrders.reduce((a,o)=>a+(Number(o.price)||0),0);
   // All-time (not week-scoped) -- distinct from weekMetrics().placementSum used further down in the
@@ -2167,7 +2198,7 @@ window.removeDuplicateOrders = removeDuplicateOrders;
 let REPORT_DATE_FROM = null, REPORT_DATE_TO = null;
 function getPaidOrdersForReport(){
   return STATE.orders.filter(o=>{
-    if(o.statusId!=='paid' || isStatsExcluded(o)) return false;
+    if(!isPaidLikeStatus(o) || isStatsExcluded(o)) return false;
     if(REPORT_DATE_FROM && (!o.orderDate || o.orderDate < REPORT_DATE_FROM)) return false;
     if(REPORT_DATE_TO && (!o.orderDate || o.orderDate > REPORT_DATE_TO)) return false;
     return true;
