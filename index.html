@@ -412,8 +412,12 @@
   <!-- REPORTS TAB -->
   <div class="panel" id="panel-reports">
     <div class="card">
-      <h2>Отчёт по продажам (оплаченные заявки)</h2>
-      <p class="hint">Заявки в статусах, отмеченных как «оплачено» (настраивается в Настройки → «Права на смену статуса заявки»): номер заявки, артикул, сумма заказа, СС, логистика, стоимость размещения, ИНН.</p>
+      <h2>Отчёт по продажам</h2>
+      <p class="hint">Номер заявки, артикул, сумма заказа, СС, логистика, стоимость размещения, ИНН.</p>
+      <div class="field" style="margin-bottom:10px;">
+        <label>Статусы, которые попадают в отчёт</label>
+        <div id="reportStatusFilter" class="btn-row" style="flex-wrap:wrap;"></div>
+      </div>
       <div class="grid-3" style="margin-bottom:10px;">
         <div class="field"><label>Дата заявки с</label><input type="date" id="reportDateFrom"></div>
         <div class="field"><label>Дата заявки по</label><input type="date" id="reportDateTo"></div>
@@ -1036,6 +1040,7 @@ async function refreshAll(){
     renderDebtPaymentsGrid();
     renderUsersList();
     renderStatusRulesForm();
+    renderReportStatusFilter();
     await loadPriceHistory();
     await loadIpList();
     // Re-apply tab visibility here too (not just from enterApp()'s initial call) -- otherwise
@@ -1154,7 +1159,7 @@ window.applyRequestedStatusOrder = async function(){
   });
   const remaining = STATE.statuses.filter(s=>!usedIds.has(s.id));
   STATE.statuses = [...matchedIds.map(id=>STATE.statuses.find(s=>s.id===id)), ...remaining];
-  renderStatusList(); renderStatusSelects(); renderOrdersGrid(); renderOrderStats(); renderStatusRulesForm();
+  renderStatusList(); renderStatusSelects(); renderOrdersGrid(); renderOrderStats(); renderStatusRulesForm(); renderReportStatusFilter(); renderSalesReportGrid();
   try {
     await saveState();
     if(unmatched.length){
@@ -1173,7 +1178,7 @@ async function addStatus(){
   STATE.statuses.push({ id, label, color, excludeStats });
   document.getElementById('s_label').value = '';
   document.getElementById('s_excludeStats').checked = false;
-  renderStatusList(); renderStatusSelects(); renderOrdersGrid(); renderOrderStats(); renderStatusRulesForm();
+  renderStatusList(); renderStatusSelects(); renderOrdersGrid(); renderOrderStats(); renderStatusRulesForm(); renderReportStatusFilter();
   toast('Сохранение…');
   try { await saveState(); toast('Статус добавлен', 'ok'); } catch(e){ toast('Ошибка сохранения: '+e.message, 'err'); }
 }
@@ -1194,7 +1199,7 @@ async function deleteStatus(id){
     if(STATE.statusRules.restrictedStatusId === id) STATE.statusRules.restrictedStatusId = null;
     if(STATE.statusRules.allowedNextIds) STATE.statusRules.allowedNextIds = STATE.statusRules.allowedNextIds.filter(x=>x!==id);
   }
-  renderStatusList(); renderStatusSelects(); renderOrdersGrid(); renderStatusRulesForm();
+  renderStatusList(); renderStatusSelects(); renderOrdersGrid(); renderStatusRulesForm(); renderReportStatusFilter();
   try { await saveState(); toast('Статус удалён', 'ok'); } catch(e){ toast('Ошибка сохранения: '+e.message, 'err'); }
 }
 function statusOf(id){ return STATE.statuses.find(s=>s.id===id) || { id, label:'Неизвестно', color:'#94a3b8' }; }
@@ -2206,14 +2211,54 @@ async function removeDuplicateOrders(){
 }
 window.removeDuplicateOrders = removeDuplicateOrders;
 
-/* ================= SALES REPORT (paid orders) ================= */
+/* ================= SALES REPORT ================= */
 // Session-only UI state (not saved to Drive) -- filters both the on-screen grid/totals and the
 // XLSX/CSV export, so "выгрузить за период" is just "apply the date range, then export" rather
 // than a separate export-only control.
 let REPORT_DATE_FROM = null, REPORT_DATE_TO = null;
+// Which statuses the report shows, independent of the dashboard's "Настройки → какие статусы
+// считать оплачено" setting -- AV wants this report specifically scoped to Оплачена / Выставлен
+// счёт / Сделка завершена with checkboxes to narrow it down further, not tied to whatever the
+// dashboard is configured to count as "paid". Matched fuzzily against real status labels (same
+// helper used for status reordering) since the exact ids of the custom statuses aren't known here.
+// null = not yet initialized; a Set once it has been.
+let REPORT_STATUS_FILTER = null;
+const REPORT_TARGET_LABELS = ['Оплачена', 'Выставлен счет', 'Сделка завершена'];
+function reportRelevantStatuses(){
+  const used = new Set();
+  const result = [];
+  REPORT_TARGET_LABELS.forEach(label=>{
+    const st = findStatusByFuzzyLabel(label, used);
+    if(st){ result.push(st); used.add(st.id); }
+  });
+  return result;
+}
+function ensureReportStatusFilter(){
+  if(REPORT_STATUS_FILTER) return;
+  REPORT_STATUS_FILTER = new Set(reportRelevantStatuses().map(s=>s.id));
+}
+function renderReportStatusFilter(){
+  const el = document.getElementById('reportStatusFilter');
+  if(!el) return;
+  ensureReportStatusFilter();
+  const statuses = reportRelevantStatuses();
+  if(!statuses.length){
+    el.innerHTML = '<span class="hint">Не нашлись статусы «Оплачена» / «Выставлен счёт» / «Сделка завершена» — проверьте названия в Настройки → «Статусы заявок».</span>';
+    return;
+  }
+  el.innerHTML = statuses.map(s=>`
+    <label style="display:flex; align-items:center; gap:4px; font-size:12px; font-weight:400;">
+      <input type="checkbox" class="report_status_cb" value="${s.id}" ${REPORT_STATUS_FILTER.has(s.id)?'checked':''} onchange="window.onReportStatusFilterChange()" style="width:auto;"> ${escapeHtml(s.label)}
+    </label>`).join('');
+}
+window.onReportStatusFilterChange = function(){
+  REPORT_STATUS_FILTER = new Set(Array.from(document.querySelectorAll('.report_status_cb:checked')).map(cb=>cb.value));
+  renderSalesReportGrid();
+};
 function getPaidOrdersForReport(){
+  ensureReportStatusFilter();
   return STATE.orders.filter(o=>{
-    if(!isPaidLikeStatus(o) || isStatsExcluded(o)) return false;
+    if(!REPORT_STATUS_FILTER.has(o.statusId) || isStatsExcluded(o)) return false;
     if(REPORT_DATE_FROM && (!o.orderDate || o.orderDate < REPORT_DATE_FROM)) return false;
     if(REPORT_DATE_TO && (!o.orderDate || o.orderDate > REPORT_DATE_TO)) return false;
     return true;
