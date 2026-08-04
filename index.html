@@ -492,7 +492,7 @@ const TOKEN_KEY = 'crm_access_token';
 // per-section access control below). This is a non-sensitive scope (no extra Google verification
 // needed) but IS a new permission — anyone who already has a cached token from before this change
 // will be prompted to re-approve once on their next sign-in.
-const SCOPES = 'https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/userinfo.email';
+const SCOPES = 'https://www.googleapis.com/auth/drive https://www.googleapis.com/auth/userinfo.email';
 const API_KEY_KEY = 'crm_google_api_key';
 // Hardcoded so the owner's own account can never be locked out by a mistake in the Пользователи
 // list below (e.g. removing/mis-typing their own row). Always has every section regardless of
