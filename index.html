@@ -119,6 +119,7 @@
   <header class="top">
     <div>
       <h1>CRM — Заявки и Прайсы</h1>
+      <div class="sub" id="signedInAs"></div>
       <div class="sub" id="syncInfo">Загрузка данных из Google Диска…</div>
     </div>
     <div class="btn-row">
@@ -220,7 +221,7 @@
       <h3>Шаг 1. Продавец</h3>
       <div class="grid-3">
         <div class="field"><label>Продавец (ИП/контрагент)</label><select id="calc_ip"></select></div>
-        <div class="field"><label>&nbsp;</label><button class="btn secondary" id="calc_ipAddToggle" type="button" onclick="document.getElementById('calc_ipAdd').classList.toggle('show')">+ добавить контрагента</button></div>
+        <div class="field"><label>&nbsp;</label><button class="btn secondary" id="calc_ipAddToggle" type="button" onclick="toggleCalcIpAdd()">+ добавить контрагента</button></div>
       </div>
       <div class="grid-3" id="calc_ipAdd" style="display:none;">
         <div class="field"><label>Название</label><input type="text" id="calc_ipName" placeholder="ИП Иванов Иван Иванович"></div>
@@ -492,7 +493,7 @@ const TOKEN_KEY = 'crm_access_token';
 // per-section access control below). This is a non-sensitive scope (no extra Google verification
 // needed) but IS a new permission — anyone who already has a cached token from before this change
 // will be prompted to re-approve once on their next sign-in.
-const SCOPES = 'https://www.googleapis.com/auth/drive https://www.googleapis.com/auth/userinfo.email';
+const SCOPES = 'https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/userinfo.email';
 const API_KEY_KEY = 'crm_google_api_key';
 // Hardcoded so the owner's own account can never be locked out by a mistake in the Пользователи
 // list below (e.g. removing/mis-typing their own row). Always has every section regardless of
@@ -705,8 +706,17 @@ function signOut(){
 async function enterApp(){
   document.getElementById('authGate').style.display = 'none';
   document.getElementById('app').style.display = 'block';
+  renderSignedInAs();
   await refreshAll();
   applyAccessControl();
+}
+// Shows who's actually signed in, top-left under the title -- came up because it wasn't obvious
+// (e.g. in an incognito window testing a colleague's access) which Google account was active.
+function renderSignedInAs(){
+  const el = document.getElementById('signedInAs');
+  if(!el) return;
+  if(!currentUserEmail){ el.textContent = ''; return; }
+  el.textContent = 'Вы вошли как: ' + currentUserEmail + (currentUserEmail === ADMIN_EMAIL ? ' (администратор)' : '');
 }
 // Section access: the hardcoded ADMIN_EMAIL always gets everything (can't be locked out by a
 // mistake in the Пользователи list). Anyone else must be explicitly added in Настройки → for them,
@@ -1028,6 +1038,11 @@ async function refreshAll(){
     renderStatusRulesForm();
     await loadPriceHistory();
     await loadIpList();
+    // Re-apply tab visibility here too (not just from enterApp()'s initial call) -- otherwise
+    // someone sitting on the "Доступ не настроен" screen who just got added in Настройки would
+    // have to fully reload the page rather than just clicking "Обновить данные" to see their new
+    // access, since STATE.users is only refreshed by this function.
+    applyAccessControl();
   } catch(e){
     console.error(e);
     document.getElementById('syncInfo').textContent = 'Ошибка загрузки данных.';
@@ -2571,6 +2586,15 @@ function renderCalcIpSelect(){
   sel.innerHTML = CALC_IP_LIST.map(ip=>`<option value="${ip.id}">${escapeHtml(ip.name)} — ИНН ${escapeHtml(ip.inn)}</option>`).join('');
   if(current && CALC_IP_LIST.some(ip=>ip.id===current)) sel.value = current;
 }
+// Was toggling a CSS class called "show" that's never actually defined anywhere in the
+// stylesheet (only .toast.show and .modal-bg.show exist, neither applies to this element) --
+// so the form to enter a new контрагент never visually appeared, and the button looked "dead".
+// Toggling the inline style directly is what actually shows/hides it; 'grid' matches the
+// display value .grid-3 already sets via CSS.
+function toggleCalcIpAdd(){
+  const el = document.getElementById('calc_ipAdd');
+  el.style.display = (el.style.display === 'none' || !el.style.display) ? 'grid' : 'none';
+}
 async function addCalcIp(){
   const name = document.getElementById('calc_ipName').value.trim();
   const inn = document.getElementById('calc_ipInn').value.trim();
@@ -2578,7 +2602,7 @@ async function addCalcIp(){
   CALC_IP_LIST.push({ id: uuid(), name, inn });
   document.getElementById('calc_ipName').value = '';
   document.getElementById('calc_ipInn').value = '';
-  document.getElementById('calc_ipAdd').classList.remove('show');
+  document.getElementById('calc_ipAdd').style.display = 'none';
   renderCalcIpSelect();
   document.getElementById('calc_ip').value = CALC_IP_LIST[CALC_IP_LIST.length-1].id;
   try { await saveIpList(); toast('Контрагент добавлен', 'ok'); } catch(e){ toast('Ошибка сохранения контрагента: '+e.message, 'err'); }
