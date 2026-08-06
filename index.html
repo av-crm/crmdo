@@ -1026,6 +1026,7 @@ async function refreshAll(){
       if(o.managerComment === undefined) o.managerComment = '';
       if(o.delivery === undefined) o.delivery = null;
       if(o.email === undefined) o.email = '';
+      if(o.serialNumber === undefined) o.serialNumber = '';
     });
     ordersDirty = false;
     { const btn = document.getElementById('ordersSaveBtn'), hint = document.getElementById('ordersSaveHint');
@@ -1731,7 +1732,7 @@ async function addOrder(){
   const order = {
     id: uuid(), bitrixId: null, orderNumber, orderDate: orderDateRaw || todayStr(), contragent, inn, clientName, phone,
     price: price ? Number(price) : null, cc: null, logistics: logistics ? Number(logistics) : null, delivery: null, link, article, address, comment,
-    managerComment: '', email: '',
+    managerComment: '', email: '', serialNumber: '',
     statusId: statusId || (STATE.statuses[0] && STATE.statuses[0].id) || 'new',
     source: 'manual', createdAt: now, updatedAt: now,
   };
@@ -1860,6 +1861,7 @@ window.viewOrderDetails = function(id){
       <tr><th>Номер заявки</th><td>${escapeHtml(o.orderNumber||'—')}</td></tr>
       <tr><th>Артикул</th><td>${escapeHtml(o.article)||'—'}</td></tr>
       <tr><th>Ссылка на товар</th><td>${o.link?`<a class="link" href="${escapeHtml(o.link)}" target="_blank">${escapeHtml(o.link)}</a>`:'—'}</td></tr>
+      <tr><th>Серийный номер</th><td><input type="text" value="${escapeHtml(o.serialNumber||'')}" placeholder="SN-000000" style="width:100%;box-sizing:border-box;" onchange="window.setOrderSerialNumber('${o.id}', this.value)"></td></tr>
       <tr><th>Сумма в чеке</th><td><strong>${receiptTotal!=null?fmtMoney(receiptTotal)+' ₽':'—'}</strong> <span class="hint">(Сумма ${o.price!=null?fmtMoney(o.price)+' ₽':'—'} + Доставка ${o.delivery!=null?fmtMoney(o.delivery)+' ₽':'—'})</span></td></tr>
     </table>
 
@@ -1883,6 +1885,7 @@ window.copyShippingInfo = async function(id){
     `Номер заявки: ${o.orderNumber || '—'}`,
     `Артикул: ${o.article || '—'}`,
     `Ссылка на товар: ${o.link || '—'}`,
+    `Серийный номер: ${o.serialNumber || '—'}`,
     `Сумма в чеке: ${receiptTotal!=null ? fmtMoney(receiptTotal)+' ₽' : '—'}`,
   ].join('\n');
   try {
@@ -1890,6 +1893,20 @@ window.copyShippingInfo = async function(id){
     toast('Информация для отгрузки скопирована', 'ok');
   } catch(e){
     toast('Не удалось скопировать: ' + e.message, 'err');
+  }
+};
+// Пишется на Диск сразу по onchange (не через общую кнопку "Сохранить изменения"), в отличие от
+// остальных полей карточки заявки -- так попросили специально для серийного номера.
+window.setOrderSerialNumber = async function(id, val){
+  const o = STATE.orders.find(x=>x.id===id); if(!o) return;
+  o.serialNumber = val.trim();
+  o.updatedAt = new Date().toISOString();
+  try {
+    await saveState();
+    toast('Серийный номер сохранён', 'ok');
+  } catch(e){
+    markOrdersDirty();
+    toast('Не удалось сохранить сразу, нажмите «Сохранить изменения»: ' + e.message, 'err');
   }
 };
 // Замена артикула -- в отличие от autofillOrdersCC/autofillOrdersLogistics (которые подбирают
@@ -2215,7 +2232,7 @@ async function importOrdersRows(rows){
       orderDate: r.orderDate || todayStr(), contragent: r.contragent, inn: r.inn,
       clientName: r.clientName, phone: r.phone, email: r.email || '',
       price: r.price, cc: null, logistics: null, delivery: null, link: '', article: r.article,
-      address: r.address, comment: r.comment, managerComment: '',
+      address: r.address, comment: r.comment, managerComment: '', serialNumber: '',
       statusId, source: 'import', createdAt: now, updatedAt: now,
     };
     STATE.orders.unshift(order);
@@ -2386,28 +2403,30 @@ function renderSalesReportGrid(){
   REPORT_GRID = renderGridInto(REPORT_GRID, el, {
     columns: [
       { name:'№ заявки', width:'90px' },
+      { name:'Дата', width:'95px' },
       { name:'Артикул', width:'110px' },
+      { name:'Серийный номер', width:'130px' },
       { name:'Сумма заказа', width:'110px', formatter:(cell)=> cell!=null?fmtMoney(cell)+' ₽':'—' },
       { name:'СС, ₽', width:'100px', formatter:(cell)=> cell!=null?fmtMoney(cell)+' ₽':'—' },
       { name:'Логистика, ₽', width:'110px', formatter:(cell)=> cell!=null?fmtMoney(cell)+' ₽':'—' },
       { name:'Размещение, ₽', width:'110px', formatter:(cell)=> cell!=null?fmtMoney(cell)+' ₽':'—' },
       { name:'ИНН', width:'110px' },
     ],
-    data: data.map(o=>[ o.orderNumber, o.article, o.price, o.cc, o.logistics, orderPlacement(o), o.inn ]),
+    data: data.map(o=>[ o.orderNumber, fmtDateLabel(o.orderDate), o.article, o.serialNumber||'—', o.price, o.cc, o.logistics, orderPlacement(o), o.inn ]),
     search:true, sort:true, pagination:{ limit:15, resetPageOnUpdate:false }, className:{ table:'gridjs-wrapper' },
   });
 }
 function buildSalesReportRows(){
   const data = getPaidOrdersForReport();
   const rows = data.map(o=>({
-    'Номер заявки': o.orderNumber, 'Артикул': o.article,
-    'Сумма заказа': o.price, 'СС': o.cc, 'Логистика': o.logistics,
+    'Номер заявки': o.orderNumber, 'Дата заявки': fmtDateLabel(o.orderDate), 'Артикул': o.article,
+    'Серийный номер': o.serialNumber || '', 'Сумма заказа': o.price, 'СС': o.cc, 'Логистика': o.logistics,
     'Стоимость размещения': orderPlacement(o), 'ИНН': o.inn,
   }));
   if(rows.length){
     const t = computeSalesReportTotals(data);
     rows.push({
-      'Номер заявки': 'ИТОГО', 'Артикул': '',
+      'Номер заявки': 'ИТОГО', 'Дата заявки': '', 'Артикул': '', 'Серийный номер': '',
       'Сумма заказа': t.price, 'СС': t.cc, 'Логистика': t.logistics,
       'Стоимость размещения': t.placement, 'ИНН': '',
     });
