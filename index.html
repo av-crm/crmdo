@@ -157,8 +157,8 @@
         <div class="field"><label>Стоимость заказа</label><input type="number" id="f_price" placeholder="0.00" step="0.01"></div>
         <div class="field"><label>Логистика, ₽ (вручную, до отгрузки)</label><input type="number" id="f_logistics" placeholder="0.00" step="0.01"></div>
         <div class="field"><label>Артикул</label><input type="text" id="f_article" placeholder="A-0001"></div>
-        <div class="field"><label>Наименование контрагента</label><input type="text" id="f_contragent" placeholder="ООО «Ромашка»"></div>
-        <div class="field"><label>ИНН (необязательно)</label><input type="text" id="f_inn" placeholder="7701234567"></div>
+        <div class="field"><label>Наименование контрагента</label><select id="f_contragent" onchange="window.onOrderContragentChange()"><option value="">— выберите контрагента —</option></select></div>
+        <div class="field"><label>ИНН (подтягивается автоматически, можно поправить)</label><input type="text" id="f_inn" placeholder="7701234567"></div>
         <div class="field"><label>Ссылка на товар</label><input type="url" id="f_link" placeholder="https://…"></div>
         <div class="field" style="grid-column:1/-1"><label>Адрес доставки</label><input type="text" id="f_address" placeholder="г. Москва, ул. Примерная, д. 1"></div>
         <div class="field" style="grid-column:1/-1"><label>Комментарий</label><textarea id="f_comment" placeholder="Необязательно"></textarea></div>
@@ -448,7 +448,7 @@
     <div class="card">
       <h2>Внести оплату размещения</h2>
       <div class="grid-3">
-        <div class="field"><label>ИНН продавца</label><input type="text" id="debt_inn" placeholder="7701234567"></div>
+        <div class="field"><label>ИНН продавца</label><select id="debt_inn"><option value="">— выберите ИНН —</option></select></div>
         <div class="field"><label>Сумма оплаты</label><input type="number" id="debt_amount" placeholder="0.00" step="0.01"></div>
         <div class="field"><label>Дата оплаты (если пусто — сегодня)</label><input type="date" id="debt_date"></div>
       </div>
@@ -1853,7 +1853,9 @@ window.viewOrderDetails = function(id){
       <textarea onchange="window.setOrderManagerComment('${o.id}', this.value)" placeholder="Заметка для внутреннего использования">${escapeHtml(o.managerComment)}</textarea>
     </div>
 
-    <h3 style="margin-top:16px;">Информация для отгрузки</h3>
+    <h3 style="margin-top:16px; display:flex; align-items:center; gap:10px;">Информация для отгрузки
+      <button class="btn" type="button" style="font-size:12px; padding:4px 10px;" onclick="window.copyShippingInfo('${o.id}')">Копировать</button>
+    </h3>
     <table class="preview">
       <tr><th>Номер заявки</th><td>${escapeHtml(o.orderNumber||'—')}</td></tr>
       <tr><th>Артикул</th><td>${escapeHtml(o.article)||'—'}</td></tr>
@@ -1861,9 +1863,81 @@ window.viewOrderDetails = function(id){
       <tr><th>Сумма в чеке</th><td><strong>${receiptTotal!=null?fmtMoney(receiptTotal)+' ₽':'—'}</strong> <span class="hint">(Сумма ${o.price!=null?fmtMoney(o.price)+' ₽':'—'} + Доставка ${o.delivery!=null?fmtMoney(o.delivery)+' ₽':'—'})</span></td></tr>
     </table>
 
+    <div class="field" style="margin-top:16px;">
+      <label>Заменить артикул (подтянет СС и логистику из последнего загруженного прайса/расчёта, не из даты заявки)</label>
+      <div style="display:flex; gap:8px;">
+        <input type="text" id="modal_newArticle" placeholder="Новый артикул" style="flex:1;">
+        <button class="btn" type="button" onclick="window.replaceOrderArticle('${o.id}')">Заменить</button>
+      </div>
+      <span class="hint" id="modal_replaceArticleHint"></span>
+    </div>
+
     <p class="hint">Правки здесь сохраняются вместе с остальными — кнопкой «Сохранить изменения» в списке заявок.</p>
   `;
   modalBg.classList.add('show');
+};
+window.copyShippingInfo = async function(id){
+  const o = STATE.orders.find(x=>x.id===id); if(!o) return;
+  const receiptTotal = (o.price!=null || o.delivery!=null) ? +((o.price||0) + (o.delivery||0)).toFixed(2) : null;
+  const text = [
+    `Номер заявки: ${o.orderNumber || '—'}`,
+    `Артикул: ${o.article || '—'}`,
+    `Ссылка на товар: ${o.link || '—'}`,
+    `Сумма в чеке: ${receiptTotal!=null ? fmtMoney(receiptTotal)+' ₽' : '—'}`,
+  ].join('\n');
+  try {
+    await navigator.clipboard.writeText(text);
+    toast('Информация для отгрузки скопирована', 'ok');
+  } catch(e){
+    toast('Не удалось скопировать: ' + e.message, 'err');
+  }
+};
+// Замена артикула -- в отличие от autofillOrdersCC/autofillOrdersLogistics (которые подбирают
+// прайс на дату САМОЙ ЗАЯВКИ и никогда не трогают уже заполненные СС/Логистику), здесь всегда
+// берётся САМЫЙ СВЕЖИЙ загруженный прайс/расчёт (последняя дата из loadAllPriceUploadDates /
+// loadAllSellPriceSnapshotDates) и старые СС/Логистика сбрасываются -- они относились к старому
+// артикулу и после замены товара уже не имеют смысла. Логистика не трогается, если уже
+// зафиксирована (isLogisticsLocked) -- как и везде, отгруженные заявки не редактируются задним числом.
+window.replaceOrderArticle = async function(id){
+  const o = STATE.orders.find(x=>x.id===id); if(!o) return;
+  const input = document.getElementById('modal_newArticle');
+  const hint = document.getElementById('modal_replaceArticleHint');
+  const newArticle = input ? input.value.trim() : '';
+  if(!newArticle){ if(hint) hint.textContent = 'Укажите новый артикул'; return; }
+  if(hint) hint.textContent = 'Ищу цену закупки и логистику в последнем загруженном прайсе…';
+  try {
+    const uploads = await loadAllPriceUploadDates();
+    const sellSnaps = await loadAllSellPriceSnapshotDates();
+    const latestUpload = uploads.length ? uploads[uploads.length-1] : null;
+    const latestSellSnap = sellSnaps.length ? sellSnaps[sellSnaps.length-1] : null;
+    const logisticsLocked = isLogisticsLocked(o);
+    o.article = newArticle;
+    o.cc = null;
+    if(!logisticsLocked) o.logistics = null;
+    let foundCC = false, foundLog = false;
+    if(latestUpload){
+      const snap = await driveDownloadJSON(latestUpload.fileId);
+      const cost = costFromSnapshot(snap, newArticle);
+      if(cost != null){ o.cc = cost; foundCC = true; }
+    }
+    if(latestSellSnap && !logisticsLocked){
+      const snap = await driveDownloadJSON(latestSellSnap.fileId);
+      const log = logisticsFromSnapshot(snap, newArticle);
+      if(log != null){ o.logistics = log; foundLog = true; }
+    }
+    o.updatedAt = new Date().toISOString();
+    markOrdersDirty();
+    await saveState();
+    renderOrdersGrid();
+    const parts = [];
+    if(foundCC) parts.push('СС'); if(foundLog) parts.push('логистика');
+    if(hint) hint.textContent = parts.length ? `Артикул заменён, подтянуто: ${parts.join(', ')}` : 'Артикул заменён, но в последнем прайсе/расчёте такого артикула не нашлось — заполните СС/логистику вручную';
+    toast('Артикул заявки заменён', 'ok');
+    window.viewOrderDetails(id);
+  } catch(e){
+    if(hint) hint.textContent = 'Ошибка: ' + e.message;
+    toast('Ошибка замены артикула: ' + e.message, 'err');
+  }
 };
 window.setOrderInn = function(id, val){
   const o = STATE.orders.find(x=>x.id===id); if(!o) return;
@@ -2388,7 +2462,23 @@ function computeSellerDebts(){
   });
   return rows.sort((a,b)=> b.debt - a.debt);
 }
+// ИНН в форме оплаты -- выпадающий список вместо свободного текста, собранный из двух источников:
+// ИНН продавцов, у которых уже есть строка в таблице ДП (computeSellerDebts), плюс весь каталог
+// контрагентов (CALC_IP_LIST), чтобы можно было внести оплату и до появления первой завершённой
+// сделки по этому продавцу. Дедуп по ИНН, приоритет -- название из таблицы ДП.
+function renderDebtInnSelect(){
+  const sel = document.getElementById('debt_inn');
+  if(!sel) return;
+  const current = sel.value;
+  const map = new Map();
+  computeSellerDebts().forEach(r=>{ if(r.inn && r.inn !== '(без ИНН)') map.set(r.inn, r.contragent && r.contragent!=='—' ? `${r.contragent} — ИНН ${r.inn}` : `ИНН ${r.inn}`); });
+  (CALC_IP_LIST||[]).forEach(ip=>{ if(ip.inn && !map.has(ip.inn)) map.set(ip.inn, `${ip.name} — ИНН ${ip.inn}`); });
+  const entries = Array.from(map.entries()).sort((a,b)=> a[1].localeCompare(b[1], 'ru'));
+  sel.innerHTML = '<option value="">— выберите ИНН —</option>' + entries.map(([inn,label])=>`<option value="${escapeHtml(inn)}">${escapeHtml(label)}</option>`).join('');
+  if(current && map.has(current)) sel.value = current;
+}
 function renderDebtGrid(){
+  renderDebtInnSelect();
   const el = document.getElementById('debtGrid');
   if(!el) return;
   const data = computeSellerDebts();
@@ -2630,7 +2720,29 @@ function renderCalcIpSelect(){
   const current = sel.value;
   sel.innerHTML = CALC_IP_LIST.map(ip=>`<option value="${ip.id}">${escapeHtml(ip.name)} — ИНН ${escapeHtml(ip.inn)}</option>`).join('');
   if(current && CALC_IP_LIST.some(ip=>ip.id===current)) sel.value = current;
+  // Контрагенты живут в одном списке (CALC_IP_LIST, заведённом здесь же кнопкой "+ добавить
+  // контрагента"), так что заявки и Долг продавца просто переиспользуют его вместо ведения
+  // отдельных списков, которые бы неизбежно разошлись.
+  renderOrderContragentSelect();
+  renderDebtInnSelect();
 }
+// "Наименование контрагента" в форме "Новая заявка" -- выпадающий список из CALC_IP_LIST
+// (значение опции = имя, как и раньше хранилось в order.contragent, чтобы addOrder() не менять).
+// При выборе автоматически подтягивает ИНН в соседнее поле (можно поправить вручную).
+function renderOrderContragentSelect(){
+  const sel = document.getElementById('f_contragent');
+  if(!sel) return;
+  const current = sel.value;
+  sel.innerHTML = '<option value="">— выберите контрагента —</option>' +
+    CALC_IP_LIST.map(ip=>`<option value="${escapeHtml(ip.name)}" data-inn="${escapeHtml(ip.inn)}">${escapeHtml(ip.name)} — ИНН ${escapeHtml(ip.inn)}</option>`).join('');
+  if(current && CALC_IP_LIST.some(ip=>ip.name===current)) sel.value = current;
+}
+window.onOrderContragentChange = function(){
+  const sel = document.getElementById('f_contragent');
+  const opt = sel && sel.selectedOptions && sel.selectedOptions[0];
+  const inn = opt ? opt.getAttribute('data-inn') : '';
+  if(inn) document.getElementById('f_inn').value = inn;
+};
 // Was toggling a CSS class called "show" that's never actually defined anywhere in the
 // stylesheet (only .toast.show and .modal-bg.show exist, neither applies to this element) --
 // so the form to enter a new контрагент never visually appeared, and the button looked "dead".
