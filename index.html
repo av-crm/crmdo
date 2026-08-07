@@ -1850,30 +1850,53 @@ window.deleteOrder = async function(id){
   renderOrderStats(); renderOrdersGrid();
   try { await saveState(); toast('Заявка удалена', 'ok'); } catch(e){ toast('Ошибка сохранения: '+e.message, 'err'); }
 };
-// СС/Логистика/Размещение and ИНН were removed from the main list on request but still feed
-// Отчёты/Долг продавца/Дашборд, so they're edited from here instead. The receipt info block
-// ("Сумма в чеке" = Сумма + Доставка) is display-only -- it just reflects whatever's already set
-// elsewhere -- meant to be read off when preparing a shipment/receipt for the customer.
+// Segmented into labeled blocks on request (Заказ / Контакты клиента / Продавец / Адрес доставки /
+// комментарии / Информация для отгрузки), instead of one flat pile of fields. ИНН продавца was
+// removed from here entirely on request -- it's still stored on the order (STATE.orders[].inn,
+// auto-filled from the выбор контрагента dropdown when the заявка is created) and still used by
+// Долг продавца/Отчёты/экспорт, just no longer shown/edited from this popup (setOrderInn is kept
+// around, just unused now). "Заменить артикул" moved to sit right next to Артикул in the Заказ
+// block instead of floating at the bottom unrelated to anything above it.
 window.viewOrderDetails = function(id){
   const o = STATE.orders.find(x=>x.id===id); if(!o) return;
   const modalBg = document.getElementById('modalBg'), modalBody = document.getElementById('modalBody');
-  // Финансовые данные (СС/Логистика/Размещение) is hidden from this popup on request -- it's now
-  // only editable via importOrdersRows/autofillOrdersCC (СС) — there's no manual entry point left
-  // for Логистика anywhere in the UI. Отчёты/Долг продавца/Дашборд still read whatever's in
-  // STATE.orders, so nothing breaks, but Логистика effectively stays whatever it already was
-  // (usually null) unless a field for it gets added back somewhere.
   const receiptTotal = (o.price!=null || o.delivery!=null) ? +((o.price||0) + (o.delivery||0)).toFixed(2) : null;
   modalBody.innerHTML = `
     <button class="close" onclick="closeModal()">✕</button>
     <h2>Заявка № ${escapeHtml(o.orderNumber||'—')}</h2>
-    <p class="muted">${escapeHtml(o.contragent)} — ${escapeHtml(o.clientName)}${o.phone?', '+escapeHtml(o.phone):''}</p>
-    <div class="grid-3">
-      <div class="field"><label>ИНН</label><input type="text" value="${escapeHtml(o.inn)}" onchange="window.setOrderInn('${o.id}', this.value)"></div>
-      <div class="field"><label>Email</label><input type="email" value="${escapeHtml(o.email)}" placeholder="client@example.com" onchange="window.setOrderEmail('${o.id}', this.value)"></div>
-    </div>
-    <p><strong>Адрес доставки:</strong><br>${escapeHtml(o.address)||'—'}</p>
-    <p><strong>Комментарий:</strong><br>${escapeHtml(o.comment)||'—'}</p>
-    <div class="field"><label>Комментарий менеджера продаж</label>
+
+    <h3>Заказ</h3>
+    <table class="preview">
+      <tr><th>Номер заявки</th><td>${escapeHtml(o.orderNumber||'—')}</td></tr>
+      <tr><th>Товар (артикул)</th><td>
+        <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+          <strong>${escapeHtml(o.article)||'—'}</strong>
+          <input type="text" id="modal_newArticle" placeholder="Новый артикул" style="width:140px;">
+          <button class="btn" type="button" style="font-size:12px; padding:4px 10px;" onclick="window.replaceOrderArticle('${o.id}')" title="Подтянет СС и логистику из последнего загруженного прайса/расчёта, не из даты заявки">Заменить</button>
+        </div>
+        <span class="hint" id="modal_replaceArticleHint"></span>
+      </td></tr>
+      <tr><th>Стоимость</th><td>${o.price!=null?fmtMoney(o.price)+' ₽':'—'}</td></tr>
+    </table>
+
+    <h3 style="margin-top:16px;">Контакты клиента</h3>
+    <table class="preview">
+      <tr><th>Имя</th><td>${escapeHtml(o.clientName)||'—'}</td></tr>
+      <tr><th>Телефон</th><td>${escapeHtml(o.phone)||'—'}</td></tr>
+      <tr><th>Email</th><td><input type="email" value="${escapeHtml(o.email)}" placeholder="client@example.com" onchange="window.setOrderEmail('${o.id}', this.value)"></td></tr>
+    </table>
+
+    <h3 style="margin-top:16px;">Продавец</h3>
+    <p>${escapeHtml(o.contragent)||'—'}</p>
+
+    <h3 style="margin-top:16px;">Адрес доставки</h3>
+    <p>${escapeHtml(o.address)||'—'}</p>
+
+    <h3 style="margin-top:16px;">Комментарий клиента</h3>
+    <p>${escapeHtml(o.comment)||'—'}</p>
+
+    <h3 style="margin-top:16px;">Комментарий менеджера</h3>
+    <div class="field">
       <textarea onchange="window.setOrderManagerComment('${o.id}', this.value)" placeholder="Заметка для внутреннего использования">${escapeHtml(o.managerComment)}</textarea>
     </div>
 
@@ -1888,16 +1911,7 @@ window.viewOrderDetails = function(id){
       <tr><th>Сумма в чеке</th><td><strong>${receiptTotal!=null?fmtMoney(receiptTotal)+' ₽':'—'}</strong> <span class="hint">(Сумма ${o.price!=null?fmtMoney(o.price)+' ₽':'—'} + Доставка ${o.delivery!=null?fmtMoney(o.delivery)+' ₽':'—'})</span></td></tr>
     </table>
 
-    <div class="field" style="margin-top:16px;">
-      <label>Заменить артикул (подтянет СС и логистику из последнего загруженного прайса/расчёта, не из даты заявки)</label>
-      <div style="display:flex; gap:8px;">
-        <input type="text" id="modal_newArticle" placeholder="Новый артикул" style="flex:1;">
-        <button class="btn" type="button" onclick="window.replaceOrderArticle('${o.id}')">Заменить</button>
-      </div>
-      <span class="hint" id="modal_replaceArticleHint"></span>
-    </div>
-
-    <p class="hint">Правки здесь сохраняются вместе с остальными — кнопкой «Сохранить изменения» в списке заявок.</p>
+    <p class="hint">Правки здесь сохраняются вместе с остальными — кнопкой «Сохранить изменения» в списке заявок (кроме серийного номера — он сохраняется сразу).</p>
   `;
   modalBg.classList.add('show');
 };
