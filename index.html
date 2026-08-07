@@ -1570,9 +1570,20 @@ async function checkPriceForDate(){
     resultEl.textContent = 'Ошибка проверки: ' + e.message;
   }
 }
+// Артикулы иногда набираются или вставляются с кириллическими "двойниками" латинских букв
+// (например "Н" U+041D вместо "H", "С" U+0421 вместо "C") -- выглядят абсолютно одинаково, но
+// это разные символы, и обычное сравнение строк их не считает равными. Это реальный случай:
+// артикул совпадал визуально с позицией в прайсе, но СС не подтягивалась именно по этой причине.
+// Нормализуем оба артикула перед сравнением, заменяя визуально неотличимые кириллические буквы
+// на латинские аналоги -- покрывает весь стандартный набор "омоглифов" A/B/E/K/M/H/O/P/C/T/Y/X.
+const CYR_LATIN_LOOKALIKE = { 'а':'a','в':'b','е':'e','к':'k','м':'m','н':'h','о':'o','р':'p','с':'c','т':'t','у':'y','х':'x' };
+function normalizeArticleForMatch(s){
+  return String(s||'').trim().toLowerCase().replace(/[а-яё]/g, ch => CYR_LATIN_LOOKALIKE[ch] || ch);
+}
 function costFromSnapshot(snapshot, article){
   if(!snapshot || !article) return null;
-  const item = (snapshot.items||[]).find(it=>String(it.article||'').trim().toLowerCase() === String(article).trim().toLowerCase());
+  const target = normalizeArticleForMatch(article);
+  const item = (snapshot.items||[]).find(it=>normalizeArticleForMatch(it.article) === target);
   if(!item) return null;
   const prices = item.prices || [];
   for(let i=prices.length-1;i>=0;i--){ if(prices[i] && prices[i].value!=null) return prices[i].value; }
@@ -1584,7 +1595,8 @@ function costFromSnapshot(snapshot, article){
 // This reads that already-computed amount for one article, mirroring costFromSnapshot above.
 function logisticsFromSnapshot(snapshot, article){
   if(!snapshot || !article) return null;
-  const item = (snapshot.items||[]).find(it=>String(it.article||'').trim().toLowerCase() === String(article).trim().toLowerCase());
+  const target = normalizeArticleForMatch(article);
+  const item = (snapshot.items||[]).find(it=>normalizeArticleForMatch(it.article) === target);
   if(!item || !item.logistics || item.logistics.amount==null) return null;
   return item.logistics.amount;
 }
