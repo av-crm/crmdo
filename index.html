@@ -1462,7 +1462,12 @@ function weekMetrics(start, end){
   const paid = orders.filter(isPaidLikeStatus);
   const paidCount = paid.length;
   const paidSum = paid.reduce((a,o)=>a+(Number(o.price)||0),0);
-  const paidOrDone = orders.filter(o=>o.statusId==='paid' || isDealDoneStatus(o));
+  // Приведено к тому же расширенному определению "оплачено", что и остальные карточки
+  // (STATE.paidStatusIds, настраивается в Настройки), плюс отдельно сделка завершена -- раньше
+  // здесь была узкая проверка только на литеральный id 'paid', из-за чего "Стоимость размещения"
+  // не учитывала заявки в статусах вроде "Выставлен счёт", даже если их отметили как оплаченные
+  // везде остальные.
+  const paidOrDone = orders.filter(o=>isPaidLikeStatus(o) || isDealDoneStatus(o));
   const placementSum = paidOrDone.reduce((a,o)=>a+(orderPlacement(o)||0),0);
   return { count, sum, paidCount, paidSum, placementSum };
 }
@@ -1477,9 +1482,11 @@ function renderOrderStats(){
   const paidCount = paidOrders.length;
   const paidSum = paidOrders.reduce((a,o)=>a+(Number(o.price)||0),0);
   // All-time (not week-scoped) -- distinct from weekMetrics().placementSum used further down in the
-  // "за неделю" row. Same paid+сделка-завершена definition as Долг продавца (see isDealDoneStatus).
+  // "за неделю" row. Same broadened "оплачено" definition as the "Оплаченных заявок" cards
+  // (isPaidLikeStatus -> STATE.paidStatusIds), plus сделка завершена on top (see isDealDoneStatus)
+  // -- unified on request so this card doesn't use a narrower rule than everything else.
   const placementSumAllTime = statsOrders
-    .filter(o=>o.statusId==='paid' || isDealDoneStatus(o))
+    .filter(o=>isPaidLikeStatus(o) || isDealDoneStatus(o))
     .reduce((a,o)=>a+(orderPlacement(o)||0),0);
   const byStatus = {};
   statsOrders.forEach(o=>{ byStatus[o.statusId] = (byStatus[o.statusId]||0)+1; });
