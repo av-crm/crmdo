@@ -1485,10 +1485,12 @@ function todayStr(){
 }
 // Логистика is entered manually (₽); Стоимость размещения is always derived (цена заказа − логистика),
 // never stored/edited directly, so the two can never drift out of sync.
-// Размещение = Цена продажи − СС (закупка) − Логистика. Needs all three known, otherwise
+// Размещение = Цена продажи − СС (закупка) − Доставка − Логистика. Доставка defaults to 0 if not
+// filled in (it's an optional per-order field, unlike СС/Логистика) so most orders without it set
+// aren't blocked from showing a number; Цена/СС/Логистика still have to all be known, otherwise
 // shown as unavailable ("—") rather than a misleading partial number.
 function derivedPlacement(o){
-  return (o.price!=null && o.cc!=null && o.logistics!=null) ? +(o.price - o.cc - o.logistics).toFixed(2) : null;
+  return (o.price!=null && o.cc!=null && o.logistics!=null) ? +(o.price - o.cc - (o.delivery||0) - o.logistics).toFixed(2) : null;
 }
 // placementOverride lets the admin correct a wrong auto-calculated Размещение by hand (e.g. when
 // СС/Логистика turned out inaccurate but the real placement value is known) without having to fix
@@ -1797,8 +1799,9 @@ window.setOrderPrice = function(id, val){
   renderOrdersGrid();
 };
 // Доставка — what the customer is charged for delivery on this specific order, entered manually.
-// Separate from Логистика (internal cost used for profit/Размещение calc) -- Доставка only feeds
-// "Сумма в чеке" (Сумма + Доставка) in the order details popup. Always editable, no shipped lock.
+// Feeds "Сумма в чеке" (Сумма + Доставка) in the order details popup, AND (per AV's explicit
+// request) is now also subtracted in the Размещение formula alongside СС/Логистика -- see
+// derivedPlacement. Always editable, no shipped lock.
 window.setOrderDelivery = function(id, val){
   const o = STATE.orders.find(x=>x.id===id); if(!o) return;
   const v = parseFloat(val);
@@ -2023,11 +2026,10 @@ function getFilteredOrders(){
   }).sort(compareOrdersDefault);
 }
 
-// СС, Размещение, Логистика and ИНН were removed from this table on request (kept fully intact
-// in STATE.orders and still used by Отчёты/Долг продавца/Дашборд — just edited from the order
-// details popup now instead of cluttering the day-to-day list). "Действия" now only ever shows
-// the product link; the delete button was removed from here entirely (deleteOrder() itself still
-// exists, just isn't wired to any button anymore).
+// ИНН was removed from this table on request (kept fully intact in STATE.orders and still used by
+// Отчёты/Долг продавца/Дашборд — just edited from the order details popup instead of cluttering
+// the day-to-day list). "Действия" (link-only, deleteOrder() isn't wired to any button) was removed
+// entirely on request -- the product link is still reachable from the order details popup.
 function renderOrdersGrid(){
   const filtered = getFilteredOrders();
   const el = document.getElementById('ordersGrid');
@@ -2067,6 +2069,10 @@ function renderOrdersGrid(){
         const d = JSON.parse(cell);
         return gridjs.html(`<input type="number" value="${d.price!=null?d.price:''}" placeholder="0.00" step="0.01" style="width:85px;font-size:12px;padding:4px;border:1px solid var(--border);border-radius:6px;" onchange="window.setOrderPrice('${d.id}', this.value)">`);
       }},
+    { name:'СС, ₽', width:'100px', formatter:(cell)=>{
+        const d = JSON.parse(cell);
+        return gridjs.html(`<input type="number" value="${d.cc!=null?d.cc:''}" placeholder="0.00" step="0.01" style="width:85px;font-size:12px;padding:4px;border:1px solid var(--border);border-radius:6px;" onchange="window.setOrderCC('${d.id}', this.value)">`);
+      }},
     { name:'Доставка, ₽', width:'100px', formatter:(cell)=>{
         const d = JSON.parse(cell);
         return gridjs.html(`<input type="number" value="${d.delivery!=null?d.delivery:''}" placeholder="0.00" step="0.01" style="width:85px;font-size:12px;padding:4px;border:1px solid var(--border);border-radius:6px;" onchange="window.setOrderDelivery('${d.id}', this.value)">`);
@@ -2087,29 +2093,26 @@ function renderOrdersGrid(){
     o.clientName, o.phone,
     JSON.stringify({ id:o.id, statusId:o.statusId }),
     JSON.stringify({ id:o.id, price:o.price }),
+    JSON.stringify({ id:o.id, cc:o.cc }),
     JSON.stringify({ id:o.id, delivery:o.delivery }),
     JSON.stringify({ id:o.id, logistics:o.logistics, locked: isLogisticsLocked(o) }),
   ]);
   if(isAdmin){
-    // Пустое поле = используется автоматический расчёт (Сумма − СС − Логистика); можно ввести
-    // своё число, чтобы скорректировать его вручную (placementOverride) -- например, когда СС/
-    // Логистика оказались неточными, а реальная сумма размещения известна.
+    // Пустое поле = используется автоматический расчёт (Сумма − СС − Доставка − Логистика);
+    // можно ввести своё число, чтобы скорректировать его вручную (placementOverride) -- например,
+    // когда СС/Логистика оказались неточными, а реальная сумма размещения известна.
     columns.push({ name:'Размещение, ₽', width:'110px', formatter:(cell)=>{
         const d = JSON.parse(cell);
         const placeholder = d.auto!=null ? fmtMoney(d.auto) : '0.00';
-        return gridjs.html(`<input type="number" value="${d.override!=null?d.override:''}" placeholder="${placeholder}" step="0.01" title="Пусто = авторасчёт (Сумма − СС − Логистика)" style="width:95px;font-size:12px;padding:4px;border:1px solid var(--border);border-radius:6px;" onchange="window.setOrderPlacementOverride('${d.id}', this.value)">`);
+        return gridjs.html(`<input type="number" value="${d.override!=null?d.override:''}" placeholder="${placeholder}" step="0.01" title="Пусто = авторасчёт (Сумма − СС − Доставка − Логистика)" style="width:95px;font-size:12px;padding:4px;border:1px solid var(--border);border-radius:6px;" onchange="window.setOrderPlacementOverride('${d.id}', this.value)">`);
       }});
     data.forEach((o,i)=> rowBase[i].push(JSON.stringify({ id:o.id, override:o.placementOverride, auto: derivedPlacement(o) })));
   }
   columns.push(
     { name:'Артикул', width:'90px' },
     { name:'Контрагент' },
-    { name:'Действия', width:'60px', formatter:(cell)=>{
-        const d = JSON.parse(cell);
-        return d.link ? gridjs.html(`<a class="link" href="${escapeHtml(d.link)}" target="_blank" title="Ссылка на товар">🔗</a>`) : '';
-      }},
   );
-  data.forEach((o,i)=> rowBase[i].push(o.article, o.contragent, JSON.stringify({ id:o.id, link:o.link })));
+  data.forEach((o,i)=> rowBase[i].push(o.article, o.contragent));
   ORDERS_GRID = renderGridInto(ORDERS_GRID, el, {
     columns,
     data: rowBase,
