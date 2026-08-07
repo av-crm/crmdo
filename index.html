@@ -974,8 +974,47 @@ async function loadLatestState(){
   // ever saved in the old combined format. Try the legacy file before giving up.
   return await loadLatestLegacyCombinedState();
 }
+// Общий мёрдж для коллекций, куда независимо друг от друга пишут разные аккаунты (Заявки, оплаты
+// Долга продавца). ПРИЧИНА БАГА "заявки, созданные под другим аккаунтом, не видны под моим":
+// saveState() раньше просто перезаписывал файл на Диске тем, что было в памяти ЭТОЙ вкладки. Если
+// кто-то другой успел сохранить новую заявку между тем, как ВАША вкладка последний раз загружала
+// данные, и тем, как ВЫ что-то сохранили (статус поменяли, СС поправили — не важно что), ваше
+// сохранение переписывало файл версией без его заявки, и она бесследно пропадала для всех.
+// Правило слияния (по id): запись есть только на Диске (кто-то добавил не в этой вкладке) —
+// сохраняем; запись есть только у нас локально — тоже сохраняем; есть в обеих версиях — побеждает
+// та, у которой позже updatedAt/createdAt.
+function mergeById(localArr, remoteArr){
+  const byId = new Map();
+  (remoteArr||[]).forEach(r=>{ if(r && r.id) byId.set(r.id, r); });
+  (localArr||[]).forEach(l=>{
+    if(!l || !l.id) return;
+    const existing = byId.get(l.id);
+    if(!existing){ byId.set(l.id, l); return; }
+    const lTime = l.updatedAt || l.createdAt || '';
+    const eTime = existing.updatedAt || existing.createdAt || '';
+    byId.set(l.id, lTime >= eTime ? l : existing);
+  });
+  return Array.from(byId.values());
+}
 async function saveState(){
   await ensureDataFolders();
+  // Подтягиваем самую свежую версию с Диска прямо перед записью и мёрджим -- сужает окно гонки
+  // почти до нуля (см. mergeById выше). Если подтянуть не удалось (например, сеть) -- сохраняем
+  // как есть локально, это лучше, чем вообще не дать сохранить.
+  try {
+    const [freshOrdersFile, freshDebtFile] = await Promise.all([
+      latestFileMetaByPrefix(FOLDERS.orders, 'orders_'),
+      FOLDERS.debt ? latestFileMetaByPrefix(FOLDERS.debt, 'debt_') : null,
+    ]);
+    const [freshOrdersData, freshDebtData] = await Promise.all([
+      freshOrdersFile ? driveDownloadJSON(freshOrdersFile.id) : null,
+      freshDebtFile ? driveDownloadJSON(freshDebtFile.id) : null,
+    ]);
+    STATE.orders = mergeById(STATE.orders, (freshOrdersData && freshOrdersData.orders) || []);
+    STATE.sellerPayments = mergeById(STATE.sellerPayments, (freshDebtData && freshDebtData.sellerPayments) || []);
+  } catch(e){
+    console.error('Не удалось подтянуть свежую версию перед сохранением, сохраняю как есть локально:', e);
+  }
   STATE.savedAt = new Date().toISOString();
   const ts = STATE.savedAt.replace(/[:.]/g,'-');
   await Promise.all([
@@ -983,6 +1022,9 @@ async function saveState(){
     driveCreateJSON(`debt_${ts}.json`, FOLDERS.debt, { sellerPayments: STATE.sellerPayments, savedAt: STATE.savedAt }),
     driveCreateJSON(`settings_${ts}.json`, FOLDERS.config, { statuses: STATE.statuses, users: STATE.users, statusRules: STATE.statusRules, dealDoneStatusId: STATE.dealDoneStatusId, paidStatusIds: STATE.paidStatusIds, savedAt: STATE.savedAt }),
   ]);
+  // Мёрдж мог подтянуть чужие заявки/оплаты, которых не было в этой вкладке -- перерисовываем,
+  // чтобы экран не разошёлся с тем, что реально теперь сохранено на Диске.
+  renderOrdersGrid(); renderOrderStats(); renderDebtGrid(); renderDebtPaymentsGrid(); renderSalesReportGrid();
 }
 
 /* ================= REFRESH ================= */
@@ -1862,6 +1904,28 @@ window.deleteOrder = async function(id){
   renderOrderStats(); renderOrdersGrid();
   try { await saveState(); toast('Заявка удалена', 'ok'); } catch(e){ toast('Ошибка сохранения: '+e.message, 'err'); }
 };
+// Same каталог контрагентов (CALC_IP_LIST) as the "Наименование контрагента" dropdown in "Новая
+// заявка" -- rebuilt fresh each time the modal opens rather than kept in sync live like the static
+// form select, since a new <select> is stamped into innerHTML on every viewOrderDetails() call
+// anyway. Legacy orders whose contragent isn't (or no longer is) in CALC_IP_LIST still get their
+// current value as a selectable option, so opening the modal never silently discards it.
+function contragentOptionsHtml(selectedName){
+  const inList = CALC_IP_LIST.some(ip=>ip.name===selectedName);
+  const extra = (selectedName && !inList) ? `<option value="${escapeHtml(selectedName)}" selected>${escapeHtml(selectedName)} (нет в списке контрагентов)</option>` : '';
+  return extra + CALC_IP_LIST.map(ip=>`<option value="${escapeHtml(ip.name)}" ${ip.name===selectedName?'selected':''}>${escapeHtml(ip.name)} — ИНН ${escapeHtml(ip.inn)}</option>`).join('');
+}
+window.setOrderContragent = function(id, name){
+  const o = STATE.orders.find(x=>x.id===id); if(!o) return;
+  o.contragent = name;
+  // ИНН больше не показывается в этой карточке (убрано по запросу), но по-прежнему хранится в
+  // заявке и используется в Долге продавца/Отчётах/экспорте -- держим его в паре с продавцом.
+  const match = CALC_IP_LIST.find(ip=>ip.name===name);
+  if(match) o.inn = match.inn;
+  o.updatedAt = new Date().toISOString();
+  markOrdersDirty();
+  renderOrdersGrid();
+  toast('Продавец изменён — не забудьте нажать «Сохранить изменения»', 'ok');
+};
 // Segmented into labeled blocks on request (Заказ / Контакты клиента / Продавец / Адрес доставки /
 // комментарии / Информация для отгрузки), instead of one flat pile of fields. ИНН продавца was
 // removed from here entirely on request -- it's still stored on the order (STATE.orders[].inn,
@@ -1899,7 +1963,9 @@ window.viewOrderDetails = function(id){
     </table>
 
     <h3 style="margin-top:16px;">Продавец</h3>
-    <p>${escapeHtml(o.contragent)||'—'}</p>
+    <div class="field">
+      <select onchange="window.setOrderContragent('${o.id}', this.value)">${contragentOptionsHtml(o.contragent)}</select>
+    </div>
 
     <h3 style="margin-top:16px;">Адрес доставки</h3>
     <p>${escapeHtml(o.address)||'—'}</p>
