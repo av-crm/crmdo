@@ -1027,6 +1027,7 @@ async function refreshAll(){
       if(o.delivery === undefined) o.delivery = null;
       if(o.email === undefined) o.email = '';
       if(o.serialNumber === undefined) o.serialNumber = '';
+      if(o.placementOverride === undefined) o.placementOverride = null;
     });
     ordersDirty = false;
     { const btn = document.getElementById('ordersSaveBtn'), hint = document.getElementById('ordersSaveHint');
@@ -1486,8 +1487,15 @@ function todayStr(){
 // never stored/edited directly, so the two can never drift out of sync.
 // Размещение = Цена продажи − СС (закупка) − Логистика. Needs all three known, otherwise
 // shown as unavailable ("—") rather than a misleading partial number.
-function orderPlacement(o){
+function derivedPlacement(o){
   return (o.price!=null && o.cc!=null && o.logistics!=null) ? +(o.price - o.cc - o.logistics).toFixed(2) : null;
+}
+// placementOverride lets the admin correct a wrong auto-calculated Размещение by hand (e.g. when
+// СС/Логистика turned out inaccurate but the real placement value is known) without having to fix
+// the underlying СС/Логистика numbers themselves. null/unset = use the derived value as before.
+function orderPlacement(o){
+  if(o.placementOverride != null) return o.placementOverride;
+  return derivedPlacement(o);
 }
 // Логистика (and its knock-on effect on Размещение) is only editable up through the "Отгружена"
 // status; once an order reaches that status (or anything after it in the configured status
@@ -1732,7 +1740,7 @@ async function addOrder(){
   const order = {
     id: uuid(), bitrixId: null, orderNumber, orderDate: orderDateRaw || todayStr(), contragent, inn, clientName, phone,
     price: price ? Number(price) : null, cc: null, logistics: logistics ? Number(logistics) : null, delivery: null, link, article, address, comment,
-    managerComment: '', email: '', serialNumber: '',
+    managerComment: '', email: '', serialNumber: '', placementOverride: null,
     statusId: statusId || (STATE.statuses[0] && STATE.statuses[0].id) || 'new',
     source: 'manual', createdAt: now, updatedAt: now,
   };
@@ -1800,6 +1808,18 @@ window.setOrderDelivery = function(id, val){
   renderOrdersGrid();
 };
 
+// Only ever rendered/wired up for the admin (see the isAdmin check in renderOrdersGrid), but
+// guarded here too in case it's ever called some other way -- empty input clears the override
+// and falls back to the auto-calculated Размещение again.
+window.setOrderPlacementOverride = function(id, val){
+  if(currentUserEmail !== ADMIN_EMAIL){ toast('Недостаточно прав', 'err'); renderOrdersGrid(); return; }
+  const o = STATE.orders.find(x=>x.id===id); if(!o) return;
+  const v = (val==null?'':String(val)).trim();
+  o.placementOverride = v==='' ? null : (isNaN(parseFloat(v)) ? null : parseFloat(v));
+  o.updatedAt = new Date().toISOString();
+  markOrdersDirty();
+  renderOrdersGrid();
+};
 window.changeOrderStatus = async function(id, statusId){
   const o = STATE.orders.find(x=>x.id===id);
   if(!o) return;
@@ -2021,59 +2041,78 @@ function renderOrdersGrid(){
     return;
   }
   const data = filtered.slice(ordersPage * ORDERS_PAGE_SIZE, (ordersPage + 1) * ORDERS_PAGE_SIZE);
+  // Размещение (себестоимость сделки для продавца) видно и редактируется только админом
+  // (avmusicstar18@gmail.com) -- по запросу, чтобы остальные пользователи со доступом к Заявкам
+  // не видели эту цифру вообще. Колонка целиком не добавляется в разметку для не-админов (а не
+  // просто скрывается CSS), т.к. этот же приём (hide, not real ACL) уже используется во всём
+  // приложении -- см. applyAccessControl.
+  const isAdmin = currentUserEmail === ADMIN_EMAIL;
+  const columns = [
+    { name:'№ заявки', width:'90px', formatter:(cell)=>{
+        const d = JSON.parse(cell);
+        return gridjs.html(`<a class="link" href="javascript:void(0)" onclick="window.viewOrderDetails('${d.id}')" title="Подробнее о заявке" style="cursor:pointer;">${escapeHtml(d.orderNumber||'—')}</a>`);
+      }},
+    { name:'Дата заявки', width:'130px', formatter:(cell)=>{
+        const d = JSON.parse(cell);
+        return gridjs.html(`<input type="date" value="${d.orderDate||''}" style="font-size:11px;padding:3px;border:1px solid var(--border);border-radius:6px;width:118px;" onchange="window.setOrderDate('${d.id}', this.value)">`);
+      }},
+    { name:'Клиент' }, { name:'Телефон', width:'120px' },
+    { name:'Статус', width:'160px', formatter:(cell)=>{
+        const d = JSON.parse(cell);
+        const allowedIds = new Set(allowedNextStatusIds(d));
+        const options = STATE.statuses.filter(s=>allowedIds.has(s.id));
+        return gridjs.html(`<select onchange="window.changeOrderStatus('${d.id}', this.value)" style="font-size:11px; padding:3px;">${options.map(s=>`<option value="${s.id}" ${s.id===d.statusId?'selected':''}>${escapeHtml(s.label)}</option>`).join('')}</select>`);
+      }},
+    { name:'Сумма', width:'100px', formatter:(cell)=>{
+        const d = JSON.parse(cell);
+        return gridjs.html(`<input type="number" value="${d.price!=null?d.price:''}" placeholder="0.00" step="0.01" style="width:85px;font-size:12px;padding:4px;border:1px solid var(--border);border-radius:6px;" onchange="window.setOrderPrice('${d.id}', this.value)">`);
+      }},
+    { name:'Доставка, ₽', width:'100px', formatter:(cell)=>{
+        const d = JSON.parse(cell);
+        return gridjs.html(`<input type="number" value="${d.delivery!=null?d.delivery:''}" placeholder="0.00" step="0.01" style="width:85px;font-size:12px;padding:4px;border:1px solid var(--border);border-radius:6px;" onchange="window.setOrderDelivery('${d.id}', this.value)">`);
+      }},
+    // Временно возвращено для ручного ввода, пока автоподтяжка логистики из расчёта прайса не
+    // станет надёжной регулярной практикой (см. autofillOrdersLogistics) — планируется снова
+    // убрать, когда прайсы будут стабильно и правильно загружаться каждый раз.
+    { name:'Логистика, ₽', width:'100px', formatter:(cell)=>{
+        const d = JSON.parse(cell);
+        const lockedAttrs = d.locked ? 'disabled title="Заявка отгружена — логистика зафиксирована"' : '';
+        const lockedStyle = d.locked ? 'opacity:.5;' : '';
+        return gridjs.html(`<input type="number" value="${d.logistics!=null?d.logistics:''}" placeholder="0.00" step="0.01" ${lockedAttrs} style="width:85px;font-size:12px;padding:4px;border:1px solid var(--border);border-radius:6px;${lockedStyle}" onchange="window.setOrderLogistics('${d.id}', this.value)">`);
+      }},
+  ];
+  const rowBase = data.map(o=>[
+    JSON.stringify({ id:o.id, orderNumber:o.orderNumber }),
+    JSON.stringify({ id:o.id, orderDate:o.orderDate }),
+    o.clientName, o.phone,
+    JSON.stringify({ id:o.id, statusId:o.statusId }),
+    JSON.stringify({ id:o.id, price:o.price }),
+    JSON.stringify({ id:o.id, delivery:o.delivery }),
+    JSON.stringify({ id:o.id, logistics:o.logistics, locked: isLogisticsLocked(o) }),
+  ]);
+  if(isAdmin){
+    // Пустое поле = используется автоматический расчёт (Сумма − СС − Логистика); можно ввести
+    // своё число, чтобы скорректировать его вручную (placementOverride) -- например, когда СС/
+    // Логистика оказались неточными, а реальная сумма размещения известна.
+    columns.push({ name:'Размещение, ₽', width:'110px', formatter:(cell)=>{
+        const d = JSON.parse(cell);
+        const placeholder = d.auto!=null ? fmtMoney(d.auto) : '0.00';
+        return gridjs.html(`<input type="number" value="${d.override!=null?d.override:''}" placeholder="${placeholder}" step="0.01" title="Пусто = авторасчёт (Сумма − СС − Логистика)" style="width:95px;font-size:12px;padding:4px;border:1px solid var(--border);border-radius:6px;" onchange="window.setOrderPlacementOverride('${d.id}', this.value)">`);
+      }});
+    data.forEach((o,i)=> rowBase[i].push(JSON.stringify({ id:o.id, override:o.placementOverride, auto: derivedPlacement(o) })));
+  }
+  columns.push(
+    { name:'Артикул', width:'90px' },
+    { name:'Контрагент' },
+    { name:'Действия', width:'60px', formatter:(cell)=>{
+        const d = JSON.parse(cell);
+        return d.link ? gridjs.html(`<a class="link" href="${escapeHtml(d.link)}" target="_blank" title="Ссылка на товар">🔗</a>`) : '';
+      }},
+  );
+  data.forEach((o,i)=> rowBase[i].push(o.article, o.contragent, JSON.stringify({ id:o.id, link:o.link })));
   ORDERS_GRID = renderGridInto(ORDERS_GRID, el, {
-    columns: [
-      { name:'№ заявки', width:'90px', formatter:(cell)=>{
-          const d = JSON.parse(cell);
-          return gridjs.html(`<a class="link" href="javascript:void(0)" onclick="window.viewOrderDetails('${d.id}')" title="Подробнее о заявке" style="cursor:pointer;">${escapeHtml(d.orderNumber||'—')}</a>`);
-        }},
-      { name:'Дата заявки', width:'130px', formatter:(cell)=>{
-          const d = JSON.parse(cell);
-          return gridjs.html(`<input type="date" value="${d.orderDate||''}" style="font-size:11px;padding:3px;border:1px solid var(--border);border-radius:6px;width:118px;" onchange="window.setOrderDate('${d.id}', this.value)">`);
-        }},
-      { name:'Клиент' }, { name:'Телефон', width:'120px' },
-      { name:'Статус', width:'160px', formatter:(cell)=>{
-          const d = JSON.parse(cell);
-          const allowedIds = new Set(allowedNextStatusIds(d));
-          const options = STATE.statuses.filter(s=>allowedIds.has(s.id));
-          return gridjs.html(`<select onchange="window.changeOrderStatus('${d.id}', this.value)" style="font-size:11px; padding:3px;">${options.map(s=>`<option value="${s.id}" ${s.id===d.statusId?'selected':''}>${escapeHtml(s.label)}</option>`).join('')}</select>`);
-        }},
-      { name:'Сумма', width:'100px', formatter:(cell)=>{
-          const d = JSON.parse(cell);
-          return gridjs.html(`<input type="number" value="${d.price!=null?d.price:''}" placeholder="0.00" step="0.01" style="width:85px;font-size:12px;padding:4px;border:1px solid var(--border);border-radius:6px;" onchange="window.setOrderPrice('${d.id}', this.value)">`);
-        }},
-      { name:'Доставка, ₽', width:'100px', formatter:(cell)=>{
-          const d = JSON.parse(cell);
-          return gridjs.html(`<input type="number" value="${d.delivery!=null?d.delivery:''}" placeholder="0.00" step="0.01" style="width:85px;font-size:12px;padding:4px;border:1px solid var(--border);border-radius:6px;" onchange="window.setOrderDelivery('${d.id}', this.value)">`);
-        }},
-      // Временно возвращено для ручного ввода, пока автоподтяжка логистики из расчёта прайса не
-      // станет надёжной регулярной практикой (см. autofillOrdersLogistics) — планируется снова
-      // убрать, когда прайсы будут стабильно и правильно загружаться каждый раз.
-      { name:'Логистика, ₽', width:'100px', formatter:(cell)=>{
-          const d = JSON.parse(cell);
-          const lockedAttrs = d.locked ? 'disabled title="Заявка отгружена — логистика зафиксирована"' : '';
-          const lockedStyle = d.locked ? 'opacity:.5;' : '';
-          return gridjs.html(`<input type="number" value="${d.logistics!=null?d.logistics:''}" placeholder="0.00" step="0.01" ${lockedAttrs} style="width:85px;font-size:12px;padding:4px;border:1px solid var(--border);border-radius:6px;${lockedStyle}" onchange="window.setOrderLogistics('${d.id}', this.value)">`);
-        }},
-      { name:'Артикул', width:'90px' },
-      { name:'Контрагент' },
-      { name:'Действия', width:'60px', formatter:(cell)=>{
-          const d = JSON.parse(cell);
-          return d.link ? gridjs.html(`<a class="link" href="${escapeHtml(d.link)}" target="_blank" title="Ссылка на товар">🔗</a>`) : '';
-        }},
-    ],
-    data: data.map(o=>[
-      JSON.stringify({ id:o.id, orderNumber:o.orderNumber }),
-      JSON.stringify({ id:o.id, orderDate:o.orderDate }),
-      o.clientName, o.phone,
-      JSON.stringify({ id:o.id, statusId:o.statusId }),
-      JSON.stringify({ id:o.id, price:o.price }),
-      JSON.stringify({ id:o.id, delivery:o.delivery }),
-      JSON.stringify({ id:o.id, logistics:o.logistics, locked: isLogisticsLocked(o) }),
-      o.article,
-      o.contragent,
-      JSON.stringify({ id:o.id, link:o.link }),
-    ]),
+    columns,
+    data: rowBase,
     search:false, sort:false, pagination:false, className:{ table:'gridjs-wrapper' },
   });
   renderOrdersPager(ordersPage, totalPages, filtered.length);
@@ -2112,12 +2151,20 @@ window.onOrdersFilterChange = function(){
 function exportOrders(fmt){
   const data = getFilteredOrders();
   if(!data.length){ toast('Нет данных для экспорта', 'err'); return; }
-  const rows = data.map(o=>({
-    '№ заявки': o.orderNumber, 'Дата заявки': o.orderDate, Клиент: o.clientName, Телефон: o.phone, Email: o.email,
-    Статус: statusOf(o.statusId).label, Сумма: o.price, 'Доставка, ₽': o.delivery, 'СС, ₽': o.cc, 'Логистика, ₽': o.logistics, 'Размещение, ₽': orderPlacement(o),
-    Артикул: o.article, Контрагент: o.contragent, ИНН: o.inn,
-    Ссылка: o.link, 'Адрес доставки': o.address, Комментарий: o.comment, 'Комментарий менеджера': o.managerComment,
-  }));
+  // Размещение -- только у админа, см. renderOrdersGrid.
+  const isAdmin = currentUserEmail === ADMIN_EMAIL;
+  const rows = data.map(o=>{
+    const row = {
+      '№ заявки': o.orderNumber, 'Дата заявки': o.orderDate, Клиент: o.clientName, Телефон: o.phone, Email: o.email,
+      Статус: statusOf(o.statusId).label, Сумма: o.price, 'Доставка, ₽': o.delivery, 'СС, ₽': o.cc, 'Логистика, ₽': o.logistics,
+    };
+    if(isAdmin) row['Размещение, ₽'] = orderPlacement(o);
+    Object.assign(row, {
+      Артикул: o.article, Контрагент: o.contragent, ИНН: o.inn,
+      Ссылка: o.link, 'Адрес доставки': o.address, Комментарий: o.comment, 'Комментарий менеджера': o.managerComment,
+    });
+    return row;
+  });
   const stamp = new Date().toISOString().slice(0,10);
   if(fmt==='csv'){
     const headers = Object.keys(rows[0]);
@@ -2232,7 +2279,7 @@ async function importOrdersRows(rows){
       orderDate: r.orderDate || todayStr(), contragent: r.contragent, inn: r.inn,
       clientName: r.clientName, phone: r.phone, email: r.email || '',
       price: r.price, cc: null, logistics: null, delivery: null, link: '', article: r.article,
-      address: r.address, comment: r.comment, managerComment: '', serialNumber: '',
+      address: r.address, comment: r.comment, managerComment: '', serialNumber: '', placementOverride: null,
       statusId, source: 'import', createdAt: now, updatedAt: now,
     };
     STATE.orders.unshift(order);
