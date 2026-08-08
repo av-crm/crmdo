@@ -475,7 +475,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.5';
+const APP_VERSION = '2026-08-08.6';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -922,11 +922,27 @@ async function driveDownloadJSON(fileId){
 // Точный поиск по имени (name=, не contains) -- в отличие от текстового contains-поиска, у
 // точного совпадения по имени нет ощутимой задержки индексации на Диске даже при большом числе
 // файлов в папке. См. driveUpsertJSON ниже, почему это важно.
+//
+// НАЙДЕННЫЙ БАГ (заявка 902, 2026-08-08): без orderBy Google Drive возвращает совпадения по
+// имени в НЕОПРЕДЕЛЁННОМ порядке. Где-то раньше (скорее всего гонка между двумя аккаунтами при
+// первом создании "текущего" файла) в папке оказалось ДВА файла с именем orders_current.json --
+// один свежий, другой сильно устаревший (проверено: у второго savedAt отставал на несколько
+// часов). Поиск иногда возвращал старый, и все статусы/новые заявки, добавленные позже, были
+// невидимы, хотя сам файл на Диске обновлялся исправно. Теперь всегда сортируем по modifiedTime
+// по убыванию и возвращаем ВСЕ совпадения (не одно) -- driveUpsertJSON ниже использует самое
+// свежее и удаляет остальные, чтобы дубль не возникал повторно.
 async function findExactFile(name, folderId){
   const q = `'${folderId}' in parents and name='${name.replace(/'/g, "\\'")}' and trashed=false`;
-  const res = await driveFetch('https://www.googleapis.com/drive/v3/files?' + new URLSearchParams({ q, fields:'files(id,name)', pageSize:'1' }));
+  const res = await driveFetch('https://www.googleapis.com/drive/v3/files?' + new URLSearchParams({ q, fields:'files(id,name,modifiedTime)', orderBy:'modifiedTime desc', pageSize:'10' }));
   const data = await res.json();
-  return (data.files && data.files[0]) ? data.files[0].id : null;
+  return (data.files || []);
+}
+async function driveTrashFile(fileId){
+  await driveFetch(`https://www.googleapis.com/drive/v3/files/${fileId}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ trashed: true }),
+  });
 }
 async function driveUpdateJSON(fileId, obj){
   const res = await driveFetch(`https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media&fields=id,name,modifiedTime`, {
@@ -954,15 +970,24 @@ async function driveUpdateJSON(fileId, obj){
 // чтения; timestamped-файлы остаются только для истории/аудита и больше не читаются при обычной
 // загрузке (только через ручной просмотр на Диске).
 async function driveUpsertJSON(name, folderId, obj){
-  const existingId = await findExactFile(name, folderId);
-  if(existingId) return await driveUpdateJSON(existingId, obj);
+  const files = await findExactFile(name, folderId);
+  if(files.length){
+    const result = await driveUpdateJSON(files[0].id, obj);
+    if(files.length > 1){
+      // Self-healing: clean up any duplicate "current" files left over from the bug above so
+      // future reads can never randomly land on a stale one again.
+      Promise.all(files.slice(1).map(f => driveTrashFile(f.id)))
+        .catch(e => console.error('Не удалось удалить дубли '+name+':', e));
+    }
+    return result;
+  }
   return await driveCreateJSON(name, folderId, obj);
 }
 async function driveDownloadCurrentJSON(name, folderId){
   if(!folderId) return null;
-  const id = await findExactFile(name, folderId);
-  if(!id) return null;
-  return await driveDownloadJSON(id);
+  const files = await findExactFile(name, folderId);
+  if(!files.length) return null;
+  return await driveDownloadJSON(files[0].id);
 }
 // Finds a subfolder by exact name under parentId, creating it once if it doesn't exist yet. Used
 // only for FOLDERS.debt right now (a folder that didn't exist before the data-split refactor).
