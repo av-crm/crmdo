@@ -475,7 +475,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.4';
+const APP_VERSION = '2026-08-08.5';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -2265,7 +2265,12 @@ function renderOrdersGrid(){
         // показываем предупреждение вместо того, чтобы врать про статус.
         const hasCurrent = options.some(s=>s.id===d.statusId);
         const orphanOption = (!hasCurrent && d.statusId) ? `<option value="${escapeHtml(d.statusId)}" selected>⚠ статус не в справочнике</option>` : '';
-        return gridjs.html(`<select onchange="window.changeOrderStatus('${d.id}', this.value)" style="font-size:11px; padding:3px;">${orphanOption}${options.map(s=>`<option value="${s.id}" ${s.id===d.statusId?'selected':''}>${escapeHtml(s.label)}</option>`).join('')}</select>`);
+        // data-order-id + data-status-id: used right after render (see syncOrdersStatusSelects
+        // below) to force the DOM <select>'s real value to match STATE, in case the browser's own
+        // "restore form field value on reload" behaviour clobbers our `selected` attribute with
+        // whatever the user had last picked in that browser tab -- this can happen even after a
+        // hard reload, independent of any Drive/JS caching, and looks identical to a sync bug.
+        return gridjs.html(`<select data-order-id="${escapeHtml(d.id)}" data-status-id="${escapeHtml(d.statusId||'')}" onchange="window.changeOrderStatus('${d.id}', this.value)" style="font-size:11px; padding:3px;">${orphanOption}${options.map(s=>`<option value="${s.id}" ${s.id===d.statusId?'selected':''}>${escapeHtml(s.label)}</option>`).join('')}</select>`);
       }},
     { name:'Сумма', width:'100px', formatter:(cell)=>{
         const d = JSON.parse(cell);
@@ -2321,6 +2326,28 @@ function renderOrdersGrid(){
     search:false, sort:false, pagination:false, className:{ table:'gridjs-wrapper' },
   });
   renderOrdersPager(ordersPage, totalPages, filtered.length);
+  syncOrdersStatusSelects(el);
+}
+// Grid.js (Preact under the hood) can finish its actual DOM patch a tick after forceRender()
+// returns, and separately, browsers can restore a <select>'s previously user-picked value on
+// reload independent of the `selected` attribute in the freshly-rendered HTML. Either one alone
+// can make a dropdown visually show a stale status even though STATE (and the HTML we generated)
+// is already correct -- confirmed on 2026-08-08 (заявка 902): the network response and STATE.orders
+// both had the right statusId, but the on-screen <select> still showed the old one. Belt-and-
+// suspenders fix: after every render, explicitly force each status <select>'s real DOM value to
+// match what we know is correct, on both this tick and the next one.
+function syncOrdersStatusSelects(container){
+  const apply = ()=>{
+    if(!container) return;
+    container.querySelectorAll('select[data-order-id]').forEach(sel=>{
+      const want = sel.getAttribute('data-status-id') || '';
+      if(sel.value !== want && [...sel.options].some(o=>o.value===want)){
+        sel.value = want;
+      }
+    });
+  };
+  apply();
+  setTimeout(apply, 0);
 }
 function renderOrdersPager(page, totalPages, totalCount){
   const el = document.getElementById('ordersPager');
