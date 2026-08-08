@@ -475,7 +475,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.2';
+const APP_VERSION = '2026-08-08.3';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -851,10 +851,17 @@ async function openDriveFolderPicker(){
 }
 
 /* ================= DRIVE (Google Drive REST v3) ================= */
+// cache:'no-store' on every request -- important since orders_current.json (и debt/settings_
+// current.json) теперь обновляются НА МЕСТЕ (тот же file id, тот же URL скачивания), в отличие от
+// старых timestamped-файлов, у которых URL всегда был новым и естественным образом не мог
+// закэшироваться браузером. С повторно используемым URL это стало реальным риском: без явного
+// no-store браузер вправе отдать старый закэшированный ответ на GET-запрос по тому же адресу
+// вместо повторного похода в сеть -- ровно то, что выглядело бы как "файл обновился, а данные
+// в приложении всё равно старые".
 async function driveFetch(url, options){
   options = options || {};
   if(!accessToken) throw new Error('Не выполнен вход через Google');
-  const res = await fetch(url, { ...options, headers: { ...(options.headers||{}), Authorization: 'Bearer ' + accessToken } });
+  const res = await fetch(url, { cache: 'no-store', ...options, headers: { ...(options.headers||{}), Authorization: 'Bearer ' + accessToken } });
   if(res.status === 401){
     accessToken = null; sessionStorage.removeItem(TOKEN_KEY);
     document.getElementById('authGate').style.display = 'block';
@@ -907,7 +914,9 @@ async function driveCreateJSON(title, parentId, obj){
   return { id:data.id, title:data.name, createdTime:data.createdTime, parentId };
 }
 async function driveDownloadJSON(fileId){
-  const res = await driveFetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`);
+  // &_cb=... -- делает URL уникальным на каждый вызов, вторая (на всякий случай, вдобавок к
+  // cache:'no-store' в driveFetch) защита от кэширования на URL с повторяющимся file id.
+  const res = await driveFetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&_cb=${Date.now()}`);
   return await res.json();
 }
 // Точный поиск по имени (name=, не contains) -- в отличие от текстового contains-поиска, у
