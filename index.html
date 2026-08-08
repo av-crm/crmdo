@@ -899,6 +899,51 @@ async function driveDownloadJSON(fileId){
   const res = await driveFetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`);
   return await res.json();
 }
+// Точный поиск по имени (name=, не contains) -- в отличие от текстового contains-поиска, у
+// точного совпадения по имени нет ощутимой задержки индексации на Диске даже при большом числе
+// файлов в папке. См. driveUpsertJSON ниже, почему это важно.
+async function findExactFile(name, folderId){
+  const q = `'${folderId}' in parents and name='${name.replace(/'/g, "\\'")}' and trashed=false`;
+  const res = await driveFetch('https://www.googleapis.com/drive/v3/files?' + new URLSearchParams({ q, fields:'files(id,name)', pageSize:'1' }));
+  const data = await res.json();
+  return (data.files && data.files[0]) ? data.files[0].id : null;
+}
+async function driveUpdateJSON(fileId, obj){
+  const res = await driveFetch(`https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media&fields=id,name,modifiedTime`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(obj),
+  });
+  const data = await res.json();
+  return { id:data.id, title:data.name, modifiedTime:data.modifiedTime };
+}
+// Заявки/Долг/Настройки теперь хранятся ДВОЯКО: (1) полная история — каждое сохранение по-прежнему
+// пишет отдельный orders_<время>.json (ничего не удаляется, история версий цела, как и раньше), и
+// (2) "текущий" файл с ФИКСИРОВАННЫМ именем (например orders_current.json), который просто
+// перезаписывается на месте при каждом сохранении.
+//
+// Почему это понадобилось: "последнее состояние" раньше искалось текстовым поиском
+// (name contains 'orders_' + сортировка по дате). У этого приложения КАЖДОЕ действие (даже смена
+// статуса одной заявки) создаёт новый файл — за время работы их накопились сотни. При таком объёме
+// и частоте записи текстовый поисковый индекс Google Диска ощутимо отстаёт от реальности: он не
+// успевает проиндексировать самые свежие файлы. Итог — «Обновить данные» стабильно подтягивал не
+// последнюю версию, а предыдущую, из-за чего казалось, что изменения другого аккаунта не видны,
+// хотя запись на Диск на самом деле проходила нормально (см. историю переписки: savedAt внутри
+// загруженного файла отставал от самого свежего orders_*.json на Диске на пару сохранений).
+// Поиск по точному имени этой задержке не подвержен, поэтому он и используется для актуального
+// чтения; timestamped-файлы остаются только для истории/аудита и больше не читаются при обычной
+// загрузке (только через ручной просмотр на Диске).
+async function driveUpsertJSON(name, folderId, obj){
+  const existingId = await findExactFile(name, folderId);
+  if(existingId) return await driveUpdateJSON(existingId, obj);
+  return await driveCreateJSON(name, folderId, obj);
+}
+async function driveDownloadCurrentJSON(name, folderId){
+  if(!folderId) return null;
+  const id = await findExactFile(name, folderId);
+  if(!id) return null;
+  return await driveDownloadJSON(id);
+}
 // Finds a subfolder by exact name under parentId, creating it once if it doesn't exist yet. Used
 // only for FOLDERS.debt right now (a folder that didn't exist before the data-split refactor).
 // Safe to call from every browser/session: it always searches-by-name first, so whichever person's
@@ -956,19 +1001,24 @@ async function loadLatestLegacyCombinedState(){
     paidStatusIds: data.paidStatusIds || null, _legacy: true,
   };
 }
+// Читает "текущий" файл по точному имени (быстро и без задержки индексации); если его ещё нет —
+// откатывается на старый contains+сортировка способ (актуально только для самой первой загрузки
+// после этого обновления, пока saveState() ещё ни разу не создал orders_current.json и т.п.).
+async function loadSection(currentName, folderId, prefix){
+  if(!folderId) return null;
+  const data = await driveDownloadCurrentJSON(currentName, folderId);
+  if(data) return data;
+  const f = await latestFileMetaByPrefix(folderId, prefix);
+  return f ? await driveDownloadJSON(f.id) : null;
+}
 async function loadLatestState(){
   await ensureDataFolders();
-  const [ordersFile, debtFile, settingsFile] = await Promise.all([
-    latestFileMetaByPrefix(FOLDERS.orders, 'orders_'),
-    FOLDERS.debt ? latestFileMetaByPrefix(FOLDERS.debt, 'debt_') : null,
-    latestFileMetaByPrefix(FOLDERS.config, 'settings_'),
+  const [ordersData, debtData, settingsData] = await Promise.all([
+    loadSection('orders_current.json', FOLDERS.orders, 'orders_'),
+    loadSection('debt_current.json', FOLDERS.debt, 'debt_'),
+    loadSection('settings_current.json', FOLDERS.config, 'settings_'),
   ]);
-  if(ordersFile || debtFile || settingsFile){
-    const [ordersData, debtData, settingsData] = await Promise.all([
-      ordersFile ? driveDownloadJSON(ordersFile.id) : null,
-      debtFile ? driveDownloadJSON(debtFile.id) : null,
-      settingsFile ? driveDownloadJSON(settingsFile.id) : null,
-    ]);
+  if(ordersData || debtData || settingsData){
     return {
       orders: (ordersData && ordersData.orders) || [],
       sellerPayments: (debtData && debtData.sellerPayments) || [],
@@ -1008,16 +1058,13 @@ function mergeById(localArr, remoteArr){
 async function saveState(){
   await ensureDataFolders();
   // Подтягиваем самую свежую версию с Диска прямо перед записью и мёрджим -- сужает окно гонки
-  // почти до нуля (см. mergeById выше). Если подтянуть не удалось (например, сеть) -- сохраняем
-  // как есть локально, это лучше, чем вообще не дать сохранить.
+  // почти до нуля (см. mergeById выше). Читаем через "текущий" файл (loadSection), а не старым
+  // contains-поиском -- см. driveUpsertJSON про то, почему это важно именно здесь. Если подтянуть
+  // не удалось (например, сеть) -- сохраняем как есть локально, это лучше, чем вообще не сохранить.
   try {
-    const [freshOrdersFile, freshDebtFile] = await Promise.all([
-      latestFileMetaByPrefix(FOLDERS.orders, 'orders_'),
-      FOLDERS.debt ? latestFileMetaByPrefix(FOLDERS.debt, 'debt_') : null,
-    ]);
     const [freshOrdersData, freshDebtData] = await Promise.all([
-      freshOrdersFile ? driveDownloadJSON(freshOrdersFile.id) : null,
-      freshDebtFile ? driveDownloadJSON(freshDebtFile.id) : null,
+      loadSection('orders_current.json', FOLDERS.orders, 'orders_'),
+      loadSection('debt_current.json', FOLDERS.debt, 'debt_'),
     ]);
     STATE.orders = mergeById(STATE.orders, (freshOrdersData && freshOrdersData.orders) || []);
     STATE.sellerPayments = mergeById(STATE.sellerPayments, (freshDebtData && freshDebtData.sellerPayments) || []);
@@ -1026,10 +1073,18 @@ async function saveState(){
   }
   STATE.savedAt = new Date().toISOString();
   const ts = STATE.savedAt.replace(/[:.]/g,'-');
+  const ordersPayload = { orders: STATE.orders, savedAt: STATE.savedAt };
+  const debtPayload = { sellerPayments: STATE.sellerPayments, savedAt: STATE.savedAt };
+  const settingsPayload = { statuses: STATE.statuses, users: STATE.users, statusRules: STATE.statusRules, dealDoneStatusId: STATE.dealDoneStatusId, paidStatusIds: STATE.paidStatusIds, savedAt: STATE.savedAt };
   await Promise.all([
-    driveCreateJSON(`orders_${ts}.json`, FOLDERS.orders, { orders: STATE.orders, savedAt: STATE.savedAt }),
-    driveCreateJSON(`debt_${ts}.json`, FOLDERS.debt, { sellerPayments: STATE.sellerPayments, savedAt: STATE.savedAt }),
-    driveCreateJSON(`settings_${ts}.json`, FOLDERS.config, { statuses: STATE.statuses, users: STATE.users, statusRules: STATE.statusRules, dealDoneStatusId: STATE.dealDoneStatusId, paidStatusIds: STATE.paidStatusIds, savedAt: STATE.savedAt }),
+    // История версий -- как и раньше, ничего не удаляется и не перезаписывается.
+    driveCreateJSON(`orders_${ts}.json`, FOLDERS.orders, ordersPayload),
+    driveCreateJSON(`debt_${ts}.json`, FOLDERS.debt, debtPayload),
+    driveCreateJSON(`settings_${ts}.json`, FOLDERS.config, settingsPayload),
+    // "Текущий" файл -- то, что реально читается при загрузке (см. loadSection/loadLatestState).
+    driveUpsertJSON('orders_current.json', FOLDERS.orders, ordersPayload),
+    driveUpsertJSON('debt_current.json', FOLDERS.debt, debtPayload),
+    driveUpsertJSON('settings_current.json', FOLDERS.config, settingsPayload),
   ]);
   // Мёрдж мог подтянуть чужие заявки/оплаты, которых не было в этой вкладке -- перерисовываем,
   // чтобы экран не разошёлся с тем, что реально теперь сохранено на Диске.
