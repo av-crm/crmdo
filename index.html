@@ -101,7 +101,7 @@
       <p class="hint">Нужен один раз настроенный Google OAuth Client ID (см. инструкцию от Клода). Затем вставьте его сюда — он сохранится в этом браузере.</p>
       <ol class="setup hint">
         <li>console.cloud.google.com → создать проект → включить Google Drive API</li>
-        <li>OAuth consent screen: External, добавить свой e-mail в Test users, scope drive.file</li>
+        <li>OAuth consent screen: External, добавить свой e-mail в Test users, scope drive (полный доступ к Диску — см. ниже, почему не drive.file)</li>
         <li>Credentials → Create OAuth client ID → Web application → Authorized JavaScript origins: адрес, с которого открываете эту страницу (например http://localhost:8765)</li>
         <li>Скопировать Client ID и вставить ниже</li>
       </ol>
@@ -475,7 +475,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.8';
+const APP_VERSION = '2026-08-08.9';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -516,11 +516,25 @@ const DEFAULT_STATUSES = [
 ];
 const CLIENT_ID_KEY = 'crm_google_client_id';
 const TOKEN_KEY = 'crm_access_token';
-// Added userinfo.email on top of drive.file so the app can tell WHO is signed in (needed for
-// per-section access control below). This is a non-sensitive scope (no extra Google verification
-// needed) but IS a new permission — anyone who already has a cached token from before this change
-// will be prompted to re-approve once on their next sign-in.
-const SCOPES = 'https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/userinfo.email';
+// НАЙДЕННЫЙ БАГ #3 (заявка 902, настоящая первопричина): drive.file -- узкий scope, который даёт
+// приложению API-доступ ТОЛЬКО к файлам, которые (а) само приложение создало под ЭТИМ аккаунтом,
+// либо (б) были явно выбраны через Google Picker под этим аккаунтом. Обычные права "Редактор",
+// выданные через штатное расшаривание на Диске, НЕ равны этому -- через drive.file они не дают
+// доступа к файлу по API, если его физически создал (т.е. является владельцем) ДРУГОЙ аккаунт, даже
+// при полном Editor-доступе. Ровно поэтому AV не мог прочитать orders_current.json, когда его в
+// очередной раз пересоздавал (стал владельцем) аккаунт joyorrussia -- приложение AV буквально не
+// видело файл по API (404), хотя сам AV прекрасно открывал его в браузере на drive.google.com и
+// имел там полный Editor-доступ. Пикер по папке (openDriveFolderPicker) эту проблему не решает --
+// выбор ПАПКИ через Picker не даёт ретроактивного доступа к файлам ВНУТРИ неё, которые создал кто-то
+// другой, а новый "текущий" файл пересоздаётся буквально на каждое сохранение статуса -- вручную
+// "пикать" каждый новый файл через Picker было бы нужно после каждого действия любого из двух
+// аккаунтов, что не имеет практического смысла. Поэтому scope расширен до полного 'drive' -- он
+// даёт доступ по API ко всем файлам, до которых и так есть обычный доступ на Диске (через
+// расшаривание), без специфики "кто именно физически создал файл". Из-за смены scope все, кто уже
+// входил раньше, при следующем входе увидят у Google новый экран подтверждения разрешений — это
+// ожидаемо, нужно один раз подтвердить (Продолжить/Разрешить), после этого проблема с "невидимыми"
+// файлами другого аккаунта исчезает полностью и навсегда, а не только для текущих трёх файлов.
+const SCOPES = 'https://www.googleapis.com/auth/drive https://www.googleapis.com/auth/userinfo.email';
 const API_KEY_KEY = 'crm_google_api_key';
 // Hardcoded so the owner's own account can never be locked out by a mistake in the Пользователи
 // list below (e.g. removing/mis-typing their own row). Always has every section regardless of
