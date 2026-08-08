@@ -812,14 +812,23 @@ async function openDriveFolderPicker(){
       .setOAuthToken(accessToken)
       .setDeveloperKey(apiKey)
       .setCallback((data)=>{
+        // Пикер не всегда закрывается сам после выбора (встречается в некоторых браузерах/режимах
+        // инкогнито, где сторонние куки урезаны) -- окно остаётся поверх страницы, и кажется, что
+        // всё "зависло", хотя папка на самом деле уже выбрана и данные грузятся под ним. Закрываем
+        // явно в обоих случаях (выбрали / отменили), не полагаясь на поведение самого виджета.
         if(data.action === google.picker.Action.PICKED){
           const doc = data.docs[0];
+          picker.setVisible(false);
           if(doc.id === FOLDERS.root){
+            hint.textContent = 'Доступ получен, загружаю данные…';
             toast('Доступ к папке «CRM_Данные» получен, обновляю данные…', 'ok');
-            refreshAll();
+            refreshAll().then(()=>{ if(hint.textContent==='Доступ получен, загружаю данные…') hint.textContent = ''; });
           } else {
+            hint.textContent = '';
             toast('Похоже, это не та папка. Нужна папка с названием «CRM_Данные», расшаренная вам её владельцем.', 'err');
           }
+        } else if(data.action === google.picker.Action.CANCEL){
+          picker.setVisible(false);
         }
       })
       .build();
