@@ -475,7 +475,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.7';
+const APP_VERSION = '2026-08-08.8';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -489,21 +489,22 @@ const FOLDERS = {
   orders: '1_4nle_GASD4Nz6VsGDp1qL48khkrEg8x',
   debt: null, // resolved at runtime by ensureDataFolders() -- didn't exist before this split
 };
-// НАЙДЕННЫЙ БАГ #2 (заявка 902, 2026-08-08, после фикса с orderBy): даже с orderBy=modifiedTime
-// desc Google Drive иногда возвращает НЕ самый свежий файл сразу после серии быстрых записей --
-// files.list (текстовый/метаданный поиск) у Drive устроен как eventually consistent индекс, а не
-// как строго консистентное чтение. Подтверждено на практике: через несколько минут после сохранения
-// со статусом "processing" (savedAt 15:09) запрос всё ещё присылал версию с savedAt 13:12. Прямое
-// чтение/запись файла ПО ЕГО ID (GET/PATCH .../files/{id}) у Drive, в отличие от files.list, строго
-// консистентно -- именно поэтому теперь текущие файлы читаются/пишутся по кэшированному id, а
-// files.list (findExactFile) используется только один раз при самой первой загрузке (bootstrap),
-// пока id ещё не известен. Сам кэш id хранится и в памяти (POINTER_IDS), и на Диске
-// (_pointers.json в папке "Настройки"), чтобы каждая новая вкладка/аккаунт не делала bootstrap
-// заново -- см. loadPointers/savePointerId/driveDownloadCurrentJSON/driveUpsertJSON ниже.
-const POINTER_IDS = { orders: null, debt: null, settings: null };
-const POINTERS_FILE_NAME = '_pointers.json';
-let pointersDocId = null;   // id самого _pointers.json (тоже кэшируется, тем же способом)
-let pointersLoaded = false; // грузим с Диска не чаще раза за сессию
+// НАЙДЕННЫЙ БАГ #2 (заявка 902, 2026-08-08): даже с orderBy=modifiedTime desc и даже через
+// отдельный "pointer file" с bootstrap-поиском Google Drive files.list (текстовый/метаданный
+// поиск) вёл себя ненадёжно -- то возвращал не самый свежий файл, то (после множества запросов за
+// день, похоже на временный рейт-лимит) сам bootstrap-поиск подвисал и не отвечал вообще, из-за
+// чего приложение не могло даже НАЧАТЬ читать по id. files.list здесь оказался вообще не тем, на
+// что можно полагаться для этих трёх файлов. Поэтому вместо bootstrap-поиска id прописаны
+// напрямую, как и у FOLDERS -- т.е. взяты один раз вручную (Диск → файл → "Получить ссылку") и
+// больше поиск для обычной загрузки/сохранения не используется совсем. Если когда-нибудь файл
+// пересоздадут вручную и id реально изменится -- driveUpsertJSON/driveDownloadCurrentJSON поймают
+// 404 на этот id и один раз откатятся на findExactFile, чтобы самоисцелиться (см. ниже), но это
+// уже редкий защитный путь, а не то, что выполняется на каждую загрузку/статус.
+const POINTER_IDS = {
+  orders: '1fDE3-4kAMCgglwRvkNufGI6Arl8Qh4MN',
+  debt: '1WCj32x3BpPduQkRqLrvvM69zR8uCsCDZ',
+  settings: '1QklBpKsV4nAf7jnT-yJK923gKysrpi8G',
+};
 const DEFAULT_STATUSES = [
   { id:'new', label:'Новая', color:'#2563eb' },
   { id:'processing', label:'В обработке', color:'#d97706' },
@@ -987,109 +988,57 @@ async function driveUpdateJSON(fileId, obj){
 function isNotFoundError(e){
   return !!e && /Drive API 404/.test(e.message||'');
 }
-// --- Указатели (pointer file) -------------------------------------------------------------
-// _pointers.json лежит в папке "Настройки" и хранит { orders: fileId, debt: fileId,
-// settings: fileId } -- id самих "текущих" файлов. Он меняется КРАЙНЕ редко (только когда файл
-// ещё не создан или когда самолечение дублей выбирает новый канонiчный id), поэтому сам по себе
-// не подвержен проблеме устаревания индекса files.list -- он ей подвержен ровно один раз, при
-// самой первой загрузке в этой вкладке, и это приемлемо (одна операция за сессию, не сотни).
-async function loadPointers(){
-  if(pointersLoaded) return;
-  pointersLoaded = true; // ставим сразу, чтобы параллельные вызовы не задублировали bootstrap
-  try {
-    const files = await findExactFile(POINTERS_FILE_NAME, FOLDERS.config);
-    if(files.length){
-      pointersDocId = files[0].id;
-      if(files.length > 1){
-        Promise.all(files.slice(1).map(f => driveTrashFile(f.id)))
-          .catch(e => console.error('Не удалось удалить дубли '+POINTERS_FILE_NAME+':', e));
-      }
-      const data = await driveDownloadJSON(pointersDocId);
-      if(data && typeof data === 'object'){
-        if(data.orders) POINTER_IDS.orders = data.orders;
-        if(data.debt) POINTER_IDS.debt = data.debt;
-        if(data.settings) POINTER_IDS.settings = data.settings;
-      }
-    }
-  } catch(e){ console.error('Не удалось загрузить _pointers.json (продолжаем без кэша id):', e); }
-}
-async function savePointerId(key, fileId){
-  POINTER_IDS[key] = fileId;
-  try {
-    if(!pointersDocId){
-      // Тот самый единственный bootstrap-поиск для самого файла указателей (см. комментарий выше).
-      const files = await findExactFile(POINTERS_FILE_NAME, FOLDERS.config);
-      if(files.length){
-        pointersDocId = files[0].id;
-        if(files.length > 1){
-          Promise.all(files.slice(1).map(f => driveTrashFile(f.id)))
-            .catch(e => console.error('Не удалось удалить дубли '+POINTERS_FILE_NAME+':', e));
-        }
-      }
-    }
-    if(pointersDocId){
-      await driveUpdateJSON(pointersDocId, POINTER_IDS);
-    } else {
-      const created = await driveCreateJSON(POINTERS_FILE_NAME, FOLDERS.config, POINTER_IDS);
-      pointersDocId = created.id;
-    }
-  } catch(e){
-    // Не страшно: POINTER_IDS[key] в памяти этой вкладки всё равно верный, а на следующей загрузке
-    // просто повторится обычный (редкий) bootstrap-поиск, как раньше.
-    console.error('Не удалось сохранить _pointers.json:', e);
-  }
-}
 // --- Текущие файлы (orders_current.json / debt_current.json / settings_current.json) -----------
 // Заявки/Долг/Настройки хранятся ДВОЯКО: (1) полная история — каждое сохранение по-прежнему пишет
 // отдельный orders_<время>.json (ничего не удаляется, история версий цела, как и раньше), и
 // (2) "текущий" файл с ФИКСИРОВАННЫМ именем (например orders_current.json), который просто
 // перезаписывается на месте при каждом сохранении.
 //
-// НАЙДЕННЫЙ БАГ #2 (заявка 902): даже точный поиск по имени с orderBy=modifiedTime иногда всё
-// равно возвращает не самую свежую версию сразу после серии быстрых записей -- у files.list нет
-// строгой консистентности. Поэтому теперь читаем/пишем текущие файлы НАПРЯМУЮ ПО ID, который
-// один раз находим через findExactFile и после этого держим в POINTER_IDS (кэш в памяти) и в
-// _pointers.json (кэш на Диске, общий для всех вкладок/аккаунтов) -- см. loadPointers/
-// savePointerId выше. files.list для этих трёх файлов теперь вызывается только при самом первом
-// bootstrap (если указателя ещё нет или он оказался битым/удалённым файлом), а не на каждое
-// сохранение/загрузку, как раньше.
+// НАЙДЕННЫЙ БАГ #2 (заявка 902): у files.list (поиска по Диску) нет строгой консистентности --
+// даже точное совпадение по имени с orderBy=modifiedTime иногда возвращало не самую свежую версию
+// после серии быстрых записей, а один раз (уже после того, как читать стали по кэшированному id,
+// который сам находился через тот же files.list при самой первой загрузке) сам этот bootstrap-
+// поиск завис и не ответил вообще -- похоже на временный рейт-лимит после сотен запросов за день.
+// Итог: полагаться на files.list для этих трёх файлов НЕЛЬЗЯ ни разу, даже один раз при старте.
+// Поэтому их id теперь прописаны напрямую в POINTER_IDS (см. выше, взяты вручную через "Получить
+// ссылку" на файл в Диске) -- ни на чтение, ни на сохранение files.list для них больше не
+// вызывается. findExactFile ниже используется только как редкий защитный откат, если жёстко
+// прописанный id вдруг перестанет существовать (файл вручную удалили/пересоздали) -- тогда ловим
+// 404 и один-единственный раз ищем по имени заново, чтобы не остаться совсем без данных.
 async function driveUpsertJSON(name, folderId, obj, pointerKey){
-  await loadPointers();
-  if(pointerKey && POINTER_IDS[pointerKey]){
+  const knownId = pointerKey && POINTER_IDS[pointerKey];
+  if(knownId){
     try {
-      return await driveUpdateJSON(POINTER_IDS[pointerKey], obj);
+      return await driveUpdateJSON(knownId, obj);
     } catch(e){
       if(!isNotFoundError(e)) throw e;
-      // Файл, на который указывал кэш, пропал (удалён/перемещён вручную) -- сбрасываем указатель
-      // и один раз падаем обратно на поиск по имени ниже, чтобы найти/создать заново.
-      POINTER_IDS[pointerKey] = null;
+      // Прописанный id больше не существует -- аварийный (редкий) откат на поиск по имени.
+      console.error(`Файл по жёстко прописанному id для "${pointerKey}" не найден, ищу по имени:`, e);
     }
   }
   const files = await findExactFile(name, folderId);
   if(files.length){
     const result = await driveUpdateJSON(files[0].id, obj);
     if(files.length > 1){
-      // Self-healing: clean up any duplicate "current" files left over from the bug above so
-      // future reads can never randomly land on a stale one again.
       Promise.all(files.slice(1).map(f => driveTrashFile(f.id)))
         .catch(e => console.error('Не удалось удалить дубли '+name+':', e));
     }
-    if(pointerKey) await savePointerId(pointerKey, files[0].id);
+    if(pointerKey) POINTER_IDS[pointerKey] = files[0].id;
     return result;
   }
   const created = await driveCreateJSON(name, folderId, obj);
-  if(pointerKey) await savePointerId(pointerKey, created.id);
+  if(pointerKey) POINTER_IDS[pointerKey] = created.id;
   return created;
 }
 async function driveDownloadCurrentJSON(name, folderId, pointerKey){
   if(!folderId) return null;
-  await loadPointers();
-  if(pointerKey && POINTER_IDS[pointerKey]){
+  const knownId = pointerKey && POINTER_IDS[pointerKey];
+  if(knownId){
     try {
-      return await driveDownloadJSON(POINTER_IDS[pointerKey]);
+      return await driveDownloadJSON(knownId);
     } catch(e){
       if(!isNotFoundError(e)) throw e;
-      POINTER_IDS[pointerKey] = null; // упавший указатель -- падаем на поиск по имени ниже
+      console.error(`Файл по жёстко прописанному id для "${pointerKey}" не найден, ищу по имени:`, e);
     }
   }
   const files = await findExactFile(name, folderId);
@@ -1098,7 +1047,7 @@ async function driveDownloadCurrentJSON(name, folderId, pointerKey){
     Promise.all(files.slice(1).map(f => driveTrashFile(f.id)))
       .catch(e => console.error('Не удалось удалить дубли '+name+':', e));
   }
-  if(pointerKey) await savePointerId(pointerKey, files[0].id);
+  if(pointerKey) POINTER_IDS[pointerKey] = files[0].id;
   return await driveDownloadJSON(files[0].id);
 }
 // Finds a subfolder by exact name under parentId, creating it once if it doesn't exist yet. Used
