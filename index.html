@@ -475,7 +475,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.3';
+const APP_VERSION = '2026-08-08.4';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -1082,12 +1082,24 @@ async function saveState(){
   // contains-поиском -- см. driveUpsertJSON про то, почему это важно именно здесь. Если подтянуть
   // не удалось (например, сеть) -- сохраняем как есть локально, это лучше, чем вообще не сохранить.
   try {
-    const [freshOrdersData, freshDebtData] = await Promise.all([
+    const [freshOrdersData, freshDebtData, freshSettingsData] = await Promise.all([
       loadSection('orders_current.json', FOLDERS.orders, 'orders_'),
       loadSection('debt_current.json', FOLDERS.debt, 'debt_'),
+      loadSection('settings_current.json', FOLDERS.config, 'settings_'),
     ]);
     STATE.orders = mergeById(STATE.orders, (freshOrdersData && freshOrdersData.orders) || []);
     STATE.sellerPayments = mergeById(STATE.sellerPayments, (freshDebtData && freshDebtData.sellerPayments) || []);
+    // НАЙДЕННЫЙ БАГ (заявка 902): статусы/пользователи раньше НЕ мёрджились, в отличие от заявок и
+    // долга продавца выше -- settings_current.json просто затирался тем, что было в памяти ЭТОЙ
+    // вкладки. Если один аккаунт добавлял новый статус (Настройки → Статусы) и сохранял, а другой
+    // аккаунт (с устаревшим списком статусов в памяти) сохранял что угодно после этого -- новый
+    // статус тихо исчезал из settings_current.json. Сама заявка при этом продолжала верно хранить
+    // statusId этого статуса (заявки мёрджатся выше), но т.к. самого статуса в списке больше нет,
+    // выпадающий список в таблице не находит совпадение и показывает первый статус по умолчанию
+    // ("Новая") -- выглядит так, будто изменение не сохранилось, хотя на самом деле пропал именно
+    // статус-справочник. Чиним тем же способом, что и для заявок/долга: мёрдж по id.
+    STATE.statuses = mergeById(STATE.statuses, (freshSettingsData && freshSettingsData.statuses) || []);
+    STATE.users = mergeById(STATE.users, (freshSettingsData && freshSettingsData.users) || []);
   } catch(e){
     console.error('Не удалось подтянуть свежую версию перед сохранением, сохраняю как есть локально:', e);
   }
@@ -2246,7 +2258,14 @@ function renderOrdersGrid(){
         const d = JSON.parse(cell);
         const allowedIds = new Set(allowedNextStatusIds(d));
         const options = STATE.statuses.filter(s=>allowedIds.has(s.id));
-        return gridjs.html(`<select onchange="window.changeOrderStatus('${d.id}', this.value)" style="font-size:11px; padding:3px;">${options.map(s=>`<option value="${s.id}" ${s.id===d.statusId?'selected':''}>${escapeHtml(s.label)}</option>`).join('')}</select>`);
+        // Защита от "статус есть у заявки, но пропал из справочника" (см. фикс мёрджа статусов в
+        // saveState): раньше в этом случае <select> просто не находил совпадающий <option> и молча
+        // показывал первый статус по списку ("Новая") -- выглядело так, будто статус заявки
+        // откатился, хотя на самом деле пропало само название статуса. Теперь в такой ситуации явно
+        // показываем предупреждение вместо того, чтобы врать про статус.
+        const hasCurrent = options.some(s=>s.id===d.statusId);
+        const orphanOption = (!hasCurrent && d.statusId) ? `<option value="${escapeHtml(d.statusId)}" selected>⚠ статус не в справочнике</option>` : '';
+        return gridjs.html(`<select onchange="window.changeOrderStatus('${d.id}', this.value)" style="font-size:11px; padding:3px;">${orphanOption}${options.map(s=>`<option value="${s.id}" ${s.id===d.statusId?'selected':''}>${escapeHtml(s.label)}</option>`).join('')}</select>`);
       }},
     { name:'Сумма', width:'100px', formatter:(cell)=>{
         const d = JSON.parse(cell);
