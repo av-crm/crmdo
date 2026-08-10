@@ -475,7 +475,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.9';
+const APP_VERSION = '2026-08-08.10';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -2117,7 +2117,15 @@ function contragentOptionsHtml(selectedName){
   const extra = (selectedName && !inList) ? `<option value="${escapeHtml(selectedName)}" selected>${escapeHtml(selectedName)} (нет в списке контрагентов)</option>` : '';
   return extra + CALC_IP_LIST.map(ip=>`<option value="${escapeHtml(ip.name)}" ${ip.name===selectedName?'selected':''}>${escapeHtml(ip.name)} — ИНН ${escapeHtml(ip.inn)}</option>`).join('');
 }
-window.setOrderContragent = function(id, name){
+// Карточка заявки (в отличие от полей прямо в таблице списка, которые печатаются посимвольно и
+// поэтому по-прежнему копятся в ordersDirty до общей кнопки "Сохранить изменения") пишет на Диск
+// сразу по каждому изменению -- так же, как статус и серийный номер. Раньше комментарий менеджера
+// и продавец сохранялись только локально до отдельного клика по кнопке в списке, и если человек
+// закрывал вкладку/забывал нажать её, правка молча терялась и была не видна другим -- ровно то,
+// что произошло с комментарием joyorrussia. При нескольких одновременно работающих людях это
+// особенно важно: правки в карточке теперь долетают на Диск сразу, а не зависают в памяти одной
+// вкладки.
+window.setOrderContragent = async function(id, name){
   const o = STATE.orders.find(x=>x.id===id); if(!o) return;
   o.contragent = name;
   // ИНН больше не показывается в этой карточке (убрано по запросу), но по-прежнему хранится в
@@ -2125,9 +2133,14 @@ window.setOrderContragent = function(id, name){
   const match = CALC_IP_LIST.find(ip=>ip.name===name);
   if(match) o.inn = match.inn;
   o.updatedAt = new Date().toISOString();
-  markOrdersDirty();
   renderOrdersGrid();
-  toast('Продавец изменён — не забудьте нажать «Сохранить изменения»', 'ok');
+  try {
+    await saveState();
+    toast('Продавец сохранён', 'ok');
+  } catch(e){
+    markOrdersDirty();
+    toast('Не удалось сохранить сразу, нажмите «Сохранить изменения»: ' + e.message, 'err');
+  }
 };
 // Segmented into labeled blocks on request (Заказ / Контакты клиента / Продавец / Адрес доставки /
 // комментарии / Информация для отгрузки), instead of one flat pile of fields. ИНН продавца was
@@ -2192,7 +2205,7 @@ window.viewOrderDetails = function(id){
       <tr><th>Сумма в чеке</th><td><strong>${receiptTotal!=null?fmtMoney(receiptTotal)+' ₽':'—'}</strong> <span class="hint">(Сумма ${o.price!=null?fmtMoney(o.price)+' ₽':'—'} + Доставка ${o.delivery!=null?fmtMoney(o.delivery)+' ₽':'—'})</span></td></tr>
     </table>
 
-    <p class="hint">Правки здесь сохраняются вместе с остальными — кнопкой «Сохранить изменения» в списке заявок (кроме серийного номера — он сохраняется сразу).</p>
+    <p class="hint">Все правки в этой карточке (email, продавец, комментарий менеджера, серийный номер) сохраняются на Диск сразу же, без отдельной кнопки.</p>
   `;
   modalBg.classList.add('show');
 };
@@ -2280,17 +2293,29 @@ window.setOrderInn = function(id, val){
   o.updatedAt = new Date().toISOString();
   markOrdersDirty();
 };
-window.setOrderEmail = function(id, val){
+window.setOrderEmail = async function(id, val){
   const o = STATE.orders.find(x=>x.id===id); if(!o) return;
   o.email = val.trim();
   o.updatedAt = new Date().toISOString();
-  markOrdersDirty();
+  try {
+    await saveState();
+    toast('Email сохранён', 'ok');
+  } catch(e){
+    markOrdersDirty();
+    toast('Не удалось сохранить сразу, нажмите «Сохранить изменения»: ' + e.message, 'err');
+  }
 };
-window.setOrderManagerComment = function(id, val){
+window.setOrderManagerComment = async function(id, val){
   const o = STATE.orders.find(x=>x.id===id); if(!o) return;
   o.managerComment = val;
   o.updatedAt = new Date().toISOString();
-  markOrdersDirty();
+  try {
+    await saveState();
+    toast('Комментарий сохранён', 'ok');
+  } catch(e){
+    markOrdersDirty();
+    toast('Не удалось сохранить сразу, нажмите «Сохранить изменения»: ' + e.message, 'err');
+  }
 };
 
 // Default table order: strictly by order number (numeric-aware, newest/highest first), with
