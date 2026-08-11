@@ -475,7 +475,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.10';
+const APP_VERSION = '2026-08-08.11';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -2159,7 +2159,9 @@ window.viewOrderDetails = function(id){
 
     <h3>Заказ</h3>
     <table class="preview">
-      <tr><th>Номер заявки</th><td>${escapeHtml(o.orderNumber||'—')}</td></tr>
+      <tr><th>Номер заявки</th><td>${isAdmin()
+        ? `<input type="text" value="${escapeHtml(o.orderNumber||'')}" style="max-width:160px;" onchange="window.setOrderNumber('${o.id}', this.value)">`
+        : escapeHtml(o.orderNumber||'—')}</td></tr>
       <tr><th>Товар (артикул)</th><td>
         <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
           <strong>${escapeHtml(o.article)||'—'}</strong>
@@ -2292,6 +2294,29 @@ window.setOrderInn = function(id, val){
   o.inn = val.trim();
   o.updatedAt = new Date().toISOString();
   markOrdersDirty();
+};
+// Номер заявки можно менять только администратору -- по запросу, чтобы обычные сотрудники не
+// могли случайно (или намеренно) перепутать/задвоить номера, влияющие на сортировку списка и на
+// сопоставление с историей/выгрузками. Поле в карточке рисуется как редактируемое только когда
+// isAdmin() -- см. viewOrderDetails; на сервере/в Диске отдельного контроля прав нет (см. общую
+// заметку в "Пользователи и права доступа" — это интерфейсная защита, не защита данных), но
+// проверка isAdmin() здесь на всякий случай дублируется и на уровне самой функции сохранения.
+window.setOrderNumber = async function(id, val){
+  if(!isAdmin()){ toast('Менять номер заявки может только администратор', 'err'); return; }
+  const o = STATE.orders.find(x=>x.id===id); if(!o) return;
+  const trimmed = val.trim();
+  if(!trimmed){ toast('Номер заявки не может быть пустым', 'err'); window.viewOrderDetails(id); return; }
+  o.orderNumber = trimmed;
+  o.updatedAt = new Date().toISOString();
+  try {
+    await saveState();
+    toast('Номер заявки сохранён', 'ok');
+  } catch(e){
+    markOrdersDirty();
+    toast('Не удалось сохранить сразу, нажмите «Сохранить изменения»: ' + e.message, 'err');
+  }
+  window.viewOrderDetails(id);
+  renderOrdersGrid();
 };
 window.setOrderEmail = async function(id, val){
   const o = STATE.orders.find(x=>x.id===id); if(!o) return;
