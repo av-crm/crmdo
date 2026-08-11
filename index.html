@@ -207,7 +207,7 @@
       </div>
       <div class="btn-row">
         <button class="btn secondary" onclick="refillMissingCC()">Подтянуть СС и логистику по датам закупки</button>
-        <button class="btn secondary" onclick="removeDuplicateOrders()">Удалить дубли (по номеру заявки)</button>
+        <button class="btn secondary" onclick="removeDuplicateOrders()">Удалить дубли (номер + артикул + дата)</button>
         <button class="btn secondary" onclick="exportOrders('csv')">Экспорт CSV</button>
         <button class="btn secondary" onclick="exportOrders('json')">Экспорт JSON</button>
         <button class="btn secondary" onclick="window.print()">Печать / PDF</button>
@@ -475,7 +475,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.11';
+const APP_VERSION = '2026-08-08.12';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -2650,12 +2650,18 @@ async function importOrdersRows(rows){
     if(fresh) STATE.orders = fresh.orders || STATE.orders;
   } catch(e){ console.error('Не удалось обновить состояние перед импортом:', e); }
   const statusId = document.getElementById('import_status').value || (STATE.statuses[0] && STATE.statuses[0].id) || 'new';
-  const existingIds = new Set(STATE.orders.map(o=>o.bitrixId).filter(Boolean));
+  // НАЙДЕННЫЙ БАГ (дубли при импорте): раньше сверяли только bitrixId. Заявки, добавленные вручную
+  // через форму (bitrixId пуст) или те, кому номер заявки поправил админ (см. setOrderNumber выше),
+  // из-за этого не находились как уже существующие -- один и тот же номер заявки оказывался в
+  // списке дважды. Сверяем теперь по НОМЕРУ заявки (Номер заявки), как и просили: "если заявка с
+  // номером уже существует -- пропускаем эту строку". String(...) на случай если где-то номер
+  // хранится как число, а где-то как строка -- иначе Set не считает их совпадающими.
+  const existingNumbers = new Set(STATE.orders.map(o=>o.orderNumber).filter(Boolean).map(String));
   let added = 0, skipped = 0;
   const now = new Date().toISOString();
   const newOrders = [];
   rows.forEach(r=>{
-    if(existingIds.has(r.bitrixId)){ skipped++; return; }
+    if(r.orderNumber && existingNumbers.has(String(r.orderNumber))){ skipped++; return; }
     const order = {
       id: uuid(), bitrixId: r.bitrixId, orderNumber: r.orderNumber,
       orderDate: r.orderDate || todayStr(), contragent: r.contragent, inn: r.inn,
@@ -2666,7 +2672,7 @@ async function importOrdersRows(rows){
     };
     STATE.orders.unshift(order);
     newOrders.push(order);
-    existingIds.add(r.bitrixId);
+    if(r.orderNumber) existingNumbers.add(String(r.orderNumber));
     added++;
   });
   if(newOrders.length){
@@ -2680,39 +2686,47 @@ async function importOrdersRows(rows){
   try { await saveState(); } catch(e){ toast('Заявки импортированы локально, но не сохранились на Диск: ' + e.message, 'err'); }
 }
 
-// A duplicate is only ever safe to auto-delete if nobody has started working it yet: brand new
-// ("Новая") or explicitly flagged as a duplicate ("Дубль"). Anything further along (в обработке,
-// отгружена, оплачена, ...) may have real work/decisions behind it, so it's left alone even if
-// another order shares the same Bitrix number — matched by id ('new') as well as by label, since
-// "Дубль" is a status the person creates themselves and has no fixed id.
+// A duplicate is only ever safe to auto-delete if its status is literally "Новая" -- nothing else,
+// even a manually-set "Дубль" status, is touched by removeDuplicateOrders(). Anything already
+// moved along (в обработке, отгружена, оплачена, ...) or even just renamed away from "Новая" may
+// have real work/decisions behind it, so it's left alone no matter how many other rows share the
+// same number+артикул+дата.
 function isRemovableDuplicateStatus(o){
   const label = (statusOf(o.statusId).label || '').trim().toLowerCase();
-  return o.statusId === 'new' || label === 'новая' || label === 'дубль';
+  return o.statusId === 'new' || label === 'новая';
 }
-// One-time cleanup for duplicate imports (see importOrdersRows' stale-state fix above for the
-// root cause). Groups orders by bitrixId (their Bitrix order number) — orders added manually
-// through the form have no bitrixId and are never touched here, since there's no reliable key
-// to match them by. Within a group, only orders in a "Новая"/"Дубль" status are ever candidates
-// for removal; if the group has at least one order in a further-along status, that one (those)
-// stay untouched and all the new/дубль copies are removed as clutter. If every order in the
-// group is new/дубль, the most recently created/updated one is kept and the rest removed.
+// НАЙДЕННЫЙ БАГ: раньше дубли группировались по bitrixId, а сама кнопка молчала, если у "дублей"
+// bitrixId различался (например один добавлен вручную, у другого его нет вовсе) -- находить
+// совпадения не получалось, хотя по смыслу это одна и та же заявка. Дублем теперь считается
+// совпадение НОМЕРА заявки + АРТИКУЛА + ДАТЫ заявки одновременно -- как и попросили. Внутри такой
+// группы удаляются только строки со статусом "Новая"; если статус не "Новая" -- эта строка не
+// трогается никогда.
+function duplicateGroupKey(o){
+  const number = (o.orderNumber ?? '').toString().trim();
+  const article = (o.article || '').trim().toLowerCase();
+  const date = (o.orderDate || '').trim();
+  if(!number) return null; // нет номера -- не с чем сравнивать, в группировку не идёт
+  return number + '||' + article + '||' + date;
+}
 async function removeDuplicateOrders(){
-  const groups = new Map(); // bitrixId -> orders[]
+  const groups = new Map(); // "номер||артикул||дата" -> orders[]
   STATE.orders.forEach(o=>{
-    if(!o.bitrixId) return;
-    if(!groups.has(o.bitrixId)) groups.set(o.bitrixId, []);
-    groups.get(o.bitrixId).push(o);
+    const key = duplicateGroupKey(o);
+    if(!key) return;
+    if(!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(o);
   });
   const toRemove = new Set();
   groups.forEach(group=>{
     if(group.length < 2) return;
     const removable = group.filter(isRemovableDuplicateStatus);
-    const protectedOrders = group.filter(o=>!isRemovableDuplicateStatus(o));
-    if(protectedOrders.length){
-      // at least one order has real progress on it -- drop all the new/дубль copies, keep the rest
+    if(removable.length < group.length){
+      // в группе есть хотя бы одна заявка НЕ в статусе "Новая" -- она (и любые такие же) остаётся
+      // как есть, а все копии в статусе "Новая" удаляются как явный дубль-мусор.
       removable.forEach(o=>toRemove.add(o.id));
     } else if(removable.length > 1){
-      // whole group is new/дубль -- keep just the most recently touched one
+      // вся группа в статусе "Новая" -- нечего "защищать" по статусу, оставляем только самую
+      // недавно созданную/изменённую, остальные удаляем.
       let kept = removable[0];
       removable.slice(1).forEach(o=>{
         const keptTime = kept.updatedAt || kept.createdAt || '';
@@ -2722,8 +2736,8 @@ async function removeDuplicateOrders(){
       });
     }
   });
-  if(!toRemove.size){ toast('Дублей в статусе «Новая»/«Дубль» не найдено', 'ok'); return; }
-  if(!confirm(`Найдено дублей для удаления: ${toRemove.size} (только в статусе «Новая»/«Дубль», заявки в работе не тронуты). Удалить?`)) return;
+  if(!toRemove.size){ toast('Дублей в статусе «Новая» не найдено', 'ok'); return; }
+  if(!confirm(`Найдено дублей для удаления: ${toRemove.size} (только в статусе «Новая» — совпадают номер, артикул и дата; заявки в других статусах не тронуты). Удалить?`)) return;
   STATE.orders = STATE.orders.filter(o=>!toRemove.has(o.id));
   renderOrdersGrid(); renderOrderStats();
   try { await saveState(); toast(`Удалено дублей: ${toRemove.size}`, 'ok'); }
