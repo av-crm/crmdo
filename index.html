@@ -475,7 +475,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.12';
+const APP_VERSION = '2026-08-08.13';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -1162,11 +1162,22 @@ async function loadLatestState(){
 // Правило слияния (по id): запись есть только на Диске (кто-то добавил не в этой вкладке) —
 // сохраняем; запись есть только у нас локально — тоже сохраняем; есть в обеих версиях — побеждает
 // та, у которой позже updatedAt/createdAt.
-function mergeById(localArr, remoteArr){
+// НАЙДЕННЫЙ БАГ (кнопка «Удалить дубли» находит дубли, но они возвращаются обратно): mergeById
+// строит итог, беря за основу ВСЁ, что есть в свежей копии с Диска, и просто добавляет к этому
+// локальные записи -- он в принципе не умеет "удалять", только добавлять/обновлять. Значит если
+// заявка удалена только локально (STATE.orders = STATE.orders.filter(...)) и тут же вызывается
+// saveState(), он подтягивает с Диска ЕЩЁ старую копию (где эта заявка была) и мёрдж молча
+// возвращает её обратно -- удаление визуально "не срабатывает". deletedIds -- явный список id,
+// которые только что удалили нарочно: такие id выбрасываются из свежей копии с Диска ДО мёрджа,
+// поэтому они не воскресают, даже если сама запись физически ещё лежит в orders_current.json на
+// момент вызова (она будет перезаписана этим же saveState чуть ниже).
+function mergeById(localArr, remoteArr, deletedIds){
   const byId = new Map();
   (remoteArr||[]).forEach(r=>{ if(r && r.id) byId.set(r.id, r); });
+  if(deletedIds && deletedIds.size){ deletedIds.forEach(id=>byId.delete(id)); }
   (localArr||[]).forEach(l=>{
     if(!l || !l.id) return;
+    if(deletedIds && deletedIds.has(l.id)) return; // не воскрешать, даже если случайно осталась в localArr
     const existing = byId.get(l.id);
     if(!existing){ byId.set(l.id, l); return; }
     const lTime = l.updatedAt || l.createdAt || '';
@@ -1175,7 +1186,12 @@ function mergeById(localArr, remoteArr){
   });
   return Array.from(byId.values());
 }
-async function saveState(){
+// deleted -- необязательный { orders: [ids...], sellerPayments: [ids...] } со списком id, которые
+// эта же операция только что нарочно удалила локально -- см. комментарий у mergeById выше про то,
+// почему без этого удаление молча откатывается при следующем сохранении.
+async function saveState(deleted){
+  const deletedOrderIds = (deleted && deleted.orders && deleted.orders.length) ? new Set(deleted.orders) : null;
+  const deletedPaymentIds = (deleted && deleted.sellerPayments && deleted.sellerPayments.length) ? new Set(deleted.sellerPayments) : null;
   await ensureDataFolders();
   // Подтягиваем самую свежую версию с Диска прямо перед записью и мёрджим -- сужает окно гонки
   // почти до нуля (см. mergeById выше). Читаем через "текущий" файл (loadSection), а не старым
@@ -1187,8 +1203,8 @@ async function saveState(){
       loadSection('debt_current.json', FOLDERS.debt, 'debt_', 'debt'),
       loadSection('settings_current.json', FOLDERS.config, 'settings_', 'settings'),
     ]);
-    STATE.orders = mergeById(STATE.orders, (freshOrdersData && freshOrdersData.orders) || []);
-    STATE.sellerPayments = mergeById(STATE.sellerPayments, (freshDebtData && freshDebtData.sellerPayments) || []);
+    STATE.orders = mergeById(STATE.orders, (freshOrdersData && freshOrdersData.orders) || [], deletedOrderIds);
+    STATE.sellerPayments = mergeById(STATE.sellerPayments, (freshDebtData && freshDebtData.sellerPayments) || [], deletedPaymentIds);
     // НАЙДЕННЫЙ БАГ (заявка 902): статусы/пользователи раньше НЕ мёрджились, в отличие от заявок и
     // долга продавца выше -- settings_current.json просто затирался тем, что было в памяти ЭТОЙ
     // вкладки. Если один аккаунт добавлял новый статус (Настройки → Статусы) и сохранял, а другой
@@ -2105,7 +2121,7 @@ window.deleteOrder = async function(id){
   if(!confirm('Удалить заявку из текущего списка? (в истории на Диске она останется)')) return;
   STATE.orders = STATE.orders.filter(o=>o.id!==id);
   renderOrderStats(); renderOrdersGrid();
-  try { await saveState(); toast('Заявка удалена', 'ok'); } catch(e){ toast('Ошибка сохранения: '+e.message, 'err'); }
+  try { await saveState({ orders: [id] }); toast('Заявка удалена', 'ok'); } catch(e){ toast('Ошибка сохранения: '+e.message, 'err'); }
 };
 // Same каталог контрагентов (CALC_IP_LIST) as the "Наименование контрагента" dropdown in "Новая
 // заявка" -- rebuilt fresh each time the modal opens rather than kept in sync live like the static
@@ -2740,7 +2756,7 @@ async function removeDuplicateOrders(){
   if(!confirm(`Найдено дублей для удаления: ${toRemove.size} (только в статусе «Новая» — совпадают номер, артикул и дата; заявки в других статусах не тронуты). Удалить?`)) return;
   STATE.orders = STATE.orders.filter(o=>!toRemove.has(o.id));
   renderOrdersGrid(); renderOrderStats();
-  try { await saveState(); toast(`Удалено дублей: ${toRemove.size}`, 'ok'); }
+  try { await saveState({ orders: Array.from(toRemove) }); toast(`Удалено дублей: ${toRemove.size}`, 'ok'); }
   catch(e){ toast('Дубли удалены локально, но не сохранились на Диск: ' + e.message, 'err'); }
 }
 window.removeDuplicateOrders = removeDuplicateOrders;
@@ -2990,7 +3006,7 @@ window.deleteSellerPayment = async function(id){
   if(!confirm('Удалить эту оплату из истории?')) return;
   STATE.sellerPayments = STATE.sellerPayments.filter(p=>p.id!==id);
   renderDebtGrid(); renderDebtPaymentsGrid();
-  try { await saveState(); toast('Оплата удалена', 'ok'); } catch(e){ toast('Ошибка сохранения: '+e.message, 'err'); }
+  try { await saveState({ sellerPayments: [id] }); toast('Оплата удалена', 'ok'); } catch(e){ toast('Ошибка сохранения: '+e.message, 'err'); }
 };
 function renderDebtPaymentsGrid(){
   const el = document.getElementById('debtPaymentsGrid');
