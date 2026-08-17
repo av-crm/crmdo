@@ -475,7 +475,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.14';
+const APP_VERSION = '2026-08-08.15';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -574,6 +574,10 @@ let ORDERS_GRID = null, PRICE_GRID = null, REPORT_GRID = null, DEBT_GRID = null,
 let ordersPage = 0; // 0-indexed
 const ORDERS_PAGE_SIZE = 12;
 let STATS_WEEK_KEY = null; // "isoYear-isoWeek" of the week selected in the dashboard; null = current week
+// Отдельный произвольный период (например, целый месяц) рядом с недельным срезом -- { start, end }
+// в формате YYYY-MM-DD, либо null пока ничего не выбрано. Независим от STATS_WEEK_KEY, оба блока
+// показываются одновременно.
+let STATS_CUSTOM_RANGE = null;
 let accessToken = null, tokenClient = null;
 
 /* ================= UTIL ================= */
@@ -1656,6 +1660,31 @@ window.onStatsWeekChange = function(val){
   STATS_WEEK_KEY = val;
   renderOrderStats();
 };
+// Первый/последний день месяца со смещением от текущего (0 = этот месяц, -1 = прошлый и т.д.) --
+// локальная дата, как и todayStr(), чтобы "этот месяц" совпадал с тем, что человек видит на часах.
+function monthRange(offsetMonths){
+  const d = new Date();
+  d.setDate(1);
+  d.setMonth(d.getMonth() + offsetMonths);
+  const y = d.getFullYear(), m = d.getMonth();
+  const start = y + '-' + String(m+1).padStart(2,'0') + '-01';
+  const lastDay = new Date(y, m+1, 0).getDate();
+  const end = y + '-' + String(m+1).padStart(2,'0') + '-' + String(lastDay).padStart(2,'0');
+  return { start, end };
+}
+window.onStatsCustomDateChange = function(field, val){
+  if(!STATS_CUSTOM_RANGE) STATS_CUSTOM_RANGE = { start:null, end:null };
+  STATS_CUSTOM_RANGE[field] = val || null;
+  renderOrderStats();
+};
+window.setStatsCustomPreset = function(offsetMonths){
+  STATS_CUSTOM_RANGE = monthRange(offsetMonths);
+  renderOrderStats();
+};
+window.clearStatsCustomRange = function(){
+  STATS_CUSTOM_RANGE = null;
+  renderOrderStats();
+};
 // Growth/decline vs. the previous week: green ▲ + % if up, red ▼ + % if down, "новое" if the
 // previous week had zero and this one doesn't, nothing if both weeks are zero.
 function trendHtml(current, previous){
@@ -1735,6 +1764,32 @@ function renderOrderStats(){
     <div class="stat"><div class="n">${cur.paidCount}${trendHtml(cur.paidCount, prev.paidCount)}</div><div class="l">Оплачено за неделю</div></div>
     <div class="stat"><div class="n">${fmtMoneyInt(cur.paidSum)} ₽${trendHtml(cur.paidSum, prev.paidSum)}</div><div class="l">Сумма оплаченных за неделю</div></div>
     <div class="stat"><div class="n">${fmtMoneyInt(cur.placementSum)} ₽</div><div class="l">Стоимость размещения (оплачено + завершено)</div></div>`;
+
+  // Отдельный произвольный период (например, месяц целиком) -- независим от недельного среза выше,
+  // выбирается через обычные <input type="date"> (открывают нативный календарь браузера) плюс
+  // быстрые кнопки "Этот/Прошлый месяц". Ничего не показывается, пока не выбраны обе даты.
+  const range = STATS_CUSTOM_RANGE;
+  const rangeValid = !!(range && range.start && range.end && range.start <= range.end);
+  cards += `
+    <div class="stat" style="grid-column:1/-1;background:transparent;border:none;padding:10px 2px 0;display:flex;align-items:center;gap:10px;flex-wrap:wrap;border-top:1px solid var(--border);margin-top:6px;">
+      <span style="font-size:12px;font-weight:700;color:var(--text);">Период:</span>
+      <input type="date" id="statsCustomFrom" value="${range && range.start ? range.start : ''}" onchange="window.onStatsCustomDateChange('start', this.value)" style="width:auto;padding:5px 8px;font-size:12px;">
+      <span style="font-size:12px;color:var(--muted);">—</span>
+      <input type="date" id="statsCustomTo" value="${range && range.end ? range.end : ''}" onchange="window.onStatsCustomDateChange('end', this.value)" style="width:auto;padding:5px 8px;font-size:12px;">
+      <button class="btn secondary" style="padding:4px 10px;font-size:11px;" onclick="window.setStatsCustomPreset(0)">Этот месяц</button>
+      <button class="btn secondary" style="padding:4px 10px;font-size:11px;" onclick="window.setStatsCustomPreset(-1)">Прошлый месяц</button>
+      ${range ? `<button class="btn secondary" style="padding:4px 10px;font-size:11px;" onclick="window.clearStatsCustomRange()">Сбросить</button>` : ''}
+      ${range && !rangeValid ? `<span style="font-size:12px;color:var(--danger);">Укажите обе даты (начало не позже конца)</span>` : ''}
+    </div>`;
+  if(rangeValid){
+    const custom = weekMetrics(range.start, range.end);
+    cards += `
+      <div class="stat"><div class="n">${custom.count}</div><div class="l">Заявок за период</div></div>
+      <div class="stat"><div class="n">${fmtMoneyInt(custom.sum)} ₽</div><div class="l">Сумма за период</div></div>
+      <div class="stat"><div class="n">${custom.paidCount}</div><div class="l">Оплачено за период</div></div>
+      <div class="stat"><div class="n">${fmtMoneyInt(custom.paidSum)} ₽</div><div class="l">Сумма оплаченных за период</div></div>
+      <div class="stat"><div class="n">${fmtMoneyInt(custom.placementSum)} ₽</div><div class="l">Стоимость размещения за период</div></div>`;
+  }
   el.innerHTML = cards;
 }
 
