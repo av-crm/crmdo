@@ -475,7 +475,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.13';
+const APP_VERSION = '2026-08-08.14';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -2192,7 +2192,7 @@ window.viewOrderDetails = function(id){
     <h3 style="margin-top:16px;">Контакты клиента</h3>
     <table class="preview">
       <tr><th>Имя</th><td>${escapeHtml(o.clientName)||'—'}</td></tr>
-      <tr><th>Телефон</th><td>${escapeHtml(o.phone)||'—'}</td></tr>
+      <tr><th>Телефон</th><td><input type="tel" value="${escapeHtml(o.phone)}" placeholder="+7 900 000-00-00" onchange="window.setOrderPhone('${o.id}', this.value)"></td></tr>
       <tr><th>Email</th><td><input type="email" value="${escapeHtml(o.email)}" placeholder="client@example.com" onchange="window.setOrderEmail('${o.id}', this.value)"></td></tr>
     </table>
 
@@ -2333,6 +2333,18 @@ window.setOrderNumber = async function(id, val){
   }
   window.viewOrderDetails(id);
   renderOrdersGrid();
+};
+window.setOrderPhone = async function(id, val){
+  const o = STATE.orders.find(x=>x.id===id); if(!o) return;
+  o.phone = val.trim();
+  o.updatedAt = new Date().toISOString();
+  try {
+    await saveState();
+    toast('Телефон сохранён', 'ok');
+  } catch(e){
+    markOrdersDirty();
+    toast('Не удалось сохранить сразу, нажмите «Сохранить изменения»: ' + e.message, 'err');
+  }
 };
 window.setOrderEmail = async function(id, val){
   const o = STATE.orders.find(x=>x.id===id); if(!o) return;
