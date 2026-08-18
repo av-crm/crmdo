@@ -247,8 +247,19 @@
       </div>
       <p class="hint" id="priceCheckResult"></p>
 
+      <h3 style="margin-top:16px;">Прайсовые лестницы (пороги наценки)</h3>
+      <p class="hint">Именованный набор порогов по цене закупки — своя Логистика и Размещение для каждого диапазона (например, до 30 000 ₽ — одни значения, от 30 100 до 50 000 ₽ — другие, и так далее). Выше самого верхнего порога применяется последний диапазон. Заданные здесь лестницы можно будет выбрать на Шаге 3 при расчёте наценки для загруженного прайса.</p>
+      <div id="priceLaddersList"></div>
+      <div class="btn-row">
+        <button class="btn secondary" type="button" onclick="window.openLadderEditor(null)">+ Новая лестница</button>
+      </div>
+
       <div id="calc_panel" style="display:none;">
         <h3 style="margin-top:16px;">Шаг 3. Наценка</h3>
+        <div class="grid-3">
+          <div class="field"><label>Прайсовая лестница</label><select id="calc_ladderSelect" onchange="window.onCalcLadderChange(this.value)"><option value="">Не использовать — значения по умолчанию ниже</option></select></div>
+        </div>
+        <p class="hint" id="calc_ladderHint"></p>
         <div class="grid-3">
           <div class="field"><label>Дата цены закупки</label><select id="calc_costCol"></select></div>
           <div class="field"><label>Округление цены продажи</label>
@@ -475,7 +486,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.15';
+const APP_VERSION = '2026-08-08.16';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -564,7 +575,13 @@ let currentUserEmail = null;
 // this to include Оплачена + Выставлен счёт + Сделка завершена, not just the single "paid" status
 // -- same reasoning as above, configured via checkboxes rather than hardcoded ids. Defaults to just
 // ['paid'] until set, matching the behaviour before this setting existed.
-let STATE = { statuses: JSON.parse(JSON.stringify(DEFAULT_STATUSES)), orders: [], sellerPayments: [], users: [], statusRules: { restrictedStatusId: null, allowedNextIds: [] }, dealDoneStatusId: null, paidStatusIds: ['paid'] };
+let STATE = { statuses: JSON.parse(JSON.stringify(DEFAULT_STATUSES)), orders: [], sellerPayments: [], users: [], statusRules: { restrictedStatusId: null, allowedNextIds: [] }, dealDoneStatusId: null, paidStatusIds: ['paid'], priceLadders: [] };
+// priceLadders: именованные "прайсовые лестницы" -- наборы порогов по цене закупки, каждый со своей
+// Логистикой и Размещением. Формат одной лестницы:
+// { id, name, tiers: [{ upTo, logistics:{value,unit}, placement:{value,unit} }, ...], createdAt, updatedAt }
+// tiers отсортированы по upTo по возрастанию; для товара берётся первый порог, где cost<=upTo, а если
+// цена закупки выше самого верхнего порога -- используется последний (самый старший) порог, т.е.
+// "и так далее" не требует отдельного "без верхней границы" -- см. findLadderTier ниже.
 let ORDERS_GRID = null, PRICE_GRID = null, REPORT_GRID = null, DEBT_GRID = null, DEBT_PAYMENTS_GRID = null;
 // Grid.js's own pagination turned out to lose track of the current page across data updates in
 // practice (see renderGridInto's comment) even after two attempts to make it behave. Orders is the
@@ -1151,6 +1168,7 @@ async function loadLatestState(){
       statusRules: (settingsData && settingsData.statusRules) || null,
       dealDoneStatusId: (settingsData && settingsData.dealDoneStatusId) || null,
       paidStatusIds: (settingsData && settingsData.paidStatusIds) || null,
+      priceLadders: (settingsData && settingsData.priceLadders) || null,
     };
   }
   // Nothing in the new locations at all -- either a brand-new Drive folder, or data that was only
@@ -1196,6 +1214,7 @@ function mergeById(localArr, remoteArr, deletedIds){
 async function saveState(deleted){
   const deletedOrderIds = (deleted && deleted.orders && deleted.orders.length) ? new Set(deleted.orders) : null;
   const deletedPaymentIds = (deleted && deleted.sellerPayments && deleted.sellerPayments.length) ? new Set(deleted.sellerPayments) : null;
+  const deletedLadderIds = (deleted && deleted.priceLadders && deleted.priceLadders.length) ? new Set(deleted.priceLadders) : null;
   await ensureDataFolders();
   // Подтягиваем самую свежую версию с Диска прямо перед записью и мёрджим -- сужает окно гонки
   // почти до нуля (см. mergeById выше). Читаем через "текущий" файл (loadSection), а не старым
@@ -1220,6 +1239,7 @@ async function saveState(deleted){
     // статус-справочник. Чиним тем же способом, что и для заявок/долга: мёрдж по id.
     STATE.statuses = mergeById(STATE.statuses, (freshSettingsData && freshSettingsData.statuses) || []);
     STATE.users = mergeById(STATE.users, (freshSettingsData && freshSettingsData.users) || []);
+    STATE.priceLadders = mergeById(STATE.priceLadders, (freshSettingsData && freshSettingsData.priceLadders) || [], deletedLadderIds);
   } catch(e){
     console.error('Не удалось подтянуть свежую версию перед сохранением, сохраняю как есть локально:', e);
   }
@@ -1227,7 +1247,7 @@ async function saveState(deleted){
   const ts = STATE.savedAt.replace(/[:.]/g,'-');
   const ordersPayload = { orders: STATE.orders, savedAt: STATE.savedAt };
   const debtPayload = { sellerPayments: STATE.sellerPayments, savedAt: STATE.savedAt };
-  const settingsPayload = { statuses: STATE.statuses, users: STATE.users, statusRules: STATE.statusRules, dealDoneStatusId: STATE.dealDoneStatusId, paidStatusIds: STATE.paidStatusIds, savedAt: STATE.savedAt };
+  const settingsPayload = { statuses: STATE.statuses, users: STATE.users, statusRules: STATE.statusRules, dealDoneStatusId: STATE.dealDoneStatusId, paidStatusIds: STATE.paidStatusIds, priceLadders: STATE.priceLadders, savedAt: STATE.savedAt };
   await Promise.all([
     // История версий -- как и раньше, ничего не удаляется и не перезаписывается.
     driveCreateJSON(`orders_${ts}.json`, FOLDERS.orders, ordersPayload),
@@ -1256,8 +1276,9 @@ async function refreshAll(){
       STATE.statusRules = loaded.statusRules || { restrictedStatusId: null, allowedNextIds: [] };
       STATE.dealDoneStatusId = loaded.dealDoneStatusId || null;
       STATE.paidStatusIds = (loaded.paidStatusIds && loaded.paidStatusIds.length) ? loaded.paidStatusIds : ['paid'];
+      STATE.priceLadders = loaded.priceLadders || [];
     } else {
-      STATE = { statuses: JSON.parse(JSON.stringify(DEFAULT_STATUSES)), orders: [], sellerPayments: [], users: [], statusRules: { restrictedStatusId: null, allowedNextIds: [] }, dealDoneStatusId: null, paidStatusIds: ['paid'] };
+      STATE = { statuses: JSON.parse(JSON.stringify(DEFAULT_STATUSES)), orders: [], sellerPayments: [], users: [], statusRules: { restrictedStatusId: null, allowedNextIds: [] }, dealDoneStatusId: null, paidStatusIds: ['paid'], priceLadders: [] };
     }
     // Back-compat one-time guess: if it's never been configured but a status literally called
     // 'done' still exists (i.e. AV never renamed/removed it), assume that's still "завершена" so
@@ -1301,6 +1322,8 @@ async function refreshAll(){
     renderUsersList();
     renderStatusRulesForm();
     renderReportStatusFilter();
+    renderPriceLadders();
+    renderCalcLadderSelect();
     await loadPriceHistory();
     await loadIpList();
     // Re-apply tab visibility here too (not just from enterApp()'s initial call) -- otherwise
@@ -3236,6 +3259,207 @@ let CALC_IP_LIST = JSON.parse(JSON.stringify(DEFAULT_IP_LIST));
 let CALC_ITEMS = [];
 let CALC_PRICE_COLS = [];
 let CALC_GRID = null;
+// id выбранной на Шаге 3 прайсовой лестницы, либо null -- "вручную" (значения по умолчанию из
+// calc_logisticsVal/calc_placementVal, как было раньше). Специально НЕ сохраняется в STATE/на
+// Диск -- это выбор конкретного расчёта здесь и сейчас, а не постоянная настройка.
+let CALC_LADDER_ID = null;
+let LADDER_EDITOR_TIERS = null; // рабочий черновик тиров, пока открыт редактор лестницы
+
+function newLadderTier(){ return { upTo: null, logistics:{value:5,unit:'pct'}, placement:{value:10,unit:'pct'} }; }
+// Для цены закупки cost берётся первый порог (по возрастанию upTo), под который она попадает; если
+// cost выше самого верхнего порога -- используется последний (самый старший) порог лестницы, т.е.
+// "и так далее" продолжается тем же значением, а не обнуляется.
+function findLadderTier(ladder, cost){
+  if(!ladder || !ladder.tiers || !ladder.tiers.length || cost==null) return null;
+  const sorted = ladder.tiers.slice().sort((a,b)=>a.upTo-b.upTo);
+  for(const t of sorted){ if(cost <= t.upTo) return t; }
+  return sorted[sorted.length-1];
+}
+function renderCalcLadderSelect(){
+  const sel = document.getElementById('calc_ladderSelect');
+  if(!sel) return;
+  const prevVal = CALC_LADDER_ID || '';
+  const options = (STATE.priceLadders||[]).map(l=>`<option value="${l.id}">${escapeHtml(l.name)}</option>`).join('');
+  sel.innerHTML = `<option value="">Не использовать — значения по умолчанию ниже</option>${options}`;
+  // Лестница могла быть удалена из другой вкладки -- не оставляем выбранным несуществующий id.
+  if(prevVal && (STATE.priceLadders||[]).some(l=>l.id===prevVal)) sel.value = prevVal;
+  else CALC_LADDER_ID = null;
+  updateCalcLadderHint();
+}
+function updateCalcLadderHint(){
+  const hint = document.getElementById('calc_ladderHint');
+  const logField = document.getElementById('calc_logisticsVal'), plField = document.getElementById('calc_placementVal');
+  const logUnitSel = document.getElementById('calc_logisticsUnit'), plUnitSel = document.getElementById('calc_placementUnit');
+  if(!hint) return;
+  const ladder = CALC_LADDER_ID ? (STATE.priceLadders||[]).find(l=>l.id===CALC_LADDER_ID) : null;
+  const disable = !!ladder;
+  [logField, plField, logUnitSel, plUnitSel].forEach(el=>{ if(el) el.disabled = disable; });
+  if(!ladder){ hint.textContent = ''; return; }
+  const rows = ladder.tiers.slice().sort((a,b)=>a.upTo-b.upTo).map(t=>{
+    const logStr = t.logistics.unit==='pct' ? `${t.logistics.value}%` : `${fmtMoney(t.logistics.value)} ₽/шт`;
+    const plStr = t.placement.unit==='pct' ? `${t.placement.value}%` : `${fmtMoney(t.placement.value)} ₽/шт`;
+    return `до ${fmtMoney(t.upTo)} ₽: логистика ${logStr}, размещение ${plStr}`;
+  }).join(' · ');
+  hint.textContent = `Лестница «${ladder.name}» активна (поля по умолчанию ниже недоступны, кроме потоварных переопределений в таблице): ${rows}`;
+}
+window.onCalcLadderChange = function(val){
+  CALC_LADDER_ID = val || null;
+  updateCalcLadderHint();
+  renderCalcGrid();
+};
+
+/* ---- Управление прайсовыми лестницами (список + модалка-редактор) ---- */
+function ladderTierSummary(ladder){
+  return ladder.tiers.slice().sort((a,b)=>a.upTo-b.upTo).map(t=>{
+    const logStr = t.logistics.unit==='pct' ? `${t.logistics.value}%` : `${fmtMoney(t.logistics.value)}₽`;
+    const plStr = t.placement.unit==='pct' ? `${t.placement.value}%` : `${fmtMoney(t.placement.value)}₽`;
+    return `до ${fmtMoney(t.upTo)}₽ (лог. ${logStr} / разм. ${plStr})`;
+  }).join(', ');
+}
+function renderPriceLadders(){
+  const el = document.getElementById('priceLaddersList');
+  if(!el) return;
+  const ladders = STATE.priceLadders || [];
+  if(!ladders.length){
+    el.innerHTML = '<p class="hint">Пока нет сохранённых лестниц — создайте первую кнопкой ниже.</p>';
+    return;
+  }
+  el.innerHTML = ladders.map(l=>`
+    <div class="card" style="padding:10px 14px; margin-bottom:8px; background:var(--bg-soft, #f8f9fb);">
+      <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
+        <div>
+          <strong>${escapeHtml(l.name)}</strong>
+          <div class="hint" style="margin-top:2px;">${escapeHtml(ladderTierSummary(l))}</div>
+        </div>
+        <div class="btn-row" style="margin:0;">
+          <button class="btn secondary" type="button" style="padding:4px 10px;font-size:12px;" onclick="window.openLadderEditor('${l.id}')">Изменить</button>
+          <button class="btn secondary" type="button" style="padding:4px 10px;font-size:12px;" onclick="window.deleteLadder('${l.id}')">Удалить</button>
+        </div>
+      </div>
+    </div>`).join('');
+}
+function newLadderTierRowHtml(t, i, total){
+  return `
+    <div class="grid-3" style="align-items:flex-end; margin-bottom:8px; padding-bottom:8px; border-bottom:1px solid var(--border);">
+      <div class="field"><label>Порог до, ₽ ${i===total-1?'<span class="hint">(и выше этого значения)</span>':''}</label><input type="number" min="0" step="100" value="${t.upTo??''}" placeholder="30000" onchange="window.updateLadderEditorTierField(${i},'upTo', this.value)"></div>
+      <div class="field" style="display:flex; gap:6px; align-items:flex-end;">
+        <div style="flex:1;"><label>Логистика</label><input type="number" step="1" value="${t.logistics.value}" onchange="window.updateLadderEditorTierField(${i},'logisticsValue', this.value)"></div>
+        <div style="width:78px;"><label>Ед.</label>
+          <select onchange="window.updateLadderEditorTierField(${i},'logisticsUnit', this.value)">
+            <option value="pct" ${t.logistics.unit==='pct'?'selected':''}>%</option>
+            <option value="rub" ${t.logistics.unit==='rub'?'selected':''}>₽/шт</option>
+          </select>
+        </div>
+      </div>
+      <div class="field" style="display:flex; gap:6px; align-items:flex-end;">
+        <div style="flex:1;"><label>Размещение</label><input type="number" step="1" value="${t.placement.value}" onchange="window.updateLadderEditorTierField(${i},'placementValue', this.value)"></div>
+        <div style="width:78px;"><label>Ед.</label>
+          <select onchange="window.updateLadderEditorTierField(${i},'placementUnit', this.value)">
+            <option value="pct" ${t.placement.unit==='pct'?'selected':''}>%</option>
+            <option value="rub" ${t.placement.unit==='rub'?'selected':''}>₽/шт</option>
+          </select>
+        </div>
+        <button class="btn secondary" type="button" style="padding:6px 10px;" onclick="window.removeLadderEditorTier(${i})" ${total<=1?'disabled':''} title="Удалить порог">✕</button>
+      </div>
+    </div>`;
+}
+function renderLadderEditorModal(id){
+  const modalBg = document.getElementById('modalBg'), modalBody = document.getElementById('modalBody');
+  const ladder = id ? (STATE.priceLadders||[]).find(l=>l.id===id) : null;
+  const nameVal = ladder ? ladder.name : '';
+  modalBody.innerHTML = `
+    <button class="close" onclick="closeModal()">✕</button>
+    <h2>${ladder ? 'Изменить лестницу' : 'Новая прайсовая лестница'}</h2>
+    <div class="field"><label>Название</label><input type="text" id="ladderEditor_name" value="${escapeHtml(nameVal)}" placeholder="Например: Основная"></div>
+    <h3 style="margin-top:14px;">Пороги по цене закупки</h3>
+    <p class="hint">Каждый порог — верхняя граница цены закупки и своя Логистика/Размещение для товаров в этом диапазоне. Порог применяется, если цена закупки ≤ его значения; для товаров дороже самого верхнего порога используется последняя строка.</p>
+    <div id="ladderEditor_tiers"></div>
+    <div class="btn-row">
+      <button class="btn secondary" type="button" onclick="window.addLadderEditorTier()">+ добавить порог</button>
+    </div>
+    <p class="hint" id="ladderEditor_hint" style="color:var(--danger);"></p>
+    <div class="btn-row">
+      <button class="btn" type="button" onclick="window.saveLadderForm('${id||''}')">Сохранить лестницу</button>
+      <button class="btn secondary" type="button" onclick="closeModal()">Отмена</button>
+    </div>
+  `;
+  LADDER_EDITOR_TIERS = ladder ? JSON.parse(JSON.stringify(ladder.tiers)) : [newLadderTier()];
+  renderLadderEditorTiers();
+  modalBg.classList.add('show');
+}
+function renderLadderEditorTiers(){
+  const el = document.getElementById('ladderEditor_tiers');
+  if(!el) return;
+  el.innerHTML = LADDER_EDITOR_TIERS.map((t,i)=>newLadderTierRowHtml(t, i, LADDER_EDITOR_TIERS.length)).join('');
+}
+window.openLadderEditor = function(id){
+  renderLadderEditorModal(id);
+};
+window.addLadderEditorTier = function(){
+  LADDER_EDITOR_TIERS.push(newLadderTier());
+  renderLadderEditorTiers();
+};
+window.removeLadderEditorTier = function(i){
+  if(LADDER_EDITOR_TIERS.length<=1) return;
+  LADDER_EDITOR_TIERS.splice(i,1);
+  renderLadderEditorTiers();
+};
+window.updateLadderEditorTierField = function(i, field, val){
+  const t = LADDER_EDITOR_TIERS[i]; if(!t) return;
+  if(field==='upTo'){ const v = parseFloat(val); t.upTo = isNaN(v) ? null : v; }
+  else if(field==='logisticsValue'){ const v = parseFloat(val); t.logistics.value = isNaN(v) ? 0 : v; }
+  else if(field==='logisticsUnit'){ t.logistics.unit = val; }
+  else if(field==='placementValue'){ const v = parseFloat(val); t.placement.value = isNaN(v) ? 0 : v; }
+  else if(field==='placementUnit'){ t.placement.unit = val; }
+};
+window.saveLadderForm = async function(id){
+  const hint = document.getElementById('ladderEditor_hint');
+  const name = document.getElementById('ladderEditor_name').value.trim();
+  if(!name){ hint.textContent = 'Укажите название лестницы'; return; }
+  if(!LADDER_EDITOR_TIERS.length){ hint.textContent = 'Нужен хотя бы один порог'; return; }
+  if(LADDER_EDITOR_TIERS.some(t=>t.upTo==null || isNaN(t.upTo) || t.upTo<=0)){
+    hint.textContent = 'У каждого порога должна быть положительная верхняя граница (₽)';
+    return;
+  }
+  hint.textContent = '';
+  const tiers = LADDER_EDITOR_TIERS.map(t=>({
+    upTo: t.upTo,
+    logistics: { value: t.logistics.value, unit: t.logistics.unit },
+    placement: { value: t.placement.value, unit: t.placement.unit },
+  })).sort((a,b)=>a.upTo-b.upTo);
+  const now = new Date().toISOString();
+  if(id){
+    const existing = (STATE.priceLadders||[]).find(l=>l.id===id);
+    if(existing){ existing.name = name; existing.tiers = tiers; existing.updatedAt = now; }
+  } else {
+    STATE.priceLadders = STATE.priceLadders || [];
+    STATE.priceLadders.push({ id: uuid(), name, tiers, createdAt: now, updatedAt: now });
+  }
+  renderPriceLadders();
+  renderCalcLadderSelect();
+  closeModal();
+  try {
+    await saveState();
+    toast('Лестница сохранена', 'ok');
+  } catch(e){
+    toast('Сохранено локально, но не удалось сохранить на Диск: ' + e.message, 'err');
+  }
+};
+window.deleteLadder = async function(id){
+  const ladder = (STATE.priceLadders||[]).find(l=>l.id===id); if(!ladder) return;
+  if(!confirm(`Удалить лестницу «${ladder.name}»?`)) return;
+  STATE.priceLadders = (STATE.priceLadders||[]).filter(l=>l.id!==id);
+  if(CALC_LADDER_ID===id) CALC_LADDER_ID = null;
+  renderPriceLadders();
+  renderCalcLadderSelect();
+  renderCalcGrid();
+  try {
+    await saveState({ priceLadders: [id] });
+    toast('Лестница удалена', 'ok');
+  } catch(e){
+    toast('Удалено локально, но не сохранилось на Диск: ' + e.message, 'err');
+  }
+};
 
 async function loadLatestByPrefix(folderId, prefix){
   // Same fix as loadLatestState(): always a direct, folder-scoped, server-sorted query — no more
@@ -3425,10 +3649,16 @@ function computeCalcRow(item){
   const priceEntry = latestValidCalcPrice(item, costIdx);
   const cost = priceEntry ? priceEntry.value : null;
   const step = Number(document.getElementById('calc_roundMode').value);
-  const logUnit = document.getElementById('calc_logisticsUnit').value;
-  const plUnit = document.getElementById('calc_placementUnit').value;
-  const logVal = item.logisticsOverride!=null ? item.logisticsOverride : parseFloat(document.getElementById('calc_logisticsVal').value || 0);
-  const plVal = item.placementOverride!=null ? item.placementOverride : parseFloat(document.getElementById('calc_placementVal').value || 0);
+  // Если на Шаге 3 выбрана прайсовая лестница -- берём Логистику/Размещение из порога, под который
+  // попадает цена закупки ЭТОГО товара, вместо одного общего значения по умолчанию. Потоварное
+  // переопределение (logisticsOverride/placementOverride) по-прежнему главнее и лестницы, и
+  // значений по умолчанию -- как и раньше, ручная правка конкретной строки не перетирается.
+  const ladder = CALC_LADDER_ID ? (STATE.priceLadders||[]).find(l=>l.id===CALC_LADDER_ID) : null;
+  const tier = ladder ? findLadderTier(ladder, cost) : null;
+  const logUnit = tier ? tier.logistics.unit : document.getElementById('calc_logisticsUnit').value;
+  const plUnit = tier ? tier.placement.unit : document.getElementById('calc_placementUnit').value;
+  const logVal = item.logisticsOverride!=null ? item.logisticsOverride : (tier ? tier.logistics.value : parseFloat(document.getElementById('calc_logisticsVal').value || 0));
+  const plVal = item.placementOverride!=null ? item.placementOverride : (tier ? tier.placement.value : parseFloat(document.getElementById('calc_placementVal').value || 0));
   let sell = null, margin = null, markupPct = null, logAmount = null, plAmount = null;
   if(cost!=null){
     logAmount = +calcComponentAmount(logVal, logUnit, cost).toFixed(2);
@@ -3488,10 +3718,15 @@ function renderCalcGrid(){
     el.innerHTML = '<div class="empty">Нет данных</div>';
     return;
   }
-  const logIsPct = document.getElementById('calc_logisticsUnit').value==='pct';
-  const plIsPct = document.getElementById('calc_placementUnit').value==='pct';
-  const logUnitSuffix = logIsPct ? '%' : '₽';
-  const plUnitSuffix = plIsPct ? '%' : '₽';
+  // При активной лестнице разные пороги могут быть в разных единицах (% у одного, ₽/шт у другого),
+  // так что общий заголовок колонки не может однозначно показать "%" или "₽" -- вместо этого всегда
+  // показываем и raw-значение (то, что реально в пороге/переопределении), и отдельно посчитанную
+  // сумму в ₽, чтобы не гадать.
+  const ladderActive = !!CALC_LADDER_ID;
+  const logIsPct = ladderActive || document.getElementById('calc_logisticsUnit').value==='pct';
+  const plIsPct = ladderActive || document.getElementById('calc_placementUnit').value==='pct';
+  const logUnitSuffix = ladderActive ? 'по лестнице' : (logIsPct ? '%' : '₽');
+  const plUnitSuffix = ladderActive ? 'по лестнице' : (plIsPct ? '%' : '₽');
 
   const columns = [
     { name:'Наименование' },
@@ -3617,8 +3852,12 @@ async function saveCalcSnapshotToDrive(){
       markupPct:c.markupPct, sell:c.sell, margin:c.margin, costDate:c.costDate };
   }).filter(r=>r.cost!=null);
   if(!items.length){ toast('Нет данных для сохранения', 'err'); return; }
+  const activeLadder = CALC_LADDER_ID ? (STATE.priceLadders||[]).find(l=>l.id===CALC_LADDER_ID) : null;
   const snapshot = {
     type:'sell_price_snapshot', ip, costColumnLabel: costLabel,
+    // Если применялась лестница -- фиксируем имя/пороги как они были на момент расчёта (не ссылку
+    // на id лестницы, которую потом можно переименовать/удалить) для истории.
+    ladder: activeLadder ? { name: activeLadder.name, tiers: activeLadder.tiers } : null,
     logisticsDefault: { value: parseFloat(document.getElementById('calc_logisticsVal').value||0), unit: document.getElementById('calc_logisticsUnit').value },
     placementDefault: { value: parseFloat(document.getElementById('calc_placementVal').value||0), unit: document.getElementById('calc_placementUnit').value },
     roundStep: Number(document.getElementById('calc_roundMode').value),
