@@ -344,6 +344,9 @@
       <div class="field" style="margin-top:4px;">
         <label style="display:flex; align-items:center; gap:6px; font-weight:400;"><input type="checkbox" id="s_excludeStats" style="width:auto;"> Не учитывать заявки с этим статусом в статистике и дашбордах</label>
       </div>
+      <div class="field" style="margin-top:4px;">
+        <label style="display:flex; align-items:center; gap:6px; font-weight:400;"><input type="checkbox" id="s_unlockLogistics" style="width:auto;"> Никогда не блокировать СС/Логистику для этого статуса (например, отмена/недозвон) — даже если он стоит в списке ниже «Отгружена»</label>
+      </div>
       <div class="btn-row" style="margin-top:10px;">
         <button class="btn secondary" onclick="if(confirm('Переставить статусы в порядке: Новая / В обработке / Подтверждена / Отгружена / Оплачена / Выставлен счёт / Сделка завершена / Отменена / Отмена. недозвон / Отмена. некорректный номер / Хотел рассрочку / Тест / Дубль?')) applyRequestedStatusOrder()">Применить порядок (по запросу)</button>
         <span class="hint">Сопоставляет по названию — если что-то не найдётся или встанет не туда, поправьте стрелками ↑/↓ выше.</span>
@@ -486,7 +489,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.16';
+const APP_VERSION = '2026-08-08.17';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -1368,8 +1371,9 @@ function renderStatusList(){
         <button class="btn secondary" style="padding:2px 7px;" title="Ниже" ${i===STATE.statuses.length-1?'disabled':''} onclick="window.moveStatus('${s.id}', 1)">↓</button>
       </span>
       <span class="swatch" style="background:${escapeHtml(s.color)}"></span>
-      <span style="flex:1">${escapeHtml(s.label)}${s.excludeStats ? ' <span class="hint" style="font-weight:400;">(не в статистике)</span>' : ''}</span>
+      <span style="flex:1">${escapeHtml(s.label)}${s.excludeStats ? ' <span class="hint" style="font-weight:400;">(не в статистике)</span>' : ''}${s.unlockLogistics ? ' <span class="hint" style="font-weight:400;">(логистика не блокируется)</span>' : ''}</span>
       <label style="display:flex; align-items:center; gap:4px; font-size:11px; font-weight:400; color:var(--muted);"><input type="checkbox" ${s.excludeStats?'checked':''} onchange="window.toggleStatusExcludeStats('${s.id}', this.checked)" style="width:auto;"> не в статистике</label>
+      <label style="display:flex; align-items:center; gap:4px; font-size:11px; font-weight:400; color:var(--muted);"><input type="checkbox" ${s.unlockLogistics?'checked':''} onchange="window.toggleStatusUnlockLogistics('${s.id}', this.checked)" style="width:auto;"> не блокировать логистику</label>
       <button class="btn danger" style="padding:4px 10px;" onclick="deleteStatus('${s.id}')">Удалить</button>
     </div>`).join('');
 }
@@ -1456,11 +1460,13 @@ async function addStatus(){
   const label = document.getElementById('s_label').value.trim();
   const color = document.getElementById('s_color').value.trim() || '#2563eb';
   const excludeStats = document.getElementById('s_excludeStats').checked;
+  const unlockLogistics = document.getElementById('s_unlockLogistics').checked;
   if(!label){ toast('Введите название статуса', 'err'); return; }
   const id = slugify(label) + '-' + Math.random().toString(36).slice(2,6);
-  STATE.statuses.push({ id, label, color, excludeStats });
+  STATE.statuses.push({ id, label, color, excludeStats, unlockLogistics });
   document.getElementById('s_label').value = '';
   document.getElementById('s_excludeStats').checked = false;
+  document.getElementById('s_unlockLogistics').checked = false;
   renderStatusList(); renderStatusSelects(); renderOrdersGrid(); renderOrderStats(); renderStatusRulesForm(); renderReportStatusFilter();
   toast('Сохранение…');
   try { await saveState(); toast('Статус добавлен', 'ok'); } catch(e){ toast('Ошибка сохранения: '+e.message, 'err'); }
@@ -1471,6 +1477,22 @@ window.toggleStatusExcludeStats = async function(id, checked){
   st.excludeStats = checked;
   renderOrderStats();
   try { await saveState(); toast(checked ? 'Статус исключён из статистики' : 'Статус снова учитывается в статистике', 'ok'); }
+  catch(e){ toast('Ошибка сохранения: '+e.message, 'err'); }
+};
+// НАЙДЕННЫЙ БАГ: isLogisticsLocked считала логистику заблокированной для ЛЮБОГО статуса, который
+// в списке (Настройки → Статусы) стоит не раньше "Отгружена" -- включая "Отменена"/"Хотел
+// рассрочку"/"Отмена. недозвон" и т.п., которые по смыслу отгрузки не касаются вообще. Эти статусы
+// оказались ниже "Отгружена" в списке просто потому, что их так попросили расположить (кнопка
+// "Применить порядок"), а не потому что они логически идут после отгрузки. Из-за этого и кнопка
+// "Подтянуть СС и логистику", и сама ручная правка поля отказывали для отменённых заявок. Флаг
+// ниже даёт явно пометить конкретный статус как "никогда не блокирует логистику", независимо от
+// его позиции в списке -- см. isLogisticsLocked.
+window.toggleStatusUnlockLogistics = async function(id, checked){
+  const st = STATE.statuses.find(s=>s.id===id);
+  if(!st) return;
+  st.unlockLogistics = checked;
+  renderOrdersGrid();
+  try { await saveState(); toast(checked ? 'Логистика для этого статуса больше не блокируется' : 'Логистика для этого статуса снова блокируется как обычно', 'ok'); }
   catch(e){ toast('Ошибка сохранения: '+e.message, 'err'); }
 };
 async function deleteStatus(id){
@@ -1842,6 +1864,12 @@ function orderPlacement(o){
 // status; once an order reaches that status (or anything after it in the configured status
 // order) it's locked in. СС has no such lock — it can always be corrected manually.
 function isLogisticsLocked(order){
+  const st = STATE.statuses.find(s=>s.id===order.statusId);
+  // Явный флаг статуса (Настройки → Статусы → "не блокировать логистику") всегда побеждает
+  // позицию в списке -- см. комментарий у toggleStatusUnlockLogistics про то, почему позиция сама
+  // по себе ненадёжна (статусы вроде "Отменена" могут стоять ниже "Отгружена" просто по порядку
+  // отображения, а не по смыслу).
+  if(st && st.unlockLogistics) return false;
   const shipIdx = STATE.statuses.findIndex(s=>s.id==='shipped');
   if(shipIdx===-1) return false;
   const idx = STATE.statuses.findIndex(s=>s.id===order.statusId);
