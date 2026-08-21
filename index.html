@@ -489,7 +489,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.18';
+const APP_VERSION = '2026-08-08.19';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -1310,6 +1310,8 @@ async function refreshAll(){
       if(o.email === undefined) o.email = '';
       if(o.serialNumber === undefined) o.serialNumber = '';
       if(o.placementOverride === undefined) o.placementOverride = null;
+      if(o.contactAt === undefined) o.contactAt = null;
+      if(o.deliveryAt === undefined) o.deliveryAt = null;
     });
     ordersDirty = false;
     { const btn = document.getElementById('ordersSaveBtn'), hint = document.getElementById('ordersSaveHint');
@@ -2146,7 +2148,7 @@ async function addOrder(){
   const order = {
     id: uuid(), bitrixId: null, orderNumber, orderDate: orderDateRaw || todayStr(), contragent, inn, clientName, phone,
     price: price ? Number(price) : null, cc: null, logistics: logistics ? Number(logistics) : null, delivery: null, link, article, address, comment,
-    managerComment: '', email: '', serialNumber: '', placementOverride: null,
+    managerComment: '', email: '', serialNumber: '', placementOverride: null, contactAt: null, deliveryAt: null,
     statusId: statusId || (STATE.statuses[0] && STATE.statuses[0].id) || 'new',
     source: 'manual', createdAt: now, updatedAt: now,
   };
@@ -2338,6 +2340,18 @@ window.viewOrderDetails = function(id){
     <h3 style="margin-top:16px;">Комментарий клиента</h3>
     <p>${escapeHtml(o.comment)||'—'}</p>
 
+    <h3 style="margin-top:16px;">Сроки</h3>
+    <div class="grid-2">
+      <div class="field">
+        <label>Когда связаться с клиентом ${o.statusId==='processing'?'<span class="hint">(статус «В обработке»)</span>':''}</label>
+        <input type="datetime-local" value="${o.contactAt?o.contactAt.slice(0,16):''}" onchange="window.setOrderContactAt('${o.id}', this.value)">
+      </div>
+      <div class="field">
+        <label>Дата и время доставки ${o.statusId==='confirmed'?'<span class="hint">(статус «Подтверждена»)</span>':''}</label>
+        <input type="datetime-local" value="${o.deliveryAt?o.deliveryAt.slice(0,16):''}" onchange="window.setOrderDeliveryAt('${o.id}', this.value)">
+      </div>
+    </div>
+
     <h3 style="margin-top:16px;">Комментарий менеджера</h3>
     <div class="field">
       <textarea onchange="window.setOrderManagerComment('${o.id}', this.value)" placeholder="Заметка для внутреннего использования">${escapeHtml(o.managerComment)}</textarea>
@@ -2496,6 +2510,38 @@ window.setOrderManagerComment = async function(id, val){
   try {
     await saveState();
     toast('Комментарий сохранён', 'ok');
+  } catch(e){
+    markOrdersDirty();
+    toast('Не удалось сохранить сразу, нажмите «Сохранить изменения»: ' + e.message, 'err');
+  }
+};
+// contactAt/deliveryAt хранятся как есть, строкой прямо из <input type="datetime-local">
+// ('YYYY-MM-DDTHH:mm', локальное время без зоны) -- НЕ через new Date(val).toISOString(). ISO
+// конвертирует в UTC, а обратно в инпут (см. viewOrderDetails) значение просто обрезается до 16
+// символов без пересчёта зоны -- в итоге при часовом поясе не UTC показывалось бы совсем другое
+// время, чем ввели. Раз все, кто работает с заявками, в одном часовом поясе, хранить как локальную
+// стену времени проще и надёжнее, плюс такие строки по-прежнему корректно сравниваются/сортируются
+// как текст. Поле не привязано жёстко к статусу -- заполнить/посмотреть можно в любой момент,
+// подсказка со статусом рядом с полем лишь показывает, когда оно обычно актуально.
+window.setOrderContactAt = async function(id, val){
+  const o = STATE.orders.find(x=>x.id===id); if(!o) return;
+  o.contactAt = val || null;
+  o.updatedAt = new Date().toISOString();
+  try {
+    await saveState();
+    toast('Дата связи с клиентом сохранена', 'ok');
+  } catch(e){
+    markOrdersDirty();
+    toast('Не удалось сохранить сразу, нажмите «Сохранить изменения»: ' + e.message, 'err');
+  }
+};
+window.setOrderDeliveryAt = async function(id, val){
+  const o = STATE.orders.find(x=>x.id===id); if(!o) return;
+  o.deliveryAt = val || null;
+  o.updatedAt = new Date().toISOString();
+  try {
+    await saveState();
+    toast('Дата доставки сохранена', 'ok');
   } catch(e){
     markOrdersDirty();
     toast('Не удалось сохранить сразу, нажмите «Сохранить изменения»: ' + e.message, 'err');
@@ -2826,7 +2872,7 @@ async function importOrdersRows(rows){
       orderDate: r.orderDate || todayStr(), contragent: r.contragent, inn: r.inn,
       clientName: r.clientName, phone: r.phone, email: r.email || '',
       price: r.price, cc: null, logistics: null, delivery: null, link: '', article: r.article,
-      address: r.address, comment: r.comment, managerComment: '', serialNumber: '', placementOverride: null,
+      address: r.address, comment: r.comment, managerComment: '', serialNumber: '', placementOverride: null, contactAt: null, deliveryAt: null,
       statusId, source: 'import', createdAt: now, updatedAt: now,
     };
     STATE.orders.unshift(order);
