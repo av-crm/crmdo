@@ -489,7 +489,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.19';
+const APP_VERSION = '2026-08-08.20';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -2306,39 +2306,36 @@ window.viewOrderDetails = function(id){
     <button class="close" onclick="closeModal()">✕</button>
     <h2>Заявка № ${escapeHtml(o.orderNumber||'—')}</h2>
 
-    <h3>Заказ</h3>
-    <table class="preview">
-      <tr><th>Номер заявки</th><td>${isAdmin()
-        ? `<input type="text" value="${escapeHtml(o.orderNumber||'')}" style="max-width:160px;" onchange="window.setOrderNumber('${o.id}', this.value)">`
-        : escapeHtml(o.orderNumber||'—')}</td></tr>
-      <tr><th>Товар (артикул)</th><td>
-        <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
-          <strong>${escapeHtml(o.article)||'—'}</strong>
-          <input type="text" id="modal_newArticle" placeholder="Новый артикул" style="width:140px;">
-          <button class="btn" type="button" style="font-size:12px; padding:4px 10px;" onclick="window.replaceOrderArticle('${o.id}')" title="Подтянет СС и логистику из последнего загруженного прайса/расчёта, не из даты заявки">Заменить</button>
-        </div>
-        <span class="hint" id="modal_replaceArticleHint"></span>
-      </td></tr>
-      <tr><th>Стоимость</th><td>${o.price!=null?fmtMoney(o.price)+' ₽':'—'}</td></tr>
-    </table>
-
-    <h3 style="margin-top:16px;">Контакты клиента</h3>
-    <table class="preview">
-      <tr><th>Имя</th><td>${escapeHtml(o.clientName)||'—'}</td></tr>
-      <tr><th>Телефон</th><td><input type="tel" value="${escapeHtml(o.phone)}" placeholder="+7 900 000-00-00" onchange="window.setOrderPhone('${o.id}', this.value)"></td></tr>
-      <tr><th>Email</th><td><input type="email" value="${escapeHtml(o.email)}" placeholder="client@example.com" onchange="window.setOrderEmail('${o.id}', this.value)"></td></tr>
-    </table>
-
-    <h3 style="margin-top:16px;">Продавец</h3>
-    <div class="field">
-      <select onchange="window.setOrderContragent('${o.id}', this.value)">${contragentOptionsHtml(o.contragent)}</select>
+    <div class="grid-2">
+      <div>
+        <h3>Заказ</h3>
+        <table class="preview">
+          <tr><th>Номер заявки</th><td>${isAdmin()
+            ? `<input type="text" value="${escapeHtml(o.orderNumber||'')}" style="max-width:160px;" onchange="window.setOrderNumber('${o.id}', this.value)">`
+            : escapeHtml(o.orderNumber||'—')}</td></tr>
+          <tr><th>Товар (артикул)</th><td>
+            <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+              <strong>${escapeHtml(o.article)||'—'}</strong>
+              <input type="text" id="modal_newArticle" placeholder="Новый артикул" style="width:140px;">
+              <button class="btn" type="button" style="font-size:12px; padding:4px 10px;" onclick="window.replaceOrderArticle('${o.id}')" title="Подтянет СС и логистику из последнего загруженного прайса/расчёта, не из даты заявки">Заменить</button>
+            </div>
+            <span class="hint" id="modal_replaceArticleHint"></span>
+          </td></tr>
+          <tr><th>Стоимость</th><td>${o.price!=null?fmtMoney(o.price)+' ₽':'—'}</td></tr>
+        </table>
+      </div>
+      <div>
+        <h3>Контакты клиента</h3>
+        <table class="preview">
+          <tr><th>Имя</th><td><input type="text" value="${escapeHtml(o.clientName)}" placeholder="Имя клиента" onchange="window.setOrderClientName('${o.id}', this.value)"></td></tr>
+          <tr><th>Телефон</th><td><input type="tel" value="${escapeHtml(o.phone)}" placeholder="+7 900 000-00-00" onchange="window.setOrderPhone('${o.id}', this.value)"></td></tr>
+          <tr><th>Email</th><td><input type="email" value="${escapeHtml(o.email)}" placeholder="client@example.com" onchange="window.setOrderEmail('${o.id}', this.value)"></td></tr>
+        </table>
+      </div>
     </div>
 
     <h3 style="margin-top:16px;">Адрес доставки</h3>
     <p>${escapeHtml(o.address)||'—'}</p>
-
-    <h3 style="margin-top:16px;">Комментарий клиента</h3>
-    <p>${escapeHtml(o.comment)||'—'}</p>
 
     <h3 style="margin-top:16px;">Сроки</h3>
     <div class="grid-2">
@@ -2351,10 +2348,26 @@ window.viewOrderDetails = function(id){
         <input type="datetime-local" value="${o.deliveryAt?o.deliveryAt.slice(0,16):''}" onchange="window.setOrderDeliveryAt('${o.id}', this.value)">
       </div>
     </div>
+    <div class="btn-row">
+      <button class="btn" type="button" onclick="window.copyDeliveryInfo('${o.id}')">Заявка для доставки</button>
+    </div>
 
-    <h3 style="margin-top:16px;">Комментарий менеджера</h3>
+    <div class="grid-2" style="margin-top:16px;">
+      <div>
+        <h3>Комментарий клиента</h3>
+        <p>${escapeHtml(o.comment)||'—'}</p>
+      </div>
+      <div>
+        <h3>Комментарий менеджера</h3>
+        <div class="field">
+          <textarea onchange="window.setOrderManagerComment('${o.id}', this.value)" placeholder="Заметка для внутреннего использования">${escapeHtml(o.managerComment)}</textarea>
+        </div>
+      </div>
+    </div>
+
+    <h3 style="margin-top:16px;">Продавец</h3>
     <div class="field">
-      <textarea onchange="window.setOrderManagerComment('${o.id}', this.value)" placeholder="Заметка для внутреннего использования">${escapeHtml(o.managerComment)}</textarea>
+      <select onchange="window.setOrderContragent('${o.id}', this.value)">${contragentOptionsHtml(o.contragent)}</select>
     </div>
 
     <h3 style="margin-top:16px; display:flex; align-items:center; gap:10px;">Информация для отгрузки
@@ -2368,9 +2381,48 @@ window.viewOrderDetails = function(id){
       <tr><th>Сумма в чеке</th><td><strong>${receiptTotal!=null?fmtMoney(receiptTotal)+' ₽':'—'}</strong> <span class="hint">(Сумма ${o.price!=null?fmtMoney(o.price)+' ₽':'—'} + Доставка ${o.delivery!=null?fmtMoney(o.delivery)+' ₽':'—'})</span></td></tr>
     </table>
 
-    <p class="hint">Все правки в этой карточке (email, продавец, комментарий менеджера, серийный номер) сохраняются на Диск сразу же, без отдельной кнопки.</p>
+    <p class="hint">Все правки в этой карточке (имя, email, продавец, комментарий менеджера, серийный номер) сохраняются на Диск сразу же, без отдельной кнопки.</p>
   `;
   modalBg.classList.add('show');
+};
+window.setOrderClientName = async function(id, val){
+  const o = STATE.orders.find(x=>x.id===id); if(!o) return;
+  o.clientName = val.trim();
+  o.updatedAt = new Date().toISOString();
+  try {
+    await saveState();
+    toast('Имя клиента сохранено', 'ok');
+  } catch(e){
+    markOrdersDirty();
+    toast('Не удалось сохранить сразу, нажмите «Сохранить изменения»: ' + e.message, 'err');
+  }
+};
+// "Заявка для доставки" -- отдельная сводка для курьера/доставки (в отличие от "Информация для
+// отгрузки" ниже, которая про сам товар: артикул/серийник/ссылку). "Вернуть продавцу" = сколько
+// денег с этого заказа в итоге причитается продавцу товара: из общей суммы, которую заплатил
+// клиент (Сумма + Доставка), вычитаются Доставка (уходит курьеру) и Логистика (комиссия
+// площадки/логиста) -- то есть остаётся именно стоимость товара за вычетом логистики.
+window.copyDeliveryInfo = async function(id){
+  const o = STATE.orders.find(x=>x.id===id); if(!o) return;
+  const receiptTotal = (o.price!=null || o.delivery!=null) ? +((o.price||0) + (o.delivery||0)).toFixed(2) : null;
+  const returnToSeller = receiptTotal!=null ? +(receiptTotal - (o.delivery||0) - (o.logistics||0)).toFixed(2) : null;
+  const text = [
+    `Имя клиента: ${o.clientName || '—'}`,
+    `Контактный телефон: ${o.phone || '—'}`,
+    `Адрес доставки: ${o.address || '—'}`,
+    `Дата доставки: ${o.deliveryAt ? o.deliveryAt.replace('T', ' ') : '—'}`,
+    `Комментарий менеджера: ${o.managerComment || '—'}`,
+    `Общая стоимость: ${receiptTotal!=null ? fmtMoney(receiptTotal)+' ₽' : '—'}`,
+    `Стоимость доставки: ${o.delivery!=null ? fmtMoney(o.delivery)+' ₽' : '—'}`,
+    `Стоимость товара: ${o.price!=null ? fmtMoney(o.price)+' ₽' : '—'}`,
+    `Вернуть продавцу: ${returnToSeller!=null ? fmtMoney(returnToSeller)+' ₽' : '—'}`,
+  ].join('\n');
+  try {
+    await navigator.clipboard.writeText(text);
+    toast('Заявка для доставки скопирована', 'ok');
+  } catch(e){
+    toast('Не удалось скопировать: ' + e.message, 'err');
+  }
 };
 window.copyShippingInfo = async function(id){
   const o = STATE.orders.find(x=>x.id===id); if(!o) return;
