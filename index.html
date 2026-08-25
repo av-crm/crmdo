@@ -493,7 +493,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.21';
+const APP_VERSION = '2026-08-08.23';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -1892,6 +1892,13 @@ function orderPlacement(o){
   if(o.placementOverride != null) return o.placementOverride;
   return derivedPlacement(o);
 }
+// Сумма, полученная продавцом (для отчёта по продажам) = СС (закупка) + Размещение. Использует
+// уже посчитанный orderPlacement (с учётом placementOverride), а не derivedPlacement напрямую, чтобы
+// не расходиться с колонкой "Размещение, ₽" того же отчёта. Оба слагаемых обязательны -- иначе "—".
+function orderSellerReceived(o){
+  const placement = orderPlacement(o);
+  return (o.cc!=null && placement!=null) ? +(o.cc + placement).toFixed(2) : null;
+}
 // Логистика (and its knock-on effect on Размещение) is only editable up through the "Отгружена"
 // status; once an order reaches that status (or anything after it in the configured status
 // order) it's locked in. СС has no such lock — it can always be corrected manually.
@@ -1998,6 +2005,15 @@ function logisticsFromSnapshot(snapshot, article){
   const item = (snapshot.items||[]).find(it=>normalizeArticleForMatch(it.article) === target);
   if(!item || !item.logistics || item.logistics.amount==null) return null;
   return item.logistics.amount;
+}
+// Цена продажи -- та же логика, только читает уже рассчитанное item.sell (см. saveCalcSnapshotToDrive:
+// items.map(...) -> { ..., sell:c.sell, ... }) из того же sellprice_*.json снапшота, что и логистика.
+function priceFromSnapshot(snapshot, article){
+  if(!snapshot || !article) return null;
+  const target = normalizeArticleForMatch(article);
+  const item = (snapshot.items||[]).find(it=>normalizeArticleForMatch(it.article) === target);
+  if(!item || item.sell==null) return null;
+  return item.sell;
 }
 // Listing (not downloading) every price_upload_ snapshot, deduped to the latest upload per
 // calendar day. Filenames already encode the date (price_upload_YYYY-MM-DD_HHMMSS.json), so this
@@ -2463,9 +2479,12 @@ window.setOrderSerialNumber = async function(id, val){
 // Замена артикула -- в отличие от autofillOrdersCC/autofillOrdersLogistics (которые подбирают
 // прайс на дату САМОЙ ЗАЯВКИ и никогда не трогают уже заполненные СС/Логистику), здесь всегда
 // берётся САМЫЙ СВЕЖИЙ загруженный прайс/расчёт (последняя дата из loadAllPriceUploadDates /
-// loadAllSellPriceSnapshotDates) и старые СС/Логистика сбрасываются -- они относились к старому
-// артикулу и после замены товара уже не имеют смысла. Логистика не трогается, если уже
-// зафиксирована (isLogisticsLocked) -- как и везде, отгруженные заявки не редактируются задним числом.
+// loadAllSellPriceSnapshotDates) и старые СС/Логистика/Цена продажи сбрасываются -- они относились
+// к старому артикулу и после замены товара уже не имеют смысла. Цена продажи (o.price) читается
+// из того же sellprice_*.json, что и логистика (см. priceFromSnapshot/item.sell), но, в отличие от
+// логистики, сбрасывается и подтягивается всегда -- цена продажи ничем не "фиксируется" в отличие
+// от логистики. Логистика не трогается, если уже зафиксирована (isLogisticsLocked) -- как и везде,
+// отгруженные заявки не редактируются задним числом.
 window.replaceOrderArticle = async function(id){
   const o = STATE.orders.find(x=>x.id===id); if(!o) return;
   const input = document.getElementById('modal_newArticle');
@@ -2481,25 +2500,30 @@ window.replaceOrderArticle = async function(id){
     const logisticsLocked = isLogisticsLocked(o);
     o.article = newArticle;
     o.cc = null;
+    o.price = null;
     if(!logisticsLocked) o.logistics = null;
-    let foundCC = false, foundLog = false;
+    let foundCC = false, foundLog = false, foundPrice = false;
     if(latestUpload){
       const snap = await driveDownloadJSON(latestUpload.fileId);
       const cost = costFromSnapshot(snap, newArticle);
       if(cost != null){ o.cc = cost; foundCC = true; }
     }
-    if(latestSellSnap && !logisticsLocked){
+    if(latestSellSnap){
       const snap = await driveDownloadJSON(latestSellSnap.fileId);
-      const log = logisticsFromSnapshot(snap, newArticle);
-      if(log != null){ o.logistics = log; foundLog = true; }
+      if(!logisticsLocked){
+        const log = logisticsFromSnapshot(snap, newArticle);
+        if(log != null){ o.logistics = log; foundLog = true; }
+      }
+      const price = priceFromSnapshot(snap, newArticle);
+      if(price != null){ o.price = price; foundPrice = true; }
     }
     o.updatedAt = new Date().toISOString();
     markOrdersDirty();
     await saveState();
     renderOrdersGrid();
     const parts = [];
-    if(foundCC) parts.push('СС'); if(foundLog) parts.push('логистика');
-    if(hint) hint.textContent = parts.length ? `Артикул заменён, подтянуто: ${parts.join(', ')}` : 'Артикул заменён, но в последнем прайсе/расчёте такого артикула не нашлось — заполните СС/логистику вручную';
+    if(foundCC) parts.push('СС'); if(foundLog) parts.push('логистика'); if(foundPrice) parts.push('цена продажи');
+    if(hint) hint.textContent = parts.length ? `Артикул заменён, подтянуто: ${parts.join(', ')}` : 'Артикул заменён, но в последнем прайсе/расчёте такого артикула не нашлось — заполните СС/логистику/цену вручную';
     toast('Артикул заявки заменён', 'ok');
     window.viewOrderDetails(id);
   } catch(e){
@@ -3136,6 +3160,7 @@ function computeSalesReportTotals(data){
     cc: data.reduce((a,o)=>a+(o.cc!=null?Number(o.cc):0),0),
     logistics: data.reduce((a,o)=>a+(o.logistics!=null?Number(o.logistics):0),0),
     placement: data.reduce((a,o)=>a+(orderPlacement(o)||0),0),
+    sellerReceived: data.reduce((a,o)=>a+(orderSellerReceived(o)||0),0),
   };
 }
 function renderSalesReportTotals(data){
@@ -3150,6 +3175,7 @@ function renderSalesReportTotals(data){
       <span>СС: ${fmtMoney(t.cc)} ₽</span>
       <span>Логистика: ${fmtMoney(t.logistics)} ₽</span>
       <span>Размещение: ${fmtMoney(t.placement)} ₽</span>
+      <span>Получено продавцом: ${fmtMoney(t.sellerReceived)} ₽</span>
     </div>`;
 }
 function renderSalesReportGrid(){
@@ -3172,10 +3198,11 @@ function renderSalesReportGrid(){
       { name:'СС, ₽', width:'100px', formatter:(cell)=> cell!=null?fmtMoney(cell)+' ₽':'—' },
       { name:'Логистика, ₽', width:'110px', formatter:(cell)=> cell!=null?fmtMoney(cell)+' ₽':'—' },
       { name:'Размещение, ₽', width:'110px', formatter:(cell)=> cell!=null?fmtMoney(cell)+' ₽':'—' },
+      { name:'Получено продавцом, ₽', width:'150px', formatter:(cell)=> cell!=null?fmtMoney(cell)+' ₽':'—' },
       { name:'Продавец', width:'160px' },
       { name:'ИНН', width:'110px' },
     ],
-    data: data.map(o=>[ o.orderNumber, fmtDateLabel(o.orderDate), o.article, o.serialNumber||'—', o.price, o.cc, o.logistics, orderPlacement(o), o.contragent||'—', o.inn ]),
+    data: data.map(o=>[ o.orderNumber, fmtDateLabel(o.orderDate), o.article, o.serialNumber||'—', o.price, o.cc, o.logistics, orderPlacement(o), orderSellerReceived(o), o.contragent||'—', o.inn ]),
     search:true, sort:true, pagination:{ limit:15, resetPageOnUpdate:false }, className:{ table:'gridjs-wrapper' },
   });
 }
@@ -3184,14 +3211,16 @@ function buildSalesReportRows(){
   const rows = data.map(o=>({
     'Номер заявки': o.orderNumber, 'Дата заявки': fmtDateLabel(o.orderDate), 'Артикул': o.article,
     'Серийный номер': o.serialNumber || '', 'Сумма заказа': o.price, 'СС': o.cc, 'Логистика': o.logistics,
-    'Стоимость размещения': orderPlacement(o), 'Продавец': o.contragent || '', 'ИНН': o.inn,
+    'Стоимость размещения': orderPlacement(o), 'Сумма полученная продавцом': orderSellerReceived(o),
+    'Продавец': o.contragent || '', 'ИНН': o.inn,
   }));
   if(rows.length){
     const t = computeSalesReportTotals(data);
     rows.push({
       'Номер заявки': 'ИТОГО', 'Дата заявки': '', 'Артикул': '', 'Серийный номер': '',
       'Сумма заказа': t.price, 'СС': t.cc, 'Логистика': t.logistics,
-      'Стоимость размещения': t.placement, 'Продавец': '', 'ИНН': '',
+      'Стоимость размещения': t.placement, 'Сумма полученная продавцом': t.sellerReceived,
+      'Продавец': '', 'ИНН': '',
     });
   }
   return rows;
