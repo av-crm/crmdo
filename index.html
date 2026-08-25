@@ -434,6 +434,10 @@
         <label>Статусы, которые попадают в отчёт</label>
         <div id="reportStatusFilter" class="btn-row" style="flex-wrap:wrap;"></div>
       </div>
+      <div class="field" style="margin-bottom:10px;">
+        <label>Продавец</label>
+        <div id="reportContragentFilter" class="btn-row" style="flex-wrap:wrap; align-items:center;"></div>
+      </div>
       <div class="grid-3" style="margin-bottom:10px;">
         <div class="field"><label>Дата заявки с</label><input type="date" id="reportDateFrom"></div>
         <div class="field"><label>Дата заявки по</label><input type="date" id="reportDateTo"></div>
@@ -489,7 +493,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.20';
+const APP_VERSION = '2026-08-08.21';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -1327,6 +1331,7 @@ async function refreshAll(){
     renderUsersList();
     renderStatusRulesForm();
     renderReportStatusFilter();
+    renderReportContragentFilter();
     renderPriceLadders();
     renderCalcLadderSelect();
     await loadPriceHistory();
@@ -1350,7 +1355,7 @@ function switchTab(name){
   document.getElementById('panel-'+name).classList.add('active');
   // Lazily (re)render on open so these always reflect the latest STATE.orders/sellerPayments,
   // without needing every single order-mutating function to know about these tabs.
-  if(name==='reports') renderSalesReportGrid();
+  if(name==='reports'){ renderReportContragentFilter(); renderSalesReportGrid(); }
   if(name==='debt'){ renderDebtGrid(); renderDebtPaymentsGrid(); }
 }
 
@@ -3028,6 +3033,61 @@ function ensureReportStatusFilter(){
   if(REPORT_STATUS_FILTER) return;
   REPORT_STATUS_FILTER = new Set(reportRelevantStatuses().map(s=>s.id));
 }
+// Продавец-фильтр -- список берётся прямо из STATE.orders (а не из CALC_IP_LIST в Прайсах), чтобы
+// в чекбоксах были ровно те продавцы, у которых реально есть заявки, включая случай "без
+// продавца" (contragent пуст). null = ещё не инициализирован; Set once initialized -- по умолчанию
+// выбраны ВСЕ найденные продавцы (т.е. фильтр по умолчанию ничего не сужает, как и со статусами).
+let REPORT_CONTRAGENT_FILTER = null;
+// Отдельно от REPORT_CONTRAGENT_FILTER -- какие продавцы вообще когда-либо предлагались чекбоксом
+// в ЭТОЙ сессии. Нужно, чтобы отличить "продавец только что появился (новый импорт) -- включить по
+// умолчанию" от "продавца уже показывали, человек сам снял галочку -- не включать обратно": оба
+// случая выглядят одинаково ("известный продавец, но не в REPORT_CONTRAGENT_FILTER"), если не
+// помнить, кого уже показывали.
+let REPORT_CONTRAGENT_KNOWN = new Set();
+const REPORT_NO_CONTRAGENT = '(без продавца)';
+function reportKnownContragents(){
+  const set = new Set();
+  STATE.orders.forEach(o=>set.add((o.contragent||'').trim() || REPORT_NO_CONTRAGENT));
+  return Array.from(set).sort((a,b)=>a.localeCompare(b,'ru'));
+}
+function ensureReportContragentFilter(){
+  const known = reportKnownContragents();
+  if(!REPORT_CONTRAGENT_FILTER){
+    REPORT_CONTRAGENT_FILTER = new Set(known);
+    known.forEach(c=>REPORT_CONTRAGENT_KNOWN.add(c));
+    return;
+  }
+  // Только ПОДЛИННО новые продавцы (никогда раньше не встречавшиеся) включаются в фильтр
+  // автоматически -- продавец, которого человек сам снял с фильтра, обратно не подставляется.
+  known.forEach(c=>{
+    if(!REPORT_CONTRAGENT_KNOWN.has(c)){
+      REPORT_CONTRAGENT_FILTER.add(c);
+      REPORT_CONTRAGENT_KNOWN.add(c);
+    }
+  });
+}
+function renderReportContragentFilter(){
+  const el = document.getElementById('reportContragentFilter');
+  if(!el) return;
+  ensureReportContragentFilter();
+  const known = reportKnownContragents();
+  if(!known.length){ el.innerHTML = '<span class="hint">Нет заявок</span>'; return; }
+  el.innerHTML = known.map(c=>`
+    <label style="display:flex; align-items:center; gap:4px; font-size:12px; font-weight:400;">
+      <input type="checkbox" class="report_contragent_cb" value="${escapeHtml(c)}" ${REPORT_CONTRAGENT_FILTER.has(c)?'checked':''} onchange="window.onReportContragentFilterChange()" style="width:auto;"> ${escapeHtml(c)}
+    </label>`).join('')
+    + `<button class="btn secondary" type="button" style="padding:3px 8px; font-size:11px;" onclick="window.setReportContragentFilterAll(true)">Все</button>`
+    + `<button class="btn secondary" type="button" style="padding:3px 8px; font-size:11px;" onclick="window.setReportContragentFilterAll(false)">Никого</button>`;
+}
+window.onReportContragentFilterChange = function(){
+  REPORT_CONTRAGENT_FILTER = new Set(Array.from(document.querySelectorAll('.report_contragent_cb:checked')).map(cb=>cb.value));
+  renderSalesReportGrid();
+};
+window.setReportContragentFilterAll = function(all){
+  REPORT_CONTRAGENT_FILTER = all ? new Set(reportKnownContragents()) : new Set();
+  renderReportContragentFilter();
+  renderSalesReportGrid();
+};
 function renderReportStatusFilter(){
   const el = document.getElementById('reportStatusFilter');
   if(!el) return;
@@ -3048,8 +3108,10 @@ window.onReportStatusFilterChange = function(){
 };
 function getPaidOrdersForReport(){
   ensureReportStatusFilter();
+  ensureReportContragentFilter();
   return STATE.orders.filter(o=>{
     if(!REPORT_STATUS_FILTER.has(o.statusId) || isStatsExcluded(o)) return false;
+    if(!REPORT_CONTRAGENT_FILTER.has((o.contragent||'').trim() || REPORT_NO_CONTRAGENT)) return false;
     if(REPORT_DATE_FROM && (!o.orderDate || o.orderDate < REPORT_DATE_FROM)) return false;
     if(REPORT_DATE_TO && (!o.orderDate || o.orderDate > REPORT_DATE_TO)) return false;
     return true;
@@ -3110,9 +3172,10 @@ function renderSalesReportGrid(){
       { name:'СС, ₽', width:'100px', formatter:(cell)=> cell!=null?fmtMoney(cell)+' ₽':'—' },
       { name:'Логистика, ₽', width:'110px', formatter:(cell)=> cell!=null?fmtMoney(cell)+' ₽':'—' },
       { name:'Размещение, ₽', width:'110px', formatter:(cell)=> cell!=null?fmtMoney(cell)+' ₽':'—' },
+      { name:'Продавец', width:'160px' },
       { name:'ИНН', width:'110px' },
     ],
-    data: data.map(o=>[ o.orderNumber, fmtDateLabel(o.orderDate), o.article, o.serialNumber||'—', o.price, o.cc, o.logistics, orderPlacement(o), o.inn ]),
+    data: data.map(o=>[ o.orderNumber, fmtDateLabel(o.orderDate), o.article, o.serialNumber||'—', o.price, o.cc, o.logistics, orderPlacement(o), o.contragent||'—', o.inn ]),
     search:true, sort:true, pagination:{ limit:15, resetPageOnUpdate:false }, className:{ table:'gridjs-wrapper' },
   });
 }
@@ -3121,14 +3184,14 @@ function buildSalesReportRows(){
   const rows = data.map(o=>({
     'Номер заявки': o.orderNumber, 'Дата заявки': fmtDateLabel(o.orderDate), 'Артикул': o.article,
     'Серийный номер': o.serialNumber || '', 'Сумма заказа': o.price, 'СС': o.cc, 'Логистика': o.logistics,
-    'Стоимость размещения': orderPlacement(o), 'ИНН': o.inn,
+    'Стоимость размещения': orderPlacement(o), 'Продавец': o.contragent || '', 'ИНН': o.inn,
   }));
   if(rows.length){
     const t = computeSalesReportTotals(data);
     rows.push({
       'Номер заявки': 'ИТОГО', 'Дата заявки': '', 'Артикул': '', 'Серийный номер': '',
       'Сумма заказа': t.price, 'СС': t.cc, 'Логистика': t.logistics,
-      'Стоимость размещения': t.placement, 'ИНН': '',
+      'Стоимость размещения': t.placement, 'Продавец': '', 'ИНН': '',
     });
   }
   return rows;
