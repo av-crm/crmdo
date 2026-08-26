@@ -493,7 +493,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.23';
+const APP_VERSION = '2026-08-08.24';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -2397,12 +2397,17 @@ window.viewOrderDetails = function(id){
     <table class="preview">
       <tr><th>Номер заявки</th><td>${escapeHtml(o.orderNumber||'—')}</td></tr>
       <tr><th>Артикул</th><td>${escapeHtml(o.article)||'—'}</td></tr>
-      <tr><th>Ссылка на товар</th><td>${o.link?`<a class="link" href="${escapeHtml(o.link)}" target="_blank">${escapeHtml(o.link)}</a>`:'—'}</td></tr>
+      <tr><th>Ссылка на товар</th><td>
+        <div style="display:flex; gap:6px; align-items:center;">
+          <input type="url" value="${escapeHtml(o.link||'')}" placeholder="https://…" style="flex:1; box-sizing:border-box;" onchange="window.setOrderLink('${o.id}', this.value)">
+          ${o.link?`<a class="link" href="${escapeHtml(o.link)}" target="_blank" title="Открыть ссылку">↗</a>`:''}
+        </div>
+      </td></tr>
       <tr><th>Серийный номер</th><td><input type="text" value="${escapeHtml(o.serialNumber||'')}" placeholder="SN-000000" style="width:100%;box-sizing:border-box;" onchange="window.setOrderSerialNumber('${o.id}', this.value)"></td></tr>
       <tr><th>Сумма в чеке</th><td><strong>${receiptTotal!=null?fmtMoney(receiptTotal)+' ₽':'—'}</strong> <span class="hint">(Сумма ${o.price!=null?fmtMoney(o.price)+' ₽':'—'} + Доставка ${o.delivery!=null?fmtMoney(o.delivery)+' ₽':'—'})</span></td></tr>
     </table>
 
-    <p class="hint">Все правки в этой карточке (имя, email, продавец, комментарий менеджера, серийный номер) сохраняются на Диск сразу же, без отдельной кнопки.</p>
+    <p class="hint">Все правки в этой карточке (имя, email, продавец, комментарий менеджера, серийный номер, ссылка на товар) сохраняются на Диск сразу же, без отдельной кнопки.</p>
   `;
   modalBg.classList.add('show');
 };
@@ -2461,6 +2466,22 @@ window.copyShippingInfo = async function(id){
   } catch(e){
     toast('Не удалось скопировать: ' + e.message, 'err');
   }
+};
+// Ссылку на товар можно было указать только при создании заявки (поле f_link) -- добавляется
+// возможность указать/поменять её и позже, прямо в карточке уже существующей заявки. Сохраняется
+// сразу по onchange, как и остальные поля блока "Информация для отгрузки".
+window.setOrderLink = async function(id, val){
+  const o = STATE.orders.find(x=>x.id===id); if(!o) return;
+  o.link = val.trim();
+  o.updatedAt = new Date().toISOString();
+  try {
+    await saveState();
+    toast('Ссылка на товар сохранена', 'ok');
+  } catch(e){
+    markOrdersDirty();
+    toast('Не удалось сохранить сразу, нажмите «Сохранить изменения»: ' + e.message, 'err');
+  }
+  window.viewOrderDetails(id);
 };
 // Пишется на Диск сразу по onchange (не через общую кнопку "Сохранить изменения"), в отличие от
 // остальных полей карточки заявки -- так попросили специально для серийного номера.
