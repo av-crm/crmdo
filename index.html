@@ -493,7 +493,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.24';
+const APP_VERSION = '2026-08-08.25';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -1277,13 +1277,22 @@ async function refreshAll(){
     const loaded = await loadLatestState();
     if(loaded){
       STATE.statuses = (loaded.statuses && loaded.statuses.length) ? loaded.statuses : DEFAULT_STATUSES;
-      STATE.orders = loaded.orders || [];
-      STATE.sellerPayments = loaded.sellerPayments || [];
+      // mergeById, а не голая перезапись -- иначе заявка/оплата/лестница, только что добавленная
+      // локально (unshift в STATE) и ещё не долетевшая до Диска (её saveState() ещё выполняется --
+      // ждёт autofillOrdersCC/Logistics), безвозвратно стирается из памяти, если в этот момент
+      // (например, от нетерпеливого клика "↻ Обновить данные") сработает refreshAll: он просто
+      // затирал STATE.orders последними данными с Диска, где новой записи ещё нет -- и когда
+      // исходный saveState() того add-потока наконец досохранял, он сохранял уже "подчищенный"
+      // STATE.orders без неё. Именно так заявка "появилась в списке, а потом исчезла" (баг с
+      // заявкой 2062). mergeById сохраняет такие ещё-не-сохранённые локальные записи (их id просто
+      // нет в свежих данных с Диска -- см. ветку `if(!existing)` внутри mergeById).
+      STATE.orders = mergeById(STATE.orders, loaded.orders || []);
+      STATE.sellerPayments = mergeById(STATE.sellerPayments, loaded.sellerPayments || []);
       STATE.users = loaded.users || [];
       STATE.statusRules = loaded.statusRules || { restrictedStatusId: null, allowedNextIds: [] };
       STATE.dealDoneStatusId = loaded.dealDoneStatusId || null;
       STATE.paidStatusIds = (loaded.paidStatusIds && loaded.paidStatusIds.length) ? loaded.paidStatusIds : ['paid'];
-      STATE.priceLadders = loaded.priceLadders || [];
+      STATE.priceLadders = mergeById(STATE.priceLadders, loaded.priceLadders || []);
     } else {
       STATE = { statuses: JSON.parse(JSON.stringify(DEFAULT_STATUSES)), orders: [], sellerPayments: [], users: [], statusRules: { restrictedStatusId: null, allowedNextIds: [] }, dealDoneStatusId: null, paidStatusIds: ['paid'], priceLadders: [] };
     }
