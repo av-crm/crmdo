@@ -506,7 +506,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.26';
+const APP_VERSION = '2026-08-08.27';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -1921,6 +1921,12 @@ function orderSellerReceived(o){
   const placement = orderPlacement(o);
   return (o.cc!=null && placement!=null) ? +(o.cc + placement).toFixed(2) : null;
 }
+// Сумма в чеке = Цена продажи + Доставка -- тот же расчёт, что уже используется в карточке заявки
+// (см. "Сумма в чеке" в блоке "Информация для отгрузки" и copyDeliveryInfo). Достаточно хотя бы
+// одного известного слагаемого, иначе результат "—", а не введённый в заблуждение 0.
+function orderReceiptTotal(o){
+  return (o.price!=null || o.delivery!=null) ? +((o.price||0) + (o.delivery||0)).toFixed(2) : null;
+}
 // Логистика (and its knock-on effect on Размещение) is only editable up through the "Отгружена"
 // status; once an order reaches that status (or anything after it in the configured status
 // order) it's locked in. СС has no such lock — it can always be corrected manually.
@@ -3252,7 +3258,7 @@ window.clearOrderStatusLookup = function(){
 function computeSalesReportTotals(data){
   return {
     count: data.length,
-    price: data.reduce((a,o)=>a+(Number(o.price)||0),0),
+    receiptTotal: data.reduce((a,o)=>a+(orderReceiptTotal(o)||0),0),
     cc: data.reduce((a,o)=>a+(o.cc!=null?Number(o.cc):0),0),
     logistics: data.reduce((a,o)=>a+(o.logistics!=null?Number(o.logistics):0),0),
     placement: data.reduce((a,o)=>a+(orderPlacement(o)||0),0),
@@ -3267,7 +3273,7 @@ function renderSalesReportTotals(data){
   el.innerHTML = `
     <div class="btn-row" style="flex-wrap:wrap; font-size:13px; font-weight:600; border-top:2px solid var(--border); padding-top:8px; margin-top:4px;">
       <span>Итого (${t.count} заявок):</span>
-      <span>Сумма заказов: ${fmtMoney(t.price)} ₽</span>
+      <span>Сумма чека: ${fmtMoney(t.receiptTotal)} ₽</span>
       <span>СС: ${fmtMoney(t.cc)} ₽</span>
       <span>Логистика: ${fmtMoney(t.logistics)} ₽</span>
       <span>Размещение: ${fmtMoney(t.placement)} ₽</span>
@@ -3290,7 +3296,7 @@ function renderSalesReportGrid(){
       { name:'Дата', width:'95px' },
       { name:'Артикул', width:'110px' },
       { name:'Серийный номер', width:'130px' },
-      { name:'Сумма заказа', width:'110px', formatter:(cell)=> cell!=null?fmtMoney(cell)+' ₽':'—' },
+      { name:'Сумма чека, ₽', width:'110px', formatter:(cell)=> cell!=null?fmtMoney(cell)+' ₽':'—' },
       { name:'СС, ₽', width:'100px', formatter:(cell)=> cell!=null?fmtMoney(cell)+' ₽':'—' },
       { name:'Логистика, ₽', width:'110px', formatter:(cell)=> cell!=null?fmtMoney(cell)+' ₽':'—' },
       { name:'Размещение, ₽', width:'110px', formatter:(cell)=> cell!=null?fmtMoney(cell)+' ₽':'—' },
@@ -3298,7 +3304,7 @@ function renderSalesReportGrid(){
       { name:'Продавец', width:'160px' },
       { name:'ИНН', width:'110px' },
     ],
-    data: data.map(o=>[ o.orderNumber, fmtDateLabel(o.orderDate), o.article, o.serialNumber||'—', o.price, o.cc, o.logistics, orderPlacement(o), orderSellerReceived(o), o.contragent||'—', o.inn ]),
+    data: data.map(o=>[ o.orderNumber, fmtDateLabel(o.orderDate), o.article, o.serialNumber||'—', orderReceiptTotal(o), o.cc, o.logistics, orderPlacement(o), orderSellerReceived(o), o.contragent||'—', o.inn ]),
     search:true, sort:true, pagination:{ limit:15, resetPageOnUpdate:false }, className:{ table:'gridjs-wrapper' },
   });
 }
@@ -3306,7 +3312,7 @@ function buildSalesReportRows(){
   const data = getPaidOrdersForReport();
   const rows = data.map(o=>({
     'Номер заявки': o.orderNumber, 'Дата заявки': fmtDateLabel(o.orderDate), 'Артикул': o.article,
-    'Серийный номер': o.serialNumber || '', 'Сумма заказа': o.price, 'СС': o.cc, 'Логистика': o.logistics,
+    'Серийный номер': o.serialNumber || '', 'Сумма чека': orderReceiptTotal(o), 'СС': o.cc, 'Логистика': o.logistics,
     'Стоимость размещения': orderPlacement(o), 'Сумма полученная продавцом': orderSellerReceived(o),
     'Продавец': o.contragent || '', 'ИНН': o.inn,
   }));
@@ -3314,7 +3320,7 @@ function buildSalesReportRows(){
     const t = computeSalesReportTotals(data);
     rows.push({
       'Номер заявки': 'ИТОГО', 'Дата заявки': '', 'Артикул': '', 'Серийный номер': '',
-      'Сумма заказа': t.price, 'СС': t.cc, 'Логистика': t.logistics,
+      'Сумма чека': t.receiptTotal, 'СС': t.cc, 'Логистика': t.logistics,
       'Стоимость размещения': t.placement, 'Сумма полученная продавцом': t.sellerReceived,
       'Продавец': '', 'ИНН': '',
     });
