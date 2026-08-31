@@ -428,6 +428,19 @@
   <!-- REPORTS TAB -->
   <div class="panel" id="panel-reports">
     <div class="card">
+      <h2>Статусы по номерам заявок</h2>
+      <p class="hint">Вставьте номера заявок — через запятую, пробел или каждый с новой строки — и получите их актуальный статус.</p>
+      <div class="field">
+        <label>Номера заявок</label>
+        <textarea id="statusLookupInput" rows="3" placeholder="Например: 2060, 2058, 2056"></textarea>
+      </div>
+      <div class="btn-row">
+        <button class="btn" onclick="window.runOrderStatusLookup()">Показать статусы</button>
+        <button class="btn secondary" onclick="window.clearOrderStatusLookup()">Очистить</button>
+      </div>
+      <div id="statusLookupResult"></div>
+    </div>
+    <div class="card">
       <h2>Отчёт по продажам</h2>
       <p class="hint">Номер заявки, артикул, сумма заказа, СС, логистика, стоимость размещения, ИНН.</p>
       <div class="field" style="margin-bottom:10px;">
@@ -493,7 +506,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.25';
+const APP_VERSION = '2026-08-08.26';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -3182,6 +3195,59 @@ window.resetReportDateFilter = function(){
   document.getElementById('reportDateFrom').value = '';
   document.getElementById('reportDateTo').value = '';
   renderSalesReportGrid();
+};
+// Разбирает произвольный ввод номеров заявок -- через запятую, пробел, точку с запятой или каждый
+// с новой строки, в любой комбинации -- в список непустых строк без дублей (сохраняя порядок
+// первого появления, чтобы результат не "перемешивался" относительно того, что человек вставил).
+function parseOrderNumbersInput(raw){
+  const seen = new Set();
+  const out = [];
+  String(raw||'').split(/[\s,;]+/).forEach(s=>{
+    const v = s.trim();
+    if(!v || seen.has(v)) return;
+    seen.add(v);
+    out.push(v);
+  });
+  return out;
+}
+// Ищет заявки по номеру (STATE.orders хранит orderNumber как строку) -- один номер теоретически
+// может соответствовать нескольким заявкам (номер не защищён от дублей на уровне данных), поэтому
+// возвращает массив совпадений, а не первое найденное; ненайденный номер просто не добавляет строк
+// в matches, но остаётся виден в отчёте отдельно как "не найден" (см. runOrderStatusLookup).
+function findOrdersByNumber(number){
+  return STATE.orders.filter(o=>String(o.orderNumber||'').trim() === number);
+}
+window.runOrderStatusLookup = function(){
+  const input = document.getElementById('statusLookupInput');
+  const resultEl = document.getElementById('statusLookupResult');
+  const numbers = parseOrderNumbersInput(input.value);
+  if(!numbers.length){ resultEl.innerHTML = '<p class="hint">Введите хотя бы один номер заявки</p>'; return; }
+  const rows = [];
+  numbers.forEach(num=>{
+    const matches = findOrdersByNumber(num);
+    if(!matches.length){
+      rows.push(`<tr><td>${escapeHtml(num)}</td><td colspan="4" style="color:#dc2626;">Заявка не найдена</td></tr>`);
+      return;
+    }
+    matches.forEach(o=>{
+      const st = statusOf(o.statusId);
+      rows.push(`<tr>
+        <td><a class="link" href="javascript:void(0)" onclick="window.viewOrderDetails('${o.id}')" style="cursor:pointer;">${escapeHtml(o.orderNumber||'—')}</a></td>
+        <td><span style="display:inline-block; width:9px; height:9px; border-radius:50%; background:${escapeHtml(st.color||'#94a3b8')}; margin-right:5px;"></span>${escapeHtml(st.label)}</td>
+        <td>${o.orderDate?fmtDateLabel(o.orderDate):'—'}</td>
+        <td>${escapeHtml(o.clientName)||'—'}</td>
+        <td>${escapeHtml(o.article)||'—'}</td>
+      </tr>`);
+    });
+  });
+  resultEl.innerHTML = `<table class="preview">
+    <tr><th>№ заявки</th><th>Статус</th><th>Дата заявки</th><th>Клиент</th><th>Артикул</th></tr>
+    ${rows.join('')}
+  </table>`;
+};
+window.clearOrderStatusLookup = function(){
+  document.getElementById('statusLookupInput').value = '';
+  document.getElementById('statusLookupResult').innerHTML = '';
 };
 function computeSalesReportTotals(data){
   return {
