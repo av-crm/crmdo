@@ -173,11 +173,11 @@
 
     <div class="card">
       <h2>Импорт заявок из XLS</h2>
-      <p class="hint">Для выгрузок из highload-блока Bitrix (файл с расширением .xls, но по факту это HTML-таблица с колонками ID / UF_ARTICUL / UF_INN / UF_DATE / UF_BODY / UF_SELLER / UF_USER / UF_PRICE). Заявки с уже импортированным ID пропускаются повторно — можно смело перезаливать один и тот же файл или более свежую выгрузку.</p>
+      <p class="hint">Понимает два формата, определяет автоматически: 1) выгрузки из highload-блока Bitrix (файл с расширением .xls, но по факту это HTML-таблица с колонками ID / UF_ARTICUL / UF_INN / UF_DATE / UF_BODY / UF_SELLER / UF_USER / UF_PRICE); 2) resell_orders_*.csv (тоже на деле не CSV, а Excel-файл, с колонками ID / Артикул / Дата / Продавец / ИНН / Телефон / Цена / «Данные клиента»). Заявки с уже импортированным ID пропускаются повторно — можно смело перезаливать один и тот же файл или более свежую выгрузку.</p>
       <div class="field" style="max-width:320px;"><label>Статус для новых заявок</label><select id="import_status"></select></div>
       <div class="drop" id="orders_import_drop">
-        <input type="file" id="orders_import_file" accept=".xls,.xlsx,.html,.htm">
-        <strong id="orders_import_title">Перетащите файл выгрузки (.xls) сюда</strong>
+        <input type="file" id="orders_import_file" accept=".xls,.xlsx,.html,.htm,.csv">
+        <strong id="orders_import_title">Перетащите файл выгрузки (.xls / .csv) сюда</strong>
         <span>или нажмите, чтобы выбрать файл</span>
       </div>
       <p class="hint" id="orders_import_hint"></p>
@@ -506,7 +506,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.27';
+const APP_VERSION = '2026-08-08.28';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -2947,15 +2947,76 @@ function parseBitrixOrdersHtml(text){
   }
   return rows;
 }
+// Второй поддерживаемый формат выгрузки: resell_orders_*.csv -- несмотря на расширение .csv в
+// имени, файл по факту настоящий xlsx (Excel сохраняет его так же, как и обычные .xlsx, просто с
+// другим расширением -- видно по PK-сигнатуре ZIP-архива внутри). Колонки: ID, Артикул, Дата,
+// Продавец, ИНН, Телефон, Цена, "Данные клиента". В отличие от Bitrix-выгрузки выше, где
+// имя/телефон/email/адрес/комментарий -- отдельные поля из JSON (UF_BODY), здесь всё это склеено в
+// одну текстовую колонку вида "name: X, phone: Y, email: Z, address: W, comment: V".
+// parseClientDataBlob разбирает её не по запятым (адрес сам может их содержать), а по позициям
+// известных меток "name:"/"phone:"/"email:"/"address:"/"comment:" -- каждое значение читается до
+// следующей встреченной метки или до конца строки.
+function parseClientDataBlob(s){
+  const str = String(s||'');
+  const get = (label, nextLabels) => {
+    const stopAlt = nextLabels.length ? '(?:,\\s*(?:' + nextLabels.join('|') + ')\\s*:|$)' : '$';
+    const re = new RegExp(label + '\\s*:\\s*([\\s\\S]*?)' + stopAlt);
+    const m = str.match(re);
+    return m ? m[1].trim() : '';
+  };
+  return {
+    name: get('name', ['phone','email','address','comment']),
+    phone: get('phone', ['email','address','comment']),
+    email: get('email', ['address','comment']),
+    address: get('address', ['comment']),
+    comment: get('comment', []),
+  };
+}
+// Возвращает тот же общий формат строк, что и parseBitrixOrdersHtml (bitrixId/orderNumber/article/
+// inn/orderDate/clientName/phone/address/comment/email/contragent/price), чтобы дальше вся заявка
+// шла через один и тот же importOrdersRows -- дедуп по номеру заявки, автоподтягивание СС/логистики
+// и сохранение работают для обоих форматов одинаково, без дублирования логики.
+function parseResellOrdersXlsx(buf){
+  let wb;
+  try { wb = XLSX.read(buf, { type:'array' }); } catch(e){ return null; }
+  const sheet = wb.Sheets[wb.SheetNames[0]];
+  if(!sheet) return null;
+  const rows = XLSX.utils.sheet_to_json(sheet, { defval: null });
+  if(!rows.length) return null;
+  const required = ['ID','Артикул','Дата','Продавец','ИНН','Телефон','Цена','Данные клиента'];
+  if(!required.every(k => k in rows[0])) return null;
+  return rows.map(r=>{
+    const client = parseClientDataBlob(r['Данные клиента']);
+    const id = r['ID']!=null ? String(r['ID']).trim() : '';
+    const priceRaw = r['Цена'];
+    const price = (priceRaw!=null && priceRaw!=='') ? Number(priceRaw) : null;
+    return {
+      bitrixId: id, orderNumber: id, article: r['Артикул']!=null ? String(r['Артикул']).trim() : '',
+      inn: r['ИНН']!=null ? String(r['ИНН']).trim() : '', orderDate: convertDMYtoISO(r['Дата']),
+      clientName: client.name, phone: client.phone || (r['Телефон']!=null ? String(r['Телефон']).trim() : ''),
+      address: client.address, comment: client.comment, email: client.email,
+      contragent: r['Продавец']!=null ? String(r['Продавец']).trim() : '',
+      price: (price!=null && !isNaN(price)) ? price : null,
+    };
+  }).filter(r=>r.bitrixId);
+}
 async function handleOrdersImportFile(file){
   const hint = document.getElementById('orders_import_hint');
   document.getElementById('orders_import_title').textContent = file.name;
   hint.textContent = 'Разбираю файл…';
   try {
     const text = await file.text();
-    const rows = parseBitrixOrdersHtml(text);
+    let rows = parseBitrixOrdersHtml(text);
     if(rows === null){
-      hint.textContent = 'Не удалось распознать формат файла (ожидались колонки ID, UF_ARTICUL, UF_INN, UF_DATE, UF_BODY, UF_SELLER, UF_PRICE)';
+      // Не похоже на Bitrix HTML-выгрузку -- пробуем второй поддерживаемый формат
+      // (resell_orders_*.csv/.xlsx, настоящий Excel-файл вопреки расширению .csv в имени).
+      try {
+        const buf = await file.arrayBuffer();
+        rows = parseResellOrdersXlsx(buf);
+      } catch(e2){ console.error(e2); rows = null; }
+    }
+    if(rows === null){
+      hint.textContent = 'Не удалось распознать формат файла (ожидались колонки ID, UF_ARTICUL, UF_INN, UF_DATE, UF_BODY, UF_SELLER, UF_PRICE — выгрузка Bitrix, либо ID, Артикул, Дата, Продавец, ИНН, Телефон, Цена, «Данные клиента» — выгрузка resell_orders)';
       toast('Формат файла не распознан', 'err');
       return;
     }
