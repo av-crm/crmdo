@@ -506,7 +506,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.28';
+const APP_VERSION = '2026-08-08.29';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -1974,8 +1974,13 @@ async function loadPriceUploadByDate(dateStr, cache){
   if(cache.has(dateStr)) return cache.get(dateStr);
   let result = null;
   try {
-    const r = await driveSearch(`'${FOLDERS.prices}' in parents and name contains 'price_upload_${dateStr}'`, 20);
-    const files = (r.files||[]).filter(f=>f.title.startsWith('price_upload_'+dateStr));
+    // Имя файла теперь price_upload_<slug-продавца>_<дата>_<время>.json (у части старых файлов --
+    // без slug'а вообще). Дата больше не всегда сразу после префикса, поэтому распознаём оба
+    // формата через parsePriceUploadFilename (см. loadAllPriceUploadDates), а не через startsWith.
+    // Это чисто диагностическая проверка "загружали ли вообще что-то на эту дату" -- продавец
+    // здесь не важен, ищем среди всех.
+    const r = await driveSearch(`'${FOLDERS.prices}' in parents and name contains 'price_upload_' and name contains '${dateStr}'`, 20);
+    const files = (r.files||[]).filter(f=>{ const p = parsePriceUploadFilename(f.title); return p && p.date === dateStr; });
     if(files.length){
       files.sort((a,b)=> new Date(b.createdTime) - new Date(a.createdTime));
       result = await driveDownloadJSON(files[0].id);
@@ -2044,49 +2049,90 @@ function priceFromSnapshot(snapshot, article){
   return item.sell;
 }
 // Listing (not downloading) every price_upload_ snapshot, deduped to the latest upload per
-// calendar day. Filenames already encode the date (price_upload_YYYY-MM-DD_HHMMSS.json), so this
-// needs no downloads — cheap enough to call once per autofill batch.
+// (продавец, calendar day) -- НЕ просто по дню: имя файла теперь price_upload_<slug-продавца>_
+// <YYYY-MM-DD>_<HHMMSS>.json (см. saveRawUploadSnapshot), и если группировать только по дате,
+// загрузка одного продавца за день затирала бы в этом списке загрузку другого продавца за тот же
+// день. ipSlug -- null у старых файлов, загруженных до этого разделения (имя было без slug'а вообще,
+// просто price_upload_<дата>_<время>.json) -- такие трактуются как "общий" прайс без привязки к
+// продавцу (см. uploadsForSeller). Downloads не нужны -- дата и slug читаются из имени файла,
+// дёшево вызывать на каждый батч автоподбора.
+// Два формата имени в ходу одновременно: новый price_upload_<slug>_<дата>_<время>.json (с
+// продавцом) и старый price_upload_<дата>_<время>.json (без slug'а вообще, ещё до этого
+// разделения) -- в старом формате между префиксом и датой НЕТ лишнего "_", так что единый regex с
+// опциональной группой сюда не подходит (для него было бы "__" перед датой). Пробуем новый формат,
+// и только если не подошёл -- старый.
+function parsePriceUploadFilename(title){
+  let m = title.match(/^price_upload_(.+)_(\d{4}-\d{2}-\d{2})_\d{6}\.json$/);
+  if(m) return { ipSlug: m[1], date: m[2] };
+  m = title.match(/^price_upload_(\d{4}-\d{2}-\d{2})_\d{6}\.json$/);
+  if(m) return { ipSlug: null, date: m[1] };
+  return null;
+}
 async function loadAllPriceUploadDates(){
   const r = await driveSearch(`'${FOLDERS.prices}' in parents and name contains 'price_upload_'`, 500);
-  const files = (r.files||[]).filter(f=>/^price_upload_\d{4}-\d{2}-\d{2}_/.test(f.title));
-  const byDate = new Map();
-  files.forEach(f=>{
-    const date = f.title.slice('price_upload_'.length, 'price_upload_'.length+10);
-    const existing = byDate.get(date);
-    if(!existing || new Date(f.createdTime) > new Date(existing.createdTime)) byDate.set(date, f);
+  const byKey = new Map();
+  (r.files||[]).forEach(f=>{
+    const parsed = parsePriceUploadFilename(f.title);
+    if(!parsed) return;
+    const key = (parsed.ipSlug||'') + '|' + parsed.date;
+    const existing = byKey.get(key);
+    if(!existing || new Date(f.createdTime) > new Date(existing.createdTime)) byKey.set(key, { date: parsed.date, fileId: f.id, ipSlug: parsed.ipSlug, createdTime: f.createdTime });
   });
-  return Array.from(byDate.entries())
-    .map(([date, f])=>({ date, fileId: f.id }))
-    .sort((a,b)=> a.date.localeCompare(b.date));
+  return Array.from(byKey.values()).sort((a,b)=> a.date.localeCompare(b.date));
 }
 // Same idea as loadAllPriceUploadDates, but over saved calculator snapshots (sellprice_*.json),
 // which is the only place logistics amounts actually exist. Filename is
 // sellprice_<slug-of-ip-name>_<YYYY-MM-DD>_<HHMMSS>.json — the slug can contain hyphens/letters
 // but never the date pattern itself, so anchoring the regex to the end of the filename is safe
-// regardless of what the ИП name slugified to.
+// regardless of what the ИП name slugified to. Same (продавец, день) grouping fix as above --
+// previously grouping by date alone meant two different sellers saving a calculator snapshot on
+// the same day would silently clobber each other in this list, with only whichever was created
+// later ever being considered for autofill.
 async function loadAllSellPriceSnapshotDates(){
   const r = await driveSearch(`'${FOLDERS.prices}' in parents and name contains 'sellprice_'`, 500);
   const files = (r.files||[]).filter(f=>/^sellprice_.+_\d{4}-\d{2}-\d{2}_\d{6}\.json$/.test(f.title));
-  const byDate = new Map();
+  const byKey = new Map();
   files.forEach(f=>{
-    const m = f.title.match(/_(\d{4}-\d{2}-\d{2})_\d{6}\.json$/);
+    const m = f.title.match(/^sellprice_(.+)_(\d{4}-\d{2}-\d{2})_\d{6}\.json$/);
     if(!m) return;
-    const date = m[1];
-    const existing = byDate.get(date);
-    if(!existing || new Date(f.createdTime) > new Date(existing.createdTime)) byDate.set(date, f);
+    const ipSlug = m[1];
+    const date = m[2];
+    const key = ipSlug + '|' + date;
+    const existing = byKey.get(key);
+    if(!existing || new Date(f.createdTime) > new Date(existing.createdTime)) byKey.set(key, { date, fileId: f.id, ipSlug, createdTime: f.createdTime });
   });
-  return Array.from(byDate.entries())
-    .map(([date, f])=>({ date, fileId: f.id }))
-    .sort((a,b)=> a.date.localeCompare(b.date));
+  return Array.from(byKey.values()).sort((a,b)=> a.date.localeCompare(b.date));
+}
+// НАЙДЕННЫЙ БАГ (СС/логистика одного продавца просачивались в заявки другого, 2026-09): раньше
+// подбор ближайшего прайса/расчёта не смотрел на продавца заявки вообще -- если у двух продавцов
+// совпадал артикул (обычное дело: один и тот же телефон продают разные ИП под тем же кодом),
+// заявка могла получить СС/логистику/цену продажи ЧУЖОГО продавца. Теперь сначала ищем записи
+// именно продавца ЭТОЙ заявки (ipSlug совпадает); если для него ничего не загружено -- используем
+// старые "общие" записи без привязки к продавцу (ipSlug: null) как запасной вариант, чтобы не
+// потерять данные, загруженные до этого разделения. Записи ДРУГОГО, отличного от sellerSlug,
+// конкретного продавца никогда не подмешиваются.
+function uploadsForSeller(uploads, sellerSlug){
+  const own = uploads.filter(u=>u.ipSlug === sellerSlug);
+  return own.length ? own : uploads.filter(u=>u.ipSlug == null);
 }
 // СС pricing rule: use the price file that was actually current for the order — i.e. the most
 // recent upload dated on or before the order date (exact-day match is just the special case
 // where an upload happened to land on that day). If the order predates every upload, there's no
 // applicable price yet, so it's left for manual entry rather than guessing from a later file.
-function findUploadForOrderDate(uploads, orderDate){
+// sellerSlug scopes the candidate pool to this order's own seller first (see uploadsForSeller) --
+// pass null/undefined to search across everything (e.g. when the order has no contragent at all).
+function findUploadForOrderDate(uploads, orderDate, sellerSlug){
+  const pool = sellerSlug!=null ? uploadsForSeller(uploads, sellerSlug) : uploads;
   let best = null;
-  for(const u of uploads){ if(u.date <= orderDate && (!best || u.date > best.date)) best = u; }
+  for(const u of pool){ if(u.date <= orderDate && (!best || u.date > best.date)) best = u; }
   return best;
+}
+// Мирроит findUploadForOrderDate, но без ограничения по дате -- для replaceOrderArticle, который
+// всегда берёт САМЫЙ СВЕЖИЙ прайс/расчёт целиком, а не тот, что был актуален на дату заявки.
+function latestUploadForSeller(uploads, sellerSlug){
+  const pool = uploadsForSeller(uploads, sellerSlug);
+  if(!pool.length) return null;
+  return pool.reduce((a,b)=> a.date > b.date ? a : b);
 }
 // Only fills orders where СС is still empty — never overwrites a value the person entered
 // or already confirmed. Returns a diagnostic breakdown (not just a count) so the "Подтянуть СС"
@@ -2104,7 +2150,8 @@ async function autofillOrdersCC(orders){
   if(!uploads.length) return stats;
   const snapshotCache = new Map(); // fileId -> downloaded snapshot (or null)
   for(const o of targets){
-    const best = findUploadForOrderDate(uploads, o.orderDate);
+    const sellerSlug = o.contragent ? slugify(o.contragent) : null;
+    const best = findUploadForOrderDate(uploads, o.orderDate, sellerSlug);
     if(!best){ stats.skippedNoUpload++; continue; }
     let snap = snapshotCache.get(best.fileId);
     if(snap === undefined){
@@ -2136,7 +2183,8 @@ async function autofillOrdersLogistics(orders){
   if(!snapshots.length) return stats;
   const snapshotCache = new Map();
   for(const o of targets){
-    const best = findUploadForOrderDate(snapshots, o.orderDate);
+    const sellerSlug = o.contragent ? slugify(o.contragent) : null;
+    const best = findUploadForOrderDate(snapshots, o.orderDate, sellerSlug);
     if(!best){ stats.skippedNoUpload++; continue; }
     let snap = snapshotCache.get(best.fileId);
     if(snap === undefined){
@@ -2527,8 +2575,9 @@ window.setOrderSerialNumber = async function(id, val){
 };
 // Замена артикула -- в отличие от autofillOrdersCC/autofillOrdersLogistics (которые подбирают
 // прайс на дату САМОЙ ЗАЯВКИ и никогда не трогают уже заполненные СС/Логистику), здесь всегда
-// берётся САМЫЙ СВЕЖИЙ загруженный прайс/расчёт (последняя дата из loadAllPriceUploadDates /
-// loadAllSellPriceSnapshotDates) и старые СС/Логистика/Цена продажи сбрасываются -- они относились
+// берётся САМЫЙ СВЕЖИЙ загруженный прайс/расчёт ИМЕННО ЭТОГО ПРОДАВЦА (см. latestUploadForSeller --
+// та же логика "свой продавец, а если для него ничего нет -- старые общие файлы", что и в
+// findUploadForOrderDate) и старые СС/Логистика/Цена продажи сбрасываются -- они относились
 // к старому артикулу и после замены товара уже не имеют смысла. Цена продажи (o.price) читается
 // из того же sellprice_*.json, что и логистика (см. priceFromSnapshot/item.sell), но, в отличие от
 // логистики, сбрасывается и подтягивается всегда -- цена продажи ничем не "фиксируется" в отличие
@@ -2544,8 +2593,9 @@ window.replaceOrderArticle = async function(id){
   try {
     const uploads = await loadAllPriceUploadDates();
     const sellSnaps = await loadAllSellPriceSnapshotDates();
-    const latestUpload = uploads.length ? uploads[uploads.length-1] : null;
-    const latestSellSnap = sellSnaps.length ? sellSnaps[sellSnaps.length-1] : null;
+    const sellerSlug = o.contragent ? slugify(o.contragent) : null;
+    const latestUpload = latestUploadForSeller(uploads, sellerSlug);
+    const latestSellSnap = latestUploadForSeller(sellSnaps, sellerSlug);
     const logisticsLocked = isLogisticsLocked(o);
     o.article = newArticle;
     o.cc = null;
@@ -3526,7 +3576,19 @@ function renderDebtPaymentsGrid(){
 }
 
 /* ================= PRICES: HISTORY (uploads + markup snapshots) ================= */
+// НАЙДЕННЫЙ БАГ (СС/логистика одного продавца просачивались в заявки другого, 2026-09):
+// price_upload_*.json раньше вообще не запоминал, для какого продавца загружен прайс -- имя файла
+// было просто price_upload_<дата>_<время>.json. Пока продавец был один, это было не важно. Как
+// только появился второй продавец с ПЕРЕСЕКАЮЩИМИСЯ артикулами (одна и та же модель телефона может
+// продаваться разными ИП под тем же кодом), автоподбор СС брал ближайший по дате прайс ГЛОБАЛЬНО,
+// не различая продавцов -- и заявка одного продавца могла получить закупочную цену из прайса
+// СОВСЕМ ДРУГОГО продавца. Теперь имя файла включает slug продавца (как и sellprice_*.json ниже,
+// который для логистики/цены продажи всегда был so организован), и подбор (см. uploadsForSeller /
+// findUploadForOrderDate) сначала ищет прайс именно этого продавца, и только если для него ничего
+// не загружали -- падает назад на старые "общие" файлы без продавца в имени (ipSlug: null),
+// чтобы данные, загруженные до этого разделения, не потерялись.
 async function saveRawUploadSnapshot(parsed){
+  const ip = currentCalcIp();
   const now = new Date();
   // The calendar date must be the person's LOCAL day (todayStr()), matching how orderDate is
   // stored everywhere else. Using now.toISOString()'s UTC date here used to shift it back a day
@@ -3534,13 +3596,13 @@ async function saveRawUploadSnapshot(parsed){
   // broke СС auto-fill matching against that day's orders.
   const dateStr = todayStr(), timeStr = now.toISOString().slice(11,19).replace(/:/g,'');
   const snapshot = {
-    type:'price_upload', uploadedAt: now.toISOString(), date: dateStr,
+    type:'price_upload', uploadedAt: now.toISOString(), date: dateStr, ip,
     itemsCount: parsed.items.length,
     priceCols: parsed.priceCols.map(pc=>({ label: pc.label })),
     items: parsed.items.map(it=>({ name:it.name, article:it.article, sap:it.sap, prices: it.prices })),
   };
   try {
-    await driveCreateJSON(`price_upload_${dateStr}_${timeStr}.json`, FOLDERS.prices, snapshot);
+    await driveCreateJSON(`price_upload_${slugify(ip.name)}_${dateStr}_${timeStr}.json`, FOLDERS.prices, snapshot);
     await loadPriceHistory();
   } catch(e){
     console.error(e);
