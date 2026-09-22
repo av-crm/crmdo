@@ -214,12 +214,24 @@
           <select id="filterStatus" onchange="window.onOrdersFilterChange()"><option value="">Все статусы</option></select>
         </div>
         <div>
+          <label>Дата заявки с</label>
+          <input type="date" id="filterDateFrom" onchange="window.onOrdersFilterChange()">
+        </div>
+        <div>
+          <label>Дата заявки по</label>
+          <input type="date" id="filterDateTo" onchange="window.onOrdersFilterChange()">
+        </div>
+        <div>
           <label>Поиск (№ заявки, контрагент, клиент, артикул, телефон)</label>
           <input type="text" id="filterSearch" placeholder="Начните вводить…" oninput="window.onOrdersFilterChange()" onkeydown="if(event.key==='Enter') applyOrdersFilter()">
         </div>
         <div>
           <label>&nbsp;</label>
           <button class="btn" type="button" onclick="applyOrdersFilter()">Искать</button>
+        </div>
+        <div>
+          <label>&nbsp;</label>
+          <button class="btn secondary" type="button" onclick="window.resetOrdersFilter()">Сбросить фильтры</button>
         </div>
       </div>
       <div id="ordersGrid"></div>
@@ -235,6 +247,7 @@
         <button class="btn secondary" onclick="exportOrders('json')">Экспорт JSON</button>
         <button class="btn secondary" onclick="window.print()">Печать / PDF</button>
       </div>
+      <p class="hint">Экспорт и печать выгружают ровно тот список, что сейчас отфильтрован выше (статус, период, поиск) -- задайте период и/или статус, затем нажмите «Экспорт».</p>
     </div>
   </div>
 
@@ -529,7 +542,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.34';
+const APP_VERSION = '2026-08-08.35';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -1377,6 +1390,7 @@ async function refreshAll(){
       if(o.serialNumber === undefined) o.serialNumber = '';
       if(o.placementOverride === undefined) o.placementOverride = null;
       if(o.contactAt === undefined) o.contactAt = null;
+      if(o.callHandledAt === undefined) o.callHandledAt = null;
       if(o.deliveryAt === undefined) o.deliveryAt = null;
     });
     ordersDirty = false;
@@ -2336,7 +2350,7 @@ async function addOrder(){
   const order = {
     id: uuid(), bitrixId: null, orderNumber, orderDate: orderDateRaw || todayStr(), contragent, inn, clientName, phone,
     price: price ? Number(price) : null, cc: null, logistics: logistics ? Number(logistics) : null, delivery: null, link, article, address, comment,
-    managerComment: '', email: '', serialNumber: '', placementOverride: null, contactAt: null, deliveryAt: null,
+    managerComment: '', email: '', serialNumber: '', placementOverride: null, contactAt: null, deliveryAt: null, callHandledAt: null,
     statusId: statusId || (STATE.statuses[0] && STATE.statuses[0].id) || 'new',
     source: 'manual', createdAt: now, updatedAt: now,
   };
@@ -2812,6 +2826,10 @@ window.setOrderManagerComment = async function(id, val){
 window.setOrderContactAt = async function(id, val){
   const o = STATE.orders.find(x=>x.id===id); if(!o) return;
   o.contactAt = val || null;
+  // Новая (изменённая) дата связи означает "нужно звонить заново" -- снимаем отметку "Решено" от
+  // предыдущего раза, иначе заявка с заново проставленной датой молча не показалась бы в списке
+  // звонков, будто ею уже занимались.
+  o.callHandledAt = null;
   o.updatedAt = new Date().toISOString();
   // Дата связи -- это как раз то, по чему строится "Звонки на сегодня": менеджер мог перенести
   // звонок на завтра (заявка должна пропасть из сегодняшнего списка) или, наоборот, только что
@@ -2857,8 +2875,17 @@ function compareOrdersDefault(a, b){
 function getFilteredOrders(){
   const statusFilter = document.getElementById('filterStatus').value;
   const q = (document.getElementById('filterSearch').value || '').toLowerCase().trim();
+  // Период по "Дата заявки" (o.orderDate, строка YYYY-MM-DD -- сравнение как текст корректно
+  // работает без парсинга) -- та же граница включительно, что и в фильтре периода Отчёта по
+  // продажам (см. getPaidOrdersForReport). Экспорт/печать заявок (exportOrders/window.print) уже
+  // используют именно getFilteredOrders(), так что период автоматически применяется и к выгрузке
+  // без отдельных изменений там.
+  const dateFrom = document.getElementById('filterDateFrom').value || null;
+  const dateTo = document.getElementById('filterDateTo').value || null;
   return STATE.orders.filter(o=>{
     if(statusFilter && o.statusId !== statusFilter) return false;
+    if(dateFrom && (!o.orderDate || o.orderDate < dateFrom)) return false;
+    if(dateTo && (!o.orderDate || o.orderDate > dateTo)) return false;
     if(q){
       const hay = [o.orderNumber,o.contragent,o.clientName,o.article,o.phone,o.inn,o.address,o.comment,o.managerComment].join(' ').toLowerCase();
       if(!hay.includes(q)) return false;
@@ -3004,6 +3031,10 @@ function getTodayCallOrders(){
     if(o.contactAt.slice(0,10) > today) return false;
     const st = STATE.statuses.find(s=>s.id===o.statusId);
     if(st && st.excludeStats) return false;
+    // Звонок отмечен как "Решено" (см. setOrderCallHandled) -- висит в списке до тех пор, пока
+    // заново не поменяется сама дата "Когда связаться с клиентом" (см. setOrderContactAt, который
+    // сбрасывает этот флаг), а не до конца сессии/до перезагрузки.
+    if(o.callHandledAt) return false;
     return true;
   });
 }
@@ -3067,6 +3098,14 @@ function renderTodayCallsGrid(){
     { name:'Сумма заказа', width:'110px', formatter:(cell)=> cell!=null ? fmtMoney(cell)+' ₽' : '—' },
     { name:'Товар', width:'120px' },
     { name:'Продавец' },
+    // Отдельная кнопка "Решено" -- вместо того, чтобы заставлять менять реальный бизнес-статус
+    // заявки (Новая/В обработке/...) только ради того, чтобы убрать её из списка звонков. Пометка
+    // живёт в callHandledAt и снимается сама, как только дата связи будет проставлена заново (см.
+    // setOrderContactAt) -- то есть заявка не потеряется навсегда, если понадобится позвонить ещё раз.
+    { name:'', width:'100px', formatter:(cell)=>{
+        const d = JSON.parse(cell);
+        return gridjs.html(`<button class="btn secondary" type="button" style="font-size:11px; padding:3px 8px;" onclick="window.setOrderCallHandled('${d.id}')" title="Убрать заявку из списка звонков на сегодня">Решено</button>`);
+      }},
   ];
   const rowBase = orders.map(o=>[
     JSON.stringify({ id:o.id, orderNumber:o.orderNumber }),
@@ -3076,6 +3115,7 @@ function renderTodayCallsGrid(){
     o.price,
     o.article || '—',
     o.contragent || '—',
+    JSON.stringify({ id:o.id }),
   ]);
   CALLS_GRID = renderGridInto(CALLS_GRID, el, {
     columns, data: rowBase,
@@ -3100,6 +3140,23 @@ window.dismissTodayCallsBanner = function(){
   document.getElementById('callsBannerCard').style.display = 'none';
   document.getElementById('callsListCard').style.display = 'none';
 };
+// "Решено" -- убирает заявку из "Звонки на сегодня", НЕ трогая её реальный бизнес-статус (Новая/В
+// обработке/...): это просто отметка "с этим звонком разобрались", а не переход заявки в другое
+// состояние. Снимается автоматически, если дату связи проставят заново (см. setOrderContactAt).
+window.setOrderCallHandled = async function(id){
+  const o = STATE.orders.find(x=>x.id===id); if(!o) return;
+  o.callHandledAt = new Date().toISOString();
+  o.updatedAt = o.callHandledAt;
+  renderTodayCallsBanner();
+  if(CALLS_LIST_OPEN) renderTodayCallsGrid();
+  try {
+    await saveState();
+    toast('Заявка убрана из списка звонков', 'ok');
+  } catch(e){
+    markOrdersDirty();
+    toast('Не удалось сохранить сразу, нажмите «Сохранить изменения»: ' + e.message, 'err');
+  }
+};
 function renderOrdersPager(page, totalPages, totalCount){
   const el = document.getElementById('ordersPager');
   if(!el) return;
@@ -3122,13 +3179,24 @@ window.applyOrdersFilter = function(){
   const shown = getFilteredOrders().length;
   const sel = document.getElementById('filterStatus');
   const label = (sel.selectedOptions && sel.selectedOptions[0] && sel.selectedOptions[0].textContent) || 'Все статусы';
-  toast(`Показано ${shown} из ${total} (статус: ${label})`, 'ok');
+  const from = document.getElementById('filterDateFrom').value, to = document.getElementById('filterDateTo').value;
+  const periodLabel = (from || to) ? `, период: ${from || 'начало'} — ${to || 'сегодня'}` : '';
+  toast(`Показано ${shown} из ${total} (статус: ${label}${periodLabel})`, 'ok');
 };
-// Live typing/status-select filter changes (not the explicit "Искать" button) -- also jump back
-// to page 1 of the new filtered set, just without the toast popping up on every keystroke.
+// Live typing/status-select/date filter changes (not the explicit "Искать" button) -- also jump
+// back to page 1 of the new filtered set, just without the toast popping up on every keystroke.
 window.onOrdersFilterChange = function(){
   ordersPage = 0;
   renderOrdersGrid();
+};
+window.resetOrdersFilter = function(){
+  document.getElementById('filterStatus').value = '';
+  document.getElementById('filterDateFrom').value = '';
+  document.getElementById('filterDateTo').value = '';
+  document.getElementById('filterSearch').value = '';
+  ordersPage = 0;
+  renderOrdersGrid();
+  toast('Фильтры сброшены', 'ok');
 };
 
 function exportOrders(fmt){
@@ -3329,7 +3397,7 @@ async function importOrdersRows(rows){
       orderDate: r.orderDate || todayStr(), contragent: r.contragent, inn: r.inn,
       clientName: r.clientName, phone: r.phone, email: r.email || '',
       price: r.price, cc: null, logistics: null, delivery: null, link: '', article: r.article,
-      address: r.address, comment: r.comment, managerComment: '', serialNumber: '', placementOverride: null, contactAt: null, deliveryAt: null,
+      address: r.address, comment: r.comment, managerComment: '', serialNumber: '', placementOverride: null, contactAt: null, deliveryAt: null, callHandledAt: null,
       statusId, source: 'import', createdAt: now, updatedAt: now,
     };
     STATE.orders.unshift(order);
