@@ -148,6 +148,29 @@
   <div class="panel active" id="panel-orders">
     <div class="stats" id="orderStats"></div>
 
+    <!-- "Звонки на сегодня": лёгкое информационное сообщение (без таблиц) -- первое, что видит
+    менеджер, если по каким-то заявкам наступила (или прошла) дата "Когда связаться с клиентом".
+    По "Да" сворачивается в тонкую полоску сверху, под ней разворачивается список -- в том же
+    табличном виде, что и основной список заявок, без отдельного дизайна. По "Не сейчас" скрывается
+    до следующей перезагрузки страницы (см. CALLS_BANNER_DISMISSED). -->
+    <div class="card" id="callsBannerCard" style="display:none;">
+      <div id="callsBannerFull">
+        <p style="margin:0 0 10px;">📞 На сегодня запланированы звонки клиентам. По <strong id="callsBannerCount">0</strong> заявкам наступила дата связи.</p>
+        <div class="btn-row">
+          <button class="btn" type="button" onclick="window.showTodayCallsList()">Да, посмотреть список</button>
+          <button class="btn secondary" type="button" onclick="window.dismissTodayCallsBanner()">Не сейчас</button>
+        </div>
+      </div>
+      <div id="callsBannerStrip" style="display:none; cursor:pointer;" onclick="window.showTodayCallsList()">
+        <span class="hint">📞 Звонки на сегодня (<strong id="callsStripCount">0</strong>) — нажмите, чтобы открыть список</span>
+      </div>
+    </div>
+    <div class="card" id="callsListCard" style="display:none;">
+      <h2>Звонки на сегодня</h2>
+      <div id="callsListGrid"></div>
+      <div class="btn-row"><button class="btn secondary" type="button" onclick="window.hideTodayCallsList()">Свернуть список</button></div>
+    </div>
+
     <div class="card">
       <h2>Новая заявка</h2>
       <div class="grid-3">
@@ -506,7 +529,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.33';
+const APP_VERSION = '2026-08-08.34';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -859,6 +882,21 @@ function allowedNextStatusIds(order){
   const allowed = (rules.allowedNextIds||[]).slice();
   if(!allowed.includes(order.statusId)) allowed.push(order.statusId);
   return allowed;
+}
+// Общий рендер <option>'ов для статуса заявки -- переиспользуется и в гриде заявок, и в карточке
+// заявки (viewOrderDetails), чтобы оба места одинаково учитывали allowedNextStatusIds и защиту от
+// "статус есть у заявки, но пропал из справочника" (см. фикс мёрджа статусов в saveState): раньше
+// в этом случае <select> просто не находил совпадающий <option> и молча показывал первый статус по
+// списку ("Новая") -- выглядело так, будто статус заявки откатился, хотя на самом деле пропало само
+// название статуса. Теперь в такой ситуации явно показываем предупреждение вместо того, чтобы
+// врать про статус. Принимает как полный объект заявки, так и облегчённый {id, statusId} (грид
+// передаёт только эти два поля) -- allowedNextStatusIds использует только order.statusId.
+function statusSelectOptionsHtml(order){
+  const allowedIds = new Set(allowedNextStatusIds(order));
+  const options = STATE.statuses.filter(s=>allowedIds.has(s.id));
+  const hasCurrent = options.some(s=>s.id===order.statusId);
+  const orphanOption = (!hasCurrent && order.statusId) ? `<option value="${escapeHtml(order.statusId)}" selected>⚠ статус не в справочнике</option>` : '';
+  return orphanOption + options.map(s=>`<option value="${s.id}" ${s.id===order.statusId?'selected':''}>${escapeHtml(s.label)}</option>`).join('');
 }
 
 /* ================= GOOGLE PICKER (one-time shared-folder access, drive.file scope) ================= */
@@ -1281,6 +1319,8 @@ async function saveState(deleted){
   // Мёрдж мог подтянуть чужие заявки/оплаты, которых не было в этой вкладке -- перерисовываем,
   // чтобы экран не разошёлся с тем, что реально теперь сохранено на Диске.
   renderOrdersGrid(); renderOrderStats(); renderDebtGrid(); renderDebtPaymentsGrid(); renderSalesReportGrid();
+  renderTodayCallsBanner();
+  if(CALLS_LIST_OPEN) renderTodayCallsGrid();
 }
 
 /* ================= REFRESH ================= */
@@ -1347,6 +1387,8 @@ async function refreshAll(){
     renderStatusList();
     renderOrderStats();
     renderOrdersGrid();
+    renderTodayCallsBanner();
+    if(CALLS_LIST_OPEN) renderTodayCallsGrid();
     renderSalesReportGrid();
     renderDebtGrid();
     renderDebtPaymentsGrid();
@@ -2394,7 +2436,20 @@ window.changeOrderStatus = async function(id, statusId){
   // back made Grid.js redraw that row from its own (stale) cache -> looked like the change had
   // reverted. Re-rendering here keeps the grid's data in sync with STATE immediately.
   renderOrdersGrid();
+  // Смена статуса может добавить/убрать заявку из "Звонки на сегодня" (excludeStats-статусы вроде
+  // "Отменена"/"Завершена" исключают её из списка) -- пересчитываем баннер и, если список сейчас
+  // открыт, сам список тоже.
+  renderTodayCallsBanner();
+  if(CALLS_LIST_OPEN) renderTodayCallsGrid();
   try { await saveState(); toast('Статус обновлён', 'ok'); } catch(e){ toast('Ошибка сохранения: '+e.message, 'err'); }
+};
+// Обёртка для смены статуса ИЗ КАРТОЧКИ заявки (а не из грида): помимо самого сохранения, ещё и
+// перерисовывает саму карточку -- у неё есть подсказки, завязанные на текущий статус ("Когда
+// связаться с клиентом (статус «В обработке»)" и т.п.), и после смены статуса они должны сразу
+// обновиться, а не остаться от предыдущего состояния до закрытия/переоткрытия карточки.
+window.changeOrderStatusFromModal = async function(id, statusId){
+  await window.changeOrderStatus(id, statusId);
+  window.viewOrderDetails(id);
 };
 window.deleteOrder = async function(id){
   if(!confirm('Удалить заявку из текущего списка? (в истории на Диске она останется)')) return;
@@ -2459,6 +2514,9 @@ window.viewOrderDetails = function(id){
           <tr><th>Номер заявки</th><td>${isAdmin()
             ? `<input type="text" value="${escapeHtml(o.orderNumber||'')}" style="max-width:160px;" onchange="window.setOrderNumber('${o.id}', this.value)">`
             : escapeHtml(o.orderNumber||'—')}</td></tr>
+          <tr><th>Статус</th><td>
+            <select onchange="window.changeOrderStatusFromModal('${o.id}', this.value)" style="max-width:220px;">${statusSelectOptionsHtml(o)}</select>
+          </td></tr>
           <tr><th>Товар (артикул)</th><td>
             <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
               <strong>${escapeHtml(o.article)||'—'}</strong>
@@ -2532,7 +2590,7 @@ window.viewOrderDetails = function(id){
       <tr><th>Сумма в чеке</th><td><strong>${receiptTotal!=null?fmtMoney(receiptTotal)+' ₽':'—'}</strong> <span class="hint">(Сумма ${o.price!=null?fmtMoney(o.price)+' ₽':'—'} + Доставка ${o.delivery!=null?fmtMoney(o.delivery)+' ₽':'—'})</span></td></tr>
     </table>
 
-    <p class="hint">Все правки в этой карточке (имя, email, продавец, комментарий менеджера, серийный номер, ссылка на товар) сохраняются на Диск сразу же, без отдельной кнопки.</p>
+    <p class="hint">Все правки в этой карточке (статус, имя, email, продавец, комментарий менеджера, серийный номер, ссылка на товар) сохраняются на Диск сразу же, без отдельной кнопки.</p>
   `;
   modalBg.classList.add('show');
 };
@@ -2755,6 +2813,11 @@ window.setOrderContactAt = async function(id, val){
   const o = STATE.orders.find(x=>x.id===id); if(!o) return;
   o.contactAt = val || null;
   o.updatedAt = new Date().toISOString();
+  // Дата связи -- это как раз то, по чему строится "Звонки на сегодня": менеджер мог перенести
+  // звонок на завтра (заявка должна пропасть из сегодняшнего списка) или, наоборот, только что
+  // проставить дату на сегодня (заявка должна в список попасть) -- пересчитываем сразу.
+  renderTodayCallsBanner();
+  if(CALLS_LIST_OPEN) renderTodayCallsGrid();
   try {
     await saveState();
     toast('Дата связи с клиентом сохранена', 'ok');
@@ -2839,21 +2902,12 @@ function renderOrdersGrid(){
     { name:'Клиент' }, { name:'Телефон', width:'120px' },
     { name:'Статус', width:'160px', formatter:(cell)=>{
         const d = JSON.parse(cell);
-        const allowedIds = new Set(allowedNextStatusIds(d));
-        const options = STATE.statuses.filter(s=>allowedIds.has(s.id));
-        // Защита от "статус есть у заявки, но пропал из справочника" (см. фикс мёрджа статусов в
-        // saveState): раньше в этом случае <select> просто не находил совпадающий <option> и молча
-        // показывал первый статус по списку ("Новая") -- выглядело так, будто статус заявки
-        // откатился, хотя на самом деле пропало само название статуса. Теперь в такой ситуации явно
-        // показываем предупреждение вместо того, чтобы врать про статус.
-        const hasCurrent = options.some(s=>s.id===d.statusId);
-        const orphanOption = (!hasCurrent && d.statusId) ? `<option value="${escapeHtml(d.statusId)}" selected>⚠ статус не в справочнике</option>` : '';
         // data-order-id + data-status-id: used right after render (see syncOrdersStatusSelects
         // below) to force the DOM <select>'s real value to match STATE, in case the browser's own
         // "restore form field value on reload" behaviour clobbers our `selected` attribute with
         // whatever the user had last picked in that browser tab -- this can happen even after a
         // hard reload, independent of any Drive/JS caching, and looks identical to a sync bug.
-        return gridjs.html(`<select data-order-id="${escapeHtml(d.id)}" data-status-id="${escapeHtml(d.statusId||'')}" onchange="window.changeOrderStatus('${d.id}', this.value)" style="font-size:11px; padding:3px;">${orphanOption}${options.map(s=>`<option value="${s.id}" ${s.id===d.statusId?'selected':''}>${escapeHtml(s.label)}</option>`).join('')}</select>`);
+        return gridjs.html(`<select data-order-id="${escapeHtml(d.id)}" data-status-id="${escapeHtml(d.statusId||'')}" onchange="window.changeOrderStatus('${d.id}', this.value)" style="font-size:11px; padding:3px;">${statusSelectOptionsHtml(d)}</select>`);
       }},
     { name:'Сумма', width:'100px', formatter:(cell)=>{
         const d = JSON.parse(cell);
@@ -2932,6 +2986,120 @@ function syncOrdersStatusSelects(container){
   apply();
   setTimeout(apply, 0);
 }
+// ---- "Звонки на сегодня" ----
+// Лёгкое информационное уведомление вместо таблицы: заявка попадает в список, если у неё заполнено
+// "Когда связаться с клиентом" (o.contactAt) и эта дата уже наступила (сегодня или раньше), а сам
+// статус заявки при этом не помечен как "не учитывать в статистике" (excludeStats -- обычно
+// отменённые/завершённые) -- дёргать менеджера звонить по уже закрытым заявкам смысла нет.
+// CALLS_BANNER_DISMISSED сбрасывается только перезагрузкой страницы ("Не сейчас" молчит до конца
+// этой сессии, не насовсем) -- специально не персистится в STATE/Диск, это лёгкая UI-заглушка, а не
+// настройка.
+let CALLS_GRID = null;
+let CALLS_LIST_OPEN = false;
+let CALLS_BANNER_DISMISSED = false;
+function getTodayCallOrders(){
+  const today = todayStr();
+  return STATE.orders.filter(o=>{
+    if(!o.contactAt) return false;
+    if(o.contactAt.slice(0,10) > today) return false;
+    const st = STATE.statuses.find(s=>s.id===o.statusId);
+    if(st && st.excludeStats) return false;
+    return true;
+  });
+}
+// "Просрочено" (дата ожидаемого звонка раньше сегодняшней) / "Сегодня" -- расставляет приоритет, не
+// заставляя открывать карточку каждой заявки. Заявки, у которых дата ещё не наступила, в
+// getTodayCallOrders вообще не попадают, так что третий бейдж (на будущее) здесь не нужен.
+function contactCallBadgeHtml(o){
+  if(!o.contactAt) return '';
+  const today = todayStr();
+  const datePart = o.contactAt.slice(0,10);
+  if(datePart < today) return '<span class="badge" style="background:#dc2626;">Просрочено</span>';
+  return '<span class="badge" style="background:#d97706;">Сегодня</span>';
+}
+function renderTodayCallsBanner(){
+  const card = document.getElementById('callsBannerCard');
+  if(!card) return;
+  const orders = getTodayCallOrders();
+  if(CALLS_BANNER_DISMISSED || !orders.length){
+    card.style.display = 'none';
+    if(!orders.length){
+      CALLS_LIST_OPEN = false;
+      const listCard = document.getElementById('callsListCard');
+      if(listCard) listCard.style.display = 'none';
+    }
+    return;
+  }
+  card.style.display = '';
+  const countEl = document.getElementById('callsBannerCount'), stripCountEl = document.getElementById('callsStripCount');
+  if(countEl) countEl.textContent = orders.length;
+  if(stripCountEl) stripCountEl.textContent = orders.length;
+  document.getElementById('callsBannerFull').style.display = CALLS_LIST_OPEN ? 'none' : '';
+  document.getElementById('callsBannerStrip').style.display = CALLS_LIST_OPEN ? '' : 'none';
+}
+// Тот же табличный вид (Grid.js), что и основной список заявок, без отдельного дизайна "под
+// звонки" -- специально минималистично: № заявки → дата заказа → дата ожидаемого звонка → статус
+// заказа → сумма заказа → товар → продавец, в этом порядке.
+function renderTodayCallsGrid(){
+  const el = document.getElementById('callsListGrid');
+  if(!el) return;
+  const orders = getTodayCallOrders();
+  if(!orders.length){
+    destroyGrid(CALLS_GRID); CALLS_GRID = null;
+    el.innerHTML = '<div class="empty">Звонков на сегодня нет</div>';
+    return;
+  }
+  const columns = [
+    { name:'№ заявки', width:'90px', formatter:(cell)=>{
+        const d = JSON.parse(cell);
+        return gridjs.html(`<a class="link" href="javascript:void(0)" onclick="window.viewOrderDetails('${d.id}')" title="Открыть заявку" style="cursor:pointer;">${escapeHtml(d.orderNumber||'—')}</a>`);
+      }},
+    { name:'Дата заказа', width:'110px' },
+    { name:'Дата ожидаемого звонка', width:'190px', formatter:(cell)=>{
+        const d = JSON.parse(cell);
+        return gridjs.html(`${escapeHtml(fmtDate(d.contactAt))} ${contactCallBadgeHtml(d)}`);
+      }},
+    { name:'Статус заказа', width:'150px', formatter:(cell)=>{
+        const d = JSON.parse(cell);
+        const st = statusOf(d.statusId);
+        return gridjs.html(`<span class="badge" style="background:${st.color};">${escapeHtml(st.label)}</span>`);
+      }},
+    { name:'Сумма заказа', width:'110px', formatter:(cell)=> cell!=null ? fmtMoney(cell)+' ₽' : '—' },
+    { name:'Товар', width:'120px' },
+    { name:'Продавец' },
+  ];
+  const rowBase = orders.map(o=>[
+    JSON.stringify({ id:o.id, orderNumber:o.orderNumber }),
+    o.orderDate || '—',
+    JSON.stringify({ id:o.id, contactAt:o.contactAt }),
+    JSON.stringify({ id:o.id, statusId:o.statusId }),
+    o.price,
+    o.article || '—',
+    o.contragent || '—',
+  ]);
+  CALLS_GRID = renderGridInto(CALLS_GRID, el, {
+    columns, data: rowBase,
+    search:false, sort:false, pagination:false, className:{ table:'gridjs-wrapper' },
+  });
+}
+window.showTodayCallsList = function(){
+  CALLS_LIST_OPEN = true;
+  document.getElementById('callsBannerFull').style.display = 'none';
+  document.getElementById('callsBannerStrip').style.display = '';
+  document.getElementById('callsListCard').style.display = '';
+  renderTodayCallsGrid();
+};
+window.hideTodayCallsList = function(){
+  CALLS_LIST_OPEN = false;
+  document.getElementById('callsListCard').style.display = 'none';
+  renderTodayCallsBanner();
+};
+window.dismissTodayCallsBanner = function(){
+  CALLS_BANNER_DISMISSED = true;
+  CALLS_LIST_OPEN = false;
+  document.getElementById('callsBannerCard').style.display = 'none';
+  document.getElementById('callsListCard').style.display = 'none';
+};
 function renderOrdersPager(page, totalPages, totalCount){
   const el = document.getElementById('ordersPager');
   if(!el) return;
