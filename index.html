@@ -542,7 +542,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.35';
+const APP_VERSION = '2026-08-08.36';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -1391,6 +1391,7 @@ async function refreshAll(){
       if(o.placementOverride === undefined) o.placementOverride = null;
       if(o.contactAt === undefined) o.contactAt = null;
       if(o.callHandledAt === undefined) o.callHandledAt = null;
+      if(o.extraItems === undefined) o.extraItems = [];
       if(o.deliveryAt === undefined) o.deliveryAt = null;
     });
     ordersDirty = false;
@@ -1854,10 +1855,10 @@ function trendHtml(current, previous){
 function weekMetrics(start, end){
   const orders = STATE.orders.filter(o=>o.orderDate && o.orderDate>=start && o.orderDate<=end && !isStatsExcluded(o));
   const count = orders.length;
-  const sum = orders.reduce((a,o)=>a+(Number(o.price)||0),0);
+  const sum = orders.reduce((a,o)=>a+(orderTotalPrice(o)||0),0);
   const paid = orders.filter(isPaidLikeStatus);
   const paidCount = paid.length;
-  const paidSum = paid.reduce((a,o)=>a+(Number(o.price)||0),0);
+  const paidSum = paid.reduce((a,o)=>a+(orderTotalPrice(o)||0),0);
   // Приведено к тому же расширенному определению "оплачено", что и остальные карточки
   // (STATE.paidStatusIds, настраивается в Настройки), плюс отдельно сделка завершена -- раньше
   // здесь была узкая проверка только на литеральный id 'paid', из-за чего "Стоимость размещения"
@@ -1871,12 +1872,12 @@ function renderOrderStats(){
   const el = document.getElementById('orderStats');
   const statsOrders = STATE.orders.filter(o=>!isStatsExcluded(o));
   const total = statsOrders.length;
-  const sum = statsOrders.reduce((a,o)=>a+(Number(o.price)||0),0);
+  const sum = statsOrders.reduce((a,o)=>a+(orderTotalPrice(o)||0),0);
   // "Оплачено" here is all-time (not week-scoped) -- distinct from the "Оплачено за неделю" cards
   // further down, which are scoped to the selected week.
   const paidOrders = statsOrders.filter(isPaidLikeStatus);
   const paidCount = paidOrders.length;
-  const paidSum = paidOrders.reduce((a,o)=>a+(Number(o.price)||0),0);
+  const paidSum = paidOrders.reduce((a,o)=>a+(orderTotalPrice(o)||0),0);
   // All-time (not week-scoped) -- distinct from weekMetrics().placementSum used further down in the
   // "за неделю" row. Same broadened "оплачено" definition as the "Оплаченных заявок" cards
   // (isPaidLikeStatus -> STATE.paidStatusIds), plus сделка завершена on top (see isDealDoneStatus)
@@ -1954,14 +1955,56 @@ function todayStr(){
   const d = new Date();
   return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
 }
+// ---- Несколько товаров в одной заявке ----
+// Заявка может содержать больше одного товара (см. "Добавить товар" в карточке заявки). Первый
+// товар по-прежнему хранится в тех же полях, что и раньше (o.article/o.price/o.cc) -- это
+// сознательное решение ради обратной совместимости: весь остальной код (грид, отчёты, Долг
+// продавца, автоподбор цены, прайсовые лестницы, экспорт) как читал, так и продолжает читать эти
+// поля для заявок с одним товаром, без единой правки. Второй и далее товары лежат в
+// o.extraItems[] = [{ id, article, price, cc }]. Логистика и Доставка НЕ разбиваются по товарам --
+// это осталось единственным значением на заявку целиком (Логистика видна и правится только в
+// гриде на главном экране, Доставка -- как и раньше), поэтому у элементов extraItems нет полей
+// logistics/delivery вообще.
+function orderItems(o){
+  const primary = { id:'primary', article:o.article, price:o.price, cc:o.cc };
+  return [primary, ...((o.extraItems||[]))];
+}
+function orderItemCount(o){ return orderItems(o).length; }
+// Сумма/СС считаются известными, только если известен ХОТЯ БЫ ОДИН товар -- иначе "—", а не вводящий
+// в заблуждение 0 (ровно та же логика, что раньше была только для одного товара).
+function sumItemsFieldOrNull(items, key){
+  const vals = items.map(it=>it[key]).filter(v=>v!=null);
+  if(!vals.length) return null;
+  return +vals.reduce((s,v)=>s+Number(v),0).toFixed(2);
+}
+function orderTotalPrice(o){ return sumItemsFieldOrNull(orderItems(o), 'price'); }
+function orderTotalCC(o){ return sumItemsFieldOrNull(orderItems(o), 'cc'); }
+// Список артикулов заявки, для отчётов/экспорта, где полезна не просто "2 товара", а сам список.
+function orderArticlesList(o){ return orderItems(o).map(it=>it.article).filter(Boolean); }
+// Компактная метка для главного экрана (грид заявок): один товар -- сам артикул, как раньше;
+// несколько -- "N товаров" с русским склонением (2 товара / 5 товаров / 21 товар и т.п.).
+function pluralizeRu(n, one, few, many){
+  const n10 = n % 10, n100 = n % 100;
+  if(n10===1 && n100!==11) return one;
+  if(n10>=2 && n10<=4 && (n100<12 || n100>14)) return few;
+  return many;
+}
+function orderArticleLabel(o){
+  const items = orderItems(o);
+  if(items.length <= 1) return items[0] ? items[0].article : '';
+  return `${items.length} ${pluralizeRu(items.length, 'товар', 'товара', 'товаров')}`;
+}
 // Логистика is entered manually (₽); Стоимость размещения is always derived (цена заказа − логистика),
 // never stored/edited directly, so the two can never drift out of sync.
 // Размещение = Цена продажи − СС (закупка) − Логистика. Доставка НЕ участвует в этом расчёте
 // (было временно добавлено и откачено обратно по просьбе AV) -- Доставка используется только для
 // "Сумма в чеке" (см. setOrderDelivery). Needs all three known, otherwise shown as unavailable
-// ("—") rather than a misleading partial number.
+// ("—") rather than a misleading partial number. Цена и СС здесь -- уже СУММЫ по всем товарам
+// заявки (см. orderTotalPrice/orderTotalCC выше); для заявки с одним товаром это то же самое
+// значение, что и раньше, так что для единственного товара в заявке ничего не меняется.
 function derivedPlacement(o){
-  return (o.price!=null && o.cc!=null && o.logistics!=null) ? +(o.price - o.cc - o.logistics).toFixed(2) : null;
+  const price = orderTotalPrice(o), cc = orderTotalCC(o);
+  return (price!=null && cc!=null && o.logistics!=null) ? +(price - cc - o.logistics).toFixed(2) : null;
 }
 // placementOverride lets the admin correct a wrong auto-calculated Размещение by hand (e.g. when
 // СС/Логистика turned out inaccurate but the real placement value is known) without having to fix
@@ -1977,11 +2020,13 @@ function orderSellerReceived(o){
   const placement = orderPlacement(o);
   return (o.cc!=null && placement!=null) ? +(o.cc + placement).toFixed(2) : null;
 }
-// Сумма в чеке = Цена продажи + Доставка -- тот же расчёт, что уже используется в карточке заявки
-// (см. "Сумма в чеке" в блоке "Информация для отгрузки" и copyDeliveryInfo). Достаточно хотя бы
-// одного известного слагаемого, иначе результат "—", а не введённый в заблуждение 0.
+// Сумма в чеке = Цена продажи (сумма по всем товарам заявки) + Доставка -- тот же расчёт, что уже
+// используется в карточке заявки (см. "Сумма в чеке" в блоке "Информация для отгрузки" и
+// copyDeliveryInfo). Достаточно хотя бы одного известного слагаемого, иначе результат "—", а не
+// введённый в заблуждение 0.
 function orderReceiptTotal(o){
-  return (o.price!=null || o.delivery!=null) ? +((o.price||0) + (o.delivery||0)).toFixed(2) : null;
+  const price = orderTotalPrice(o);
+  return (price!=null || o.delivery!=null) ? +((price||0) + (o.delivery||0)).toFixed(2) : null;
 }
 // Логистика (and its knock-on effect on Размещение) is only editable up through the "Отгружена"
 // status; once an order reaches that status (or anything after it in the configured status
@@ -2254,9 +2299,19 @@ async function firstMatchAcrossCandidates(candidates, article, extractFn, snapsh
 // button can explain a zero-result run instead of a flat, unhelpful "no matches".
 async function autofillOrdersCC(orders){
   const stats = { filled:0, uploadsCount:0, candidates:0, skippedNoArticle:0, skippedNoUpload:0, skippedNoMatch:0, error:null };
-  const withoutCC = orders.filter(o=>o.cc==null);
-  stats.skippedNoArticle = withoutCC.filter(o=>!o.article).length;
-  const targets = withoutCC.filter(o=>o.article && o.orderDate);
+  // Задачи собираются по каждому ТОВАРУ, а не по заявке целиком -- у заявки с несколькими товарами
+  // (см. "Добавить товар" в карточке) СС может не хватать только у ОДНОГО из них, и остальные
+  // трогать не нужно. Для заявки с одним товаром это ровно тот же единственный "основной" товар,
+  // что проверялся и раньше -- поведение для них не меняется.
+  const tasks = [];
+  orders.forEach(o=>{
+    if(o.cc==null) tasks.push({ order:o, article:o.article, orderDate:o.orderDate, apply:(cost)=>{ o.cc = cost; } });
+    (o.extraItems||[]).forEach(it=>{
+      if(it.cc==null) tasks.push({ order:o, article:it.article, orderDate:o.orderDate, apply:(cost)=>{ it.cc = cost; } });
+    });
+  });
+  stats.skippedNoArticle = tasks.filter(t=>!t.article).length;
+  const targets = tasks.filter(t=>t.article && t.orderDate);
   stats.candidates = targets.length;
   if(!targets.length) return stats;
   let uploads;
@@ -2264,12 +2319,12 @@ async function autofillOrdersCC(orders){
   stats.uploadsCount = uploads.length;
   if(!uploads.length) return stats;
   const snapshotCache = new Map(); // fileId -> downloaded snapshot (or null)
-  for(const o of targets){
-    const sellerSlug = o.contragent ? slugify(o.contragent) : null;
-    const candidates = await candidatesForOrderDate(uploads, o.orderDate, sellerSlug, snapshotCache);
+  for(const t of targets){
+    const sellerSlug = t.order.contragent ? slugify(t.order.contragent) : null;
+    const candidates = await candidatesForOrderDate(uploads, t.orderDate, sellerSlug, snapshotCache);
     if(!candidates.length){ stats.skippedNoUpload++; continue; }
-    const cost = await firstMatchAcrossCandidates(candidates, o.article, costFromSnapshot, snapshotCache);
-    if(cost != null){ o.cc = cost; stats.filled++; } else { stats.skippedNoMatch++; }
+    const cost = await firstMatchAcrossCandidates(candidates, t.article, costFromSnapshot, snapshotCache);
+    if(cost != null){ t.apply(cost); stats.filled++; } else { stats.skippedNoMatch++; }
   }
   return stats;
 }
@@ -2350,7 +2405,7 @@ async function addOrder(){
   const order = {
     id: uuid(), bitrixId: null, orderNumber, orderDate: orderDateRaw || todayStr(), contragent, inn, clientName, phone,
     price: price ? Number(price) : null, cc: null, logistics: logistics ? Number(logistics) : null, delivery: null, link, article, address, comment,
-    managerComment: '', email: '', serialNumber: '', placementOverride: null, contactAt: null, deliveryAt: null, callHandledAt: null,
+    managerComment: '', email: '', serialNumber: '', placementOverride: null, contactAt: null, deliveryAt: null, callHandledAt: null, extraItems: [],
     statusId: statusId || (STATE.statuses[0] && STATE.statuses[0].id) || 'new',
     source: 'manual', createdAt: now, updatedAt: now,
   };
@@ -2516,32 +2571,60 @@ window.setOrderContragent = async function(id, name){
 window.viewOrderDetails = function(id){
   const o = STATE.orders.find(x=>x.id===id); if(!o) return;
   const modalBg = document.getElementById('modalBg'), modalBody = document.getElementById('modalBody');
-  const receiptTotal = (o.price!=null || o.delivery!=null) ? +((o.price||0) + (o.delivery||0)).toFixed(2) : null;
+  const receiptTotal = orderReceiptTotal(o);
+  const totalPrice = orderTotalPrice(o);
+  const totalCC = orderTotalCC(o);
+  const itemRowsHtml = orderItems(o).map(it=>{
+    const isPrimary = it.id === 'primary';
+    return `
+      <tr>
+        <td>${escapeHtml(it.article)||'—'}</td>
+        <td><input type="number" step="0.01" value="${it.price!=null?it.price:''}" style="width:100px;" onchange="window.setOrderItemField('${o.id}','${it.id}','price', this.value)"></td>
+        <td><input type="number" step="0.01" value="${it.cc!=null?it.cc:''}" style="width:100px;" onchange="window.setOrderItemField('${o.id}','${it.id}','cc', this.value)"></td>
+        <td style="white-space:nowrap;">
+          <a class="link" href="#" onclick="event.preventDefault(); ${isPrimary?`window.replaceOrderArticle('${o.id}')`:`window.replaceOrderExtraItem('${o.id}','${it.id}')`}" style="font-size:12px;" title="Подтянет СС и цену продажи из последнего загруженного прайса/расчёта, не из даты заявки">Заменить</a>${isPrimary?'':` · <a class="link" href="#" onclick="event.preventDefault(); window.removeOrderItem('${o.id}','${it.id}')" style="font-size:12px; color:#dc2626;">Убрать</a>`}
+        </td>
+      </tr>`;
+  }).join('');
   modalBody.innerHTML = `
     <button class="close" onclick="closeModal()">✕</button>
     <h2>Заявка № ${escapeHtml(o.orderNumber||'—')}</h2>
 
-    <div class="grid-2">
-      <div>
-        <h3>Заказ</h3>
-        <table class="preview">
-          <tr><th>Номер заявки</th><td>${isAdmin()
-            ? `<input type="text" value="${escapeHtml(o.orderNumber||'')}" style="max-width:160px;" onchange="window.setOrderNumber('${o.id}', this.value)">`
-            : escapeHtml(o.orderNumber||'—')}</td></tr>
-          <tr><th>Статус</th><td>
-            <select onchange="window.changeOrderStatusFromModal('${o.id}', this.value)" style="max-width:220px;">${statusSelectOptionsHtml(o)}</select>
-          </td></tr>
-          <tr><th>Товар (артикул)</th><td>
-            <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
-              <strong>${escapeHtml(o.article)||'—'}</strong>
-              <input type="text" id="modal_newArticle" placeholder="Новый артикул" style="width:140px;">
-              <button class="btn" type="button" style="font-size:12px; padding:4px 10px;" onclick="window.replaceOrderArticle('${o.id}')" title="Подтянет СС и логистику из последнего загруженного прайса/расчёта, не из даты заявки">Заменить</button>
-            </div>
-            <span class="hint" id="modal_replaceArticleHint"></span>
-          </td></tr>
-          <tr><th>Стоимость</th><td>${o.price!=null?fmtMoney(o.price)+' ₽':'—'}</td></tr>
-        </table>
-      </div>
+    <h3>Заказ</h3>
+    <table class="preview">
+      <tr><th>Номер заявки</th><td>${isAdmin()
+        ? `<input type="text" value="${escapeHtml(o.orderNumber||'')}" style="max-width:160px;" onchange="window.setOrderNumber('${o.id}', this.value)">`
+        : escapeHtml(o.orderNumber||'—')}</td></tr>
+      <tr><th>Статус</th><td>
+        <select onchange="window.changeOrderStatusFromModal('${o.id}', this.value)" style="max-width:220px;">${statusSelectOptionsHtml(o)}</select>
+      </td></tr>
+    </table>
+
+    <table class="preview" style="margin-top:10px;">
+      <thead><tr><th>Артикул</th><th>Сумма</th><th>СС</th><th></th></tr></thead>
+      <tbody>
+        ${itemRowsHtml}
+        <tr>
+          <td><strong>Итого</strong></td>
+          <td><strong>${totalPrice!=null?fmtMoney(totalPrice)+' ₽':'—'}</strong></td>
+          <td><strong>${totalCC!=null?fmtMoney(totalCC)+' ₽':'—'}</strong></td>
+          <td></td>
+        </tr>
+      </tbody>
+    </table>
+    <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-top:10px;">
+      <input type="text" id="modal_newArticle" placeholder="Артикул товара" style="width:160px;">
+      <button class="btn" type="button" style="font-size:12px; padding:4px 10px;" onclick="window.addOrderItem('${o.id}')">Добавить товар</button>
+    </div>
+    <span class="hint" id="modal_itemsHint"></span>
+    <span class="hint" id="modal_replaceArticleHint"></span>
+
+    <h3 style="margin-top:16px;">Продавец</h3>
+    <div class="field">
+      <select onchange="window.setOrderContragent('${o.id}', this.value)">${contragentOptionsHtml(o.contragent)}</select>
+    </div>
+
+    <div class="grid-2" style="margin-top:16px;">
       <div>
         <h3>Контакты клиента</h3>
         <table class="preview">
@@ -2550,21 +2633,20 @@ window.viewOrderDetails = function(id){
           <tr><th>Email</th><td><input type="email" value="${escapeHtml(o.email)}" placeholder="client@example.com" onchange="window.setOrderEmail('${o.id}', this.value)"></td></tr>
         </table>
       </div>
+      <div>
+        <h3>Доставка</h3>
+        <p><strong>Адрес:</strong> ${escapeHtml(o.address)||'—'}</p>
+        <div class="field">
+          <label>Дата и время доставки ${o.statusId==='confirmed'?'<span class="hint">(статус «Подтверждена»)</span>':''}</label>
+          <input type="datetime-local" value="${o.deliveryAt?o.deliveryAt.slice(0,16):''}" onchange="window.setOrderDeliveryAt('${o.id}', this.value)">
+        </div>
+      </div>
     </div>
 
-    <h3 style="margin-top:16px;">Адрес доставки</h3>
-    <p>${escapeHtml(o.address)||'—'}</p>
-
     <h3 style="margin-top:16px;">Сроки</h3>
-    <div class="grid-2">
-      <div class="field">
-        <label>Когда связаться с клиентом ${o.statusId==='processing'?'<span class="hint">(статус «В обработке»)</span>':''}</label>
-        <input type="datetime-local" value="${o.contactAt?o.contactAt.slice(0,16):''}" onchange="window.setOrderContactAt('${o.id}', this.value)">
-      </div>
-      <div class="field">
-        <label>Дата и время доставки ${o.statusId==='confirmed'?'<span class="hint">(статус «Подтверждена»)</span>':''}</label>
-        <input type="datetime-local" value="${o.deliveryAt?o.deliveryAt.slice(0,16):''}" onchange="window.setOrderDeliveryAt('${o.id}', this.value)">
-      </div>
+    <div class="field">
+      <label>Когда связаться с клиентом ${o.statusId==='processing'?'<span class="hint">(статус «В обработке»)</span>':''}</label>
+      <input type="datetime-local" value="${o.contactAt?o.contactAt.slice(0,16):''}" onchange="window.setOrderContactAt('${o.id}', this.value)">
     </div>
     <div class="btn-row">
       <button class="btn" type="button" onclick="window.copyDeliveryInfo('${o.id}')">Заявка для доставки</button>
@@ -2583,17 +2665,12 @@ window.viewOrderDetails = function(id){
       </div>
     </div>
 
-    <h3 style="margin-top:16px;">Продавец</h3>
-    <div class="field">
-      <select onchange="window.setOrderContragent('${o.id}', this.value)">${contragentOptionsHtml(o.contragent)}</select>
-    </div>
-
     <h3 style="margin-top:16px; display:flex; align-items:center; gap:10px;">Информация для отгрузки
       <button class="btn" type="button" style="font-size:12px; padding:4px 10px;" onclick="window.copyShippingInfo('${o.id}')">Копировать</button>
     </h3>
     <table class="preview">
       <tr><th>Номер заявки</th><td>${escapeHtml(o.orderNumber||'—')}</td></tr>
-      <tr><th>Артикул</th><td>${escapeHtml(o.article)||'—'}</td></tr>
+      <tr><th>Товары (артикулы)</th><td>${escapeHtml(orderArticlesList(o).join(', '))||'—'}</td></tr>
       <tr><th>Ссылка на товар</th><td>
         <div style="display:flex; gap:6px; align-items:center;">
           <input type="url" value="${escapeHtml(o.link||'')}" placeholder="https://…" style="flex:1; box-sizing:border-box;" onchange="window.setOrderLink('${o.id}', this.value)">
@@ -2601,10 +2678,10 @@ window.viewOrderDetails = function(id){
         </div>
       </td></tr>
       <tr><th>Серийный номер</th><td><input type="text" value="${escapeHtml(o.serialNumber||'')}" placeholder="SN-000000" style="width:100%;box-sizing:border-box;" onchange="window.setOrderSerialNumber('${o.id}', this.value)"></td></tr>
-      <tr><th>Сумма в чеке</th><td><strong>${receiptTotal!=null?fmtMoney(receiptTotal)+' ₽':'—'}</strong> <span class="hint">(Сумма ${o.price!=null?fmtMoney(o.price)+' ₽':'—'} + Доставка ${o.delivery!=null?fmtMoney(o.delivery)+' ₽':'—'})</span></td></tr>
+      <tr><th>Сумма в чеке</th><td><strong>${receiptTotal!=null?fmtMoney(receiptTotal)+' ₽':'—'}</strong> <span class="hint">(Сумма ${totalPrice!=null?fmtMoney(totalPrice)+' ₽':'—'} + Доставка ${o.delivery!=null?fmtMoney(o.delivery)+' ₽':'—'})</span></td></tr>
     </table>
 
-    <p class="hint">Все правки в этой карточке (статус, имя, email, продавец, комментарий менеджера, серийный номер, ссылка на товар) сохраняются на Диск сразу же, без отдельной кнопки.</p>
+    <p class="hint">Все правки в этой карточке (статус, товары, имя, email, продавец, комментарий менеджера, серийный номер, ссылка на товар) сохраняются на Диск сразу же, без отдельной кнопки. Логистика и Размещение здесь не показываются — эти поля доступны только на главном экране списка заявок.</p>
   `;
   modalBg.classList.add('show');
 };
@@ -2627,7 +2704,8 @@ window.setOrderClientName = async function(id, val){
 // площадки/логиста) -- то есть остаётся именно стоимость товара за вычетом логистики.
 window.copyDeliveryInfo = async function(id){
   const o = STATE.orders.find(x=>x.id===id); if(!o) return;
-  const receiptTotal = (o.price!=null || o.delivery!=null) ? +((o.price||0) + (o.delivery||0)).toFixed(2) : null;
+  const receiptTotal = orderReceiptTotal(o);
+  const totalPrice = orderTotalPrice(o);
   const returnToSeller = receiptTotal!=null ? +(receiptTotal - (o.delivery||0) - (o.logistics||0)).toFixed(2) : null;
   const text = [
     `Имя клиента: ${o.clientName || '—'}`,
@@ -2637,7 +2715,7 @@ window.copyDeliveryInfo = async function(id){
     `Комментарий менеджера: ${o.managerComment || '—'}`,
     `Общая стоимость: ${receiptTotal!=null ? fmtMoney(receiptTotal)+' ₽' : '—'}`,
     `Стоимость доставки: ${o.delivery!=null ? fmtMoney(o.delivery)+' ₽' : '—'}`,
-    `Стоимость товара: ${o.price!=null ? fmtMoney(o.price)+' ₽' : '—'}`,
+    `Стоимость товара: ${totalPrice!=null ? fmtMoney(totalPrice)+' ₽' : '—'}`,
     `Вернуть продавцу: ${returnToSeller!=null ? fmtMoney(returnToSeller)+' ₽' : '—'}`,
   ].join('\n');
   try {
@@ -2649,10 +2727,10 @@ window.copyDeliveryInfo = async function(id){
 };
 window.copyShippingInfo = async function(id){
   const o = STATE.orders.find(x=>x.id===id); if(!o) return;
-  const receiptTotal = (o.price!=null || o.delivery!=null) ? +((o.price||0) + (o.delivery||0)).toFixed(2) : null;
+  const receiptTotal = orderReceiptTotal(o);
   const text = [
     `Номер заявки: ${o.orderNumber || '—'}`,
-    `Артикул: ${o.article || '—'}`,
+    `Товары (артикулы): ${orderArticlesList(o).join(', ') || '—'}`,
     `Ссылка на товар: ${o.link || '—'}`,
     `Серийный номер: ${o.serialNumber || '—'}`,
     `Сумма в чеке: ${receiptTotal!=null ? fmtMoney(receiptTotal)+' ₽' : '—'}`,
@@ -2749,6 +2827,125 @@ window.replaceOrderArticle = async function(id){
     if(hint) hint.textContent = 'Ошибка: ' + e.message;
     toast('Ошибка замены артикула: ' + e.message, 'err');
   }
+};
+// Общий поиск СС + цены продажи для артикула у конкретного продавца -- используется и при
+// добавлении нового товара (addOrderItem), и при замене артикула у уже добавленного, не основного,
+// товара (replaceOrderExtraItem). В отличие от replaceOrderArticle (который меняет ОСНОВНОЙ товар
+// заявки и заодно логистику), здесь логистика не трогается вообще -- она не привязана к
+// конкретному товару, см. комментарий у orderItems.
+async function lookupArticlePriceForSeller(article, sellerSlug){
+  const uploads = await loadAllPriceUploadDates();
+  const sellSnaps = await loadAllSellPriceSnapshotDates();
+  const snapshotCache = new Map();
+  const uploadCandidates = await latestCandidatesForSeller(uploads, sellerSlug, snapshotCache);
+  const sellCandidates = await latestCandidatesForSeller(sellSnaps, sellerSlug, snapshotCache);
+  const cc = await firstMatchAcrossCandidates(uploadCandidates, article, costFromSnapshot, snapshotCache);
+  const price = await firstMatchAcrossCandidates(sellCandidates, article, priceFromSnapshot, snapshotCache);
+  return { cc, price };
+}
+// "Добавить товар" -- добавляет ВТОРОЙ и далее товар в заявку (первый по-прежнему хранится в
+// o.article/price/cc). Артикул берётся из общего поля #modal_newArticle (того же самого, что
+// использует "Заменить" у любого товара в списке ниже) -- подставляет СС и цену продажи из
+// последнего прайса/расчёта этого продавца, как replaceOrderArticle для основного товара, но НЕ
+// трогает логистику -- она не привязана к конкретному товару.
+window.addOrderItem = async function(id){
+  const o = STATE.orders.find(x=>x.id===id); if(!o) return;
+  const input = document.getElementById('modal_newArticle');
+  const hint = document.getElementById('modal_itemsHint');
+  const article = input ? input.value.trim() : '';
+  if(!article){ if(hint) hint.textContent = 'Укажите артикул товара'; return; }
+  if(hint) hint.textContent = 'Ищу цену закупки и цену продажи в последнем загруженном прайсе…';
+  try {
+    const sellerSlug = o.contragent ? slugify(o.contragent) : null;
+    const { cc, price } = await lookupArticlePriceForSeller(article, sellerSlug);
+    if(!o.extraItems) o.extraItems = [];
+    o.extraItems.push({ id: uuid(), article, cc: cc!=null?cc:null, price: price!=null?price:null });
+    o.updatedAt = new Date().toISOString();
+    if(input) input.value = '';
+    markOrdersDirty();
+    await saveState();
+    renderOrdersGrid();
+    const parts = [];
+    if(cc!=null) parts.push('СС'); if(price!=null) parts.push('цена продажи');
+    if(hint) hint.textContent = parts.length ? `Товар добавлен, подтянуто: ${parts.join(', ')}` : 'Товар добавлен, но в последнем прайсе/расчёте такого артикула не нашлось — заполните СС/цену вручную';
+    toast('Товар добавлен в заявку', 'ok');
+    window.viewOrderDetails(id);
+  } catch(e){
+    if(hint) hint.textContent = 'Ошибка: ' + e.message;
+    toast('Ошибка добавления товара: ' + e.message, 'err');
+  }
+};
+// "Заменить" у товара, добавленного через "Добавить товар" (не у основного -- для него по-прежнему
+// используется replaceOrderArticle). Тоже читает новый артикул из общего поля #modal_newArticle.
+window.replaceOrderExtraItem = async function(id, itemId){
+  const o = STATE.orders.find(x=>x.id===id); if(!o) return;
+  const item = (o.extraItems||[]).find(it=>it.id===itemId); if(!item) return;
+  const input = document.getElementById('modal_newArticle');
+  const hint = document.getElementById('modal_itemsHint');
+  const newArticle = input ? input.value.trim() : '';
+  if(!newArticle){ if(hint) hint.textContent = 'Укажите новый артикул'; return; }
+  if(hint) hint.textContent = 'Ищу цену закупки и цену продажи в последнем загруженном прайсе…';
+  try {
+    const sellerSlug = o.contragent ? slugify(o.contragent) : null;
+    const { cc, price } = await lookupArticlePriceForSeller(newArticle, sellerSlug);
+    item.article = newArticle;
+    item.cc = cc!=null ? cc : null;
+    item.price = price!=null ? price : null;
+    o.updatedAt = new Date().toISOString();
+    if(input) input.value = '';
+    markOrdersDirty();
+    await saveState();
+    renderOrdersGrid();
+    const parts = [];
+    if(cc!=null) parts.push('СС'); if(price!=null) parts.push('цена продажи');
+    if(hint) hint.textContent = parts.length ? `Артикул заменён, подтянуто: ${parts.join(', ')}` : 'Артикул заменён, но в последнем прайсе/расчёте такого артикула не нашлось — заполните СС/цену вручную';
+    toast('Артикул товара заменён', 'ok');
+    window.viewOrderDetails(id);
+  } catch(e){
+    if(hint) hint.textContent = 'Ошибка: ' + e.message;
+    toast('Ошибка замены артикула: ' + e.message, 'err');
+  }
+};
+// "Убрать" -- удаляет добавленный товар из заявки целиком (только для extraItems -- у основного
+// товара такой кнопки нет, заявка не может остаться совсем без товара).
+window.removeOrderItem = async function(id, itemId){
+  const o = STATE.orders.find(x=>x.id===id); if(!o) return;
+  if(!(o.extraItems||[]).some(it=>it.id===itemId)) return;
+  o.extraItems = o.extraItems.filter(it=>it.id!==itemId);
+  o.updatedAt = new Date().toISOString();
+  markOrdersDirty();
+  try {
+    await saveState();
+    toast('Товар убран из заявки', 'ok');
+  } catch(e){
+    toast('Не удалось сохранить сразу, нажмите «Сохранить изменения»: ' + e.message, 'err');
+  }
+  renderOrdersGrid();
+  window.viewOrderDetails(id);
+};
+// Ручная правка Суммы/СС конкретного товара прямо в таблице карточки -- разрешена для ЛЮБОГО
+// товара (и основного, и добавленных). В отличие от setOrderPrice/setOrderCC в гриде (которые
+// только помечают изменения "грязными" до нажатия общей кнопки "Сохранить") эта версия сохраняет
+// на Диск сразу же -- как и все остальные поля карточки заявки (см. подсказку внизу карточки).
+window.setOrderItemField = async function(id, itemId, field, val){
+  const o = STATE.orders.find(x=>x.id===id); if(!o) return;
+  const v = parseFloat(val);
+  const parsed = isNaN(v) ? null : v;
+  if(itemId==='primary'){
+    o[field] = parsed;
+  } else {
+    const item = (o.extraItems||[]).find(it=>it.id===itemId); if(!item) return;
+    item[field] = parsed;
+  }
+  o.updatedAt = new Date().toISOString();
+  try {
+    await saveState();
+    toast('Сохранено', 'ok');
+  } catch(e){
+    markOrdersDirty();
+    toast('Не удалось сохранить сразу, нажмите «Сохранить изменения»: ' + e.message, 'err');
+  }
+  renderOrdersGrid();
 };
 window.setOrderInn = function(id, val){
   const o = STATE.orders.find(x=>x.id===id); if(!o) return;
@@ -2936,12 +3133,19 @@ function renderOrdersGrid(){
         // hard reload, independent of any Drive/JS caching, and looks identical to a sync bug.
         return gridjs.html(`<select data-order-id="${escapeHtml(d.id)}" data-status-id="${escapeHtml(d.statusId||'')}" onchange="window.changeOrderStatus('${d.id}', this.value)" style="font-size:11px; padding:3px;">${statusSelectOptionsHtml(d)}</select>`);
       }},
+    // Сумма/СС -- редактируемые поля, только пока в заявке ОДИН товар (как и раньше). Как только
+    // товаров два и больше (см. "Добавить товар" в карточке заявки), это уже сумма по нескольким
+    // товарам -- редактировать её здесь одним числом было бы неоднозначно (какой из товаров
+    // менять?), поэтому грид показывает итог только для чтения, а правки -- в самой карточке,
+    // отдельно по каждому товару.
     { name:'Сумма', width:'100px', formatter:(cell)=>{
         const d = JSON.parse(cell);
+        if(d.multi) return gridjs.html(`<span title="Несколько товаров -- редактируется в карточке заявки">${d.price!=null?fmtMoney(d.price):'—'}</span>`);
         return gridjs.html(`<input type="number" value="${d.price!=null?d.price:''}" placeholder="0.00" step="0.01" style="width:85px;font-size:12px;padding:4px;border:1px solid var(--border);border-radius:6px;" onchange="window.setOrderPrice('${d.id}', this.value)">`);
       }},
     { name:'СС, ₽', width:'100px', formatter:(cell)=>{
         const d = JSON.parse(cell);
+        if(d.multi) return gridjs.html(`<span title="Несколько товаров -- редактируется в карточке заявки">${d.cc!=null?fmtMoney(d.cc):'—'}</span>`);
         return gridjs.html(`<input type="number" value="${d.cc!=null?d.cc:''}" placeholder="0.00" step="0.01" style="width:85px;font-size:12px;padding:4px;border:1px solid var(--border);border-radius:6px;" onchange="window.setOrderCC('${d.id}', this.value)">`);
       }},
     { name:'Доставка, ₽', width:'100px', formatter:(cell)=>{
@@ -2963,8 +3167,8 @@ function renderOrdersGrid(){
     JSON.stringify({ id:o.id, orderDate:o.orderDate }),
     o.clientName, o.phone,
     JSON.stringify({ id:o.id, statusId:o.statusId }),
-    JSON.stringify({ id:o.id, price:o.price }),
-    JSON.stringify({ id:o.id, cc:o.cc }),
+    JSON.stringify({ id:o.id, price:orderTotalPrice(o), multi: orderItemCount(o)>1 }),
+    JSON.stringify({ id:o.id, cc:orderTotalCC(o), multi: orderItemCount(o)>1 }),
     JSON.stringify({ id:o.id, delivery:o.delivery }),
     JSON.stringify({ id:o.id, logistics:o.logistics, locked: isLogisticsLocked(o) }),
   ]);
@@ -2980,10 +3184,13 @@ function renderOrdersGrid(){
     data.forEach((o,i)=> rowBase[i].push(JSON.stringify({ id:o.id, override:o.placementOverride, auto: derivedPlacement(o) })));
   }
   columns.push(
-    { name:'Артикул', width:'90px' },
+    { name:'Артикул', width:'90px', formatter:(cell)=>{
+        const d = JSON.parse(cell);
+        return gridjs.html(d.multi ? `<a class="link" href="javascript:void(0)" onclick="window.viewOrderDetails('${d.id}')" title="${escapeHtml(d.articles.join(', '))}" style="cursor:pointer;">${escapeHtml(d.label)}</a>` : escapeHtml(d.label));
+      }},
     { name:'Контрагент' },
   );
-  data.forEach((o,i)=> rowBase[i].push(o.article, o.contragent));
+  data.forEach((o,i)=> rowBase[i].push(JSON.stringify({ id:o.id, label: orderArticleLabel(o), multi: orderItemCount(o)>1, articles: orderArticlesList(o) }), o.contragent));
   ORDERS_GRID = renderGridInto(ORDERS_GRID, el, {
     columns,
     data: rowBase,
@@ -3112,8 +3319,8 @@ function renderTodayCallsGrid(){
     o.orderDate || '—',
     JSON.stringify({ id:o.id, contactAt:o.contactAt }),
     JSON.stringify({ id:o.id, statusId:o.statusId }),
-    o.price,
-    o.article || '—',
+    orderTotalPrice(o),
+    orderArticleLabel(o) || '—',
     o.contragent || '—',
     JSON.stringify({ id:o.id }),
   ]);
@@ -3205,13 +3412,16 @@ function exportOrders(fmt){
   // Размещение -- только у админа, см. renderOrdersGrid.
   const isAdmin = currentUserEmail === ADMIN_EMAIL;
   const rows = data.map(o=>{
+    // Сумма/СС -- суммы по всем товарам заявки (см. orderTotalPrice/orderTotalCC); для заявки с
+    // одним товаром это то же самое значение, что было и раньше. Артикул -- список через запятую,
+    // если товаров несколько.
     const row = {
       '№ заявки': o.orderNumber, 'Дата заявки': o.orderDate, Клиент: o.clientName, Телефон: o.phone, Email: o.email,
-      Статус: statusOf(o.statusId).label, Сумма: o.price, 'Доставка, ₽': o.delivery, 'СС, ₽': o.cc, 'Логистика, ₽': o.logistics,
+      Статус: statusOf(o.statusId).label, Сумма: orderTotalPrice(o), 'Доставка, ₽': o.delivery, 'СС, ₽': orderTotalCC(o), 'Логистика, ₽': o.logistics,
     };
     if(isAdmin) row['Размещение, ₽'] = orderPlacement(o);
     Object.assign(row, {
-      Артикул: o.article, Контрагент: o.contragent, ИНН: o.inn,
+      Артикул: orderArticlesList(o).join(', '), Контрагент: o.contragent, ИНН: o.inn,
       Ссылка: o.link, 'Адрес доставки': o.address, Комментарий: o.comment, 'Комментарий менеджера': o.managerComment,
     });
     return row;
@@ -3397,7 +3607,7 @@ async function importOrdersRows(rows){
       orderDate: r.orderDate || todayStr(), contragent: r.contragent, inn: r.inn,
       clientName: r.clientName, phone: r.phone, email: r.email || '',
       price: r.price, cc: null, logistics: null, delivery: null, link: '', article: r.article,
-      address: r.address, comment: r.comment, managerComment: '', serialNumber: '', placementOverride: null, contactAt: null, deliveryAt: null, callHandledAt: null,
+      address: r.address, comment: r.comment, managerComment: '', serialNumber: '', placementOverride: null, contactAt: null, deliveryAt: null, callHandledAt: null, extraItems: [],
       statusId, source: 'import', createdAt: now, updatedAt: now,
     };
     STATE.orders.unshift(order);
@@ -3654,7 +3864,7 @@ function computeSalesReportTotals(data){
   return {
     count: data.length,
     receiptTotal: data.reduce((a,o)=>a+(orderReceiptTotal(o)||0),0),
-    cc: data.reduce((a,o)=>a+(o.cc!=null?Number(o.cc):0),0),
+    cc: data.reduce((a,o)=>a+(orderTotalCC(o)||0),0),
     logistics: data.reduce((a,o)=>a+(o.logistics!=null?Number(o.logistics):0),0),
     placement: data.reduce((a,o)=>a+(orderPlacement(o)||0),0),
     sellerReceived: data.reduce((a,o)=>a+(orderSellerReceived(o)||0),0),
@@ -3699,15 +3909,15 @@ function renderSalesReportGrid(){
       { name:'Продавец', width:'160px' },
       { name:'ИНН', width:'110px' },
     ],
-    data: data.map(o=>[ o.orderNumber, fmtDateLabel(o.orderDate), o.article, o.serialNumber||'—', orderReceiptTotal(o), o.cc, o.logistics, orderPlacement(o), orderSellerReceived(o), o.contragent||'—', o.inn ]),
+    data: data.map(o=>[ o.orderNumber, fmtDateLabel(o.orderDate), orderArticlesList(o).join(', ')||'—', o.serialNumber||'—', orderReceiptTotal(o), orderTotalCC(o), o.logistics, orderPlacement(o), orderSellerReceived(o), o.contragent||'—', o.inn ]),
     search:true, sort:true, pagination:{ limit:15, resetPageOnUpdate:false }, className:{ table:'gridjs-wrapper' },
   });
 }
 function buildSalesReportRows(){
   const data = getPaidOrdersForReport();
   const rows = data.map(o=>({
-    'Номер заявки': o.orderNumber, 'Дата заявки': fmtDateLabel(o.orderDate), 'Артикул': o.article,
-    'Серийный номер': o.serialNumber || '', 'Сумма чека': orderReceiptTotal(o), 'СС': o.cc, 'Логистика': o.logistics,
+    'Номер заявки': o.orderNumber, 'Дата заявки': fmtDateLabel(o.orderDate), 'Артикул': orderArticlesList(o).join(', '),
+    'Серийный номер': o.serialNumber || '', 'Сумма чека': orderReceiptTotal(o), 'СС': orderTotalCC(o), 'Логистика': o.logistics,
     'Стоимость размещения': orderPlacement(o), 'Сумма полученная продавцом': orderSellerReceived(o),
     'Продавец': o.contragent || '', 'ИНН': o.inn,
   }));
