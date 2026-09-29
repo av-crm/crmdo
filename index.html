@@ -141,6 +141,7 @@
     <button class="tab-btn" data-tab="prices" onclick="switchTab('prices')">Прайсы</button>
     <button class="tab-btn" data-tab="reports" onclick="switchTab('reports')">Отчёты</button>
     <button class="tab-btn" data-tab="debt" onclick="switchTab('debt')">Долг продавца</button>
+    <button class="tab-btn" data-tab="reconcile" onclick="switchTab('reconcile')">Сверка</button>
     <button class="tab-btn" data-tab="settings" onclick="switchTab('settings')">Настройки</button>
   </div>
 
@@ -366,6 +367,26 @@
     </div>
   </div>
 
+  <!-- RECONCILE TAB -->
+  <div class="panel" id="panel-reconcile">
+    <div class="card">
+      <h2>Сверка</h2>
+      <p class="hint">Укажите артикул и дату — система найдёт самый свежий прайс закупки и расчёт цены продажи, действовавшие не позже этой даты (среди всех продавцов), и покажет название документа, продавца и цену.</p>
+      <div class="btn-row" style="align-items:flex-end;">
+        <div class="field" style="max-width:220px;">
+          <label>Артикул</label>
+          <input type="text" id="reconcile_article" placeholder="Артикул товара">
+        </div>
+        <div class="field" style="max-width:180px;">
+          <label>Дата</label>
+          <input type="date" id="reconcile_date">
+        </div>
+        <button class="btn" type="button" onclick="window.runReconcile()">Проверить</button>
+      </div>
+      <div id="reconcile_result" style="margin-top:14px;"></div>
+    </div>
+  </div>
+
   <!-- SETTINGS TAB -->
   <div class="panel" id="panel-settings">
     <div class="card">
@@ -452,6 +473,7 @@
           <label style="display:flex;align-items:center;gap:4px;font-size:12px;font-weight:400;"><input type="checkbox" class="u_section" value="prices" checked style="width:auto;"> Прайсы</label>
           <label style="display:flex;align-items:center;gap:4px;font-size:12px;font-weight:400;"><input type="checkbox" class="u_section" value="reports" checked style="width:auto;"> Отчёты</label>
           <label style="display:flex;align-items:center;gap:4px;font-size:12px;font-weight:400;"><input type="checkbox" class="u_section" value="debt" checked style="width:auto;"> Долг продавца</label>
+          <label style="display:flex;align-items:center;gap:4px;font-size:12px;font-weight:400;"><input type="checkbox" class="u_section" value="reconcile" checked style="width:auto;"> Сверка</label>
           <label style="display:flex;align-items:center;gap:4px;font-size:12px;font-weight:400;"><input type="checkbox" class="u_section" value="settings" checked style="width:auto;"> Настройки</label>
         </div>
       </div>
@@ -542,7 +564,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.36';
+const APP_VERSION = '2026-08-08.37';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -612,6 +634,7 @@ const ACCESS_SECTIONS = [
   { id:'prices', label:'Прайсы' },
   { id:'reports', label:'Отчёты' },
   { id:'debt', label:'Долг продавца' },
+  { id:'reconcile', label:'Сверка' },
   { id:'settings', label:'Настройки' },
 ];
 let currentUserEmail = null;
@@ -1437,6 +1460,102 @@ function switchTab(name){
   if(name==='reports'){ renderReportContragentFilter(); renderSalesReportGrid(); }
   if(name==='debt'){ renderDebtGrid(); renderDebtPaymentsGrid(); }
 }
+// ================= RECONCILE (Сверка) =================
+// Простая проверка "что было в прайсе на такую-то дату по такому-то артикулу", без привязки к
+// конкретной заявке или продавцу -- по запросу AV, чтобы можно было руками свериться с исходным
+// документом. Ищет СРЕДИ ВСЕХ продавцов сразу (в отличие от autofillOrdersCC/replaceOrderArticle,
+// которые всегда скоуплены к продавцу конкретной заявки) -- намеренно: сверка нужна именно тогда,
+// когда неизвестно заранее, чей это был прайс, или когда нужно увидеть все совпадения. Дата -- как
+// и везде в приложении: берётся самый свежий документ НЕ ПОЗЖЕ указанной даты, а не точное
+// совпадение (см. большой комментарий у candidatesForOrderDate).
+//
+// Имя продавца для отображения: файлы несут только slug (из имени файла) или, для старых
+// безымянных файлов, ip.name внутри содержимого (см. resolveUploadSellerSlug) -- это не то же
+// самое, что читаемое имя контрагента. Сопоставляем slug с текущим каталогом контрагентов
+// (CALC_IP_LIST) по slugify(ip.name); если совпадения нет (контрагента переименовали/удалили,
+// либо файл вообще не идентифицирован), показываем как есть -- сам slug или "не определён".
+function sellerNameForSlug(slug){
+  if(slug == null) return 'не определён';
+  const match = (CALC_IP_LIST||[]).find(ip=>slugify(ip.name) === slug);
+  return match ? match.name : slug;
+}
+// Ищет по ВСЕМ файлам сразу (продавец не фильтруется) самый свежий документ каждого вида (прайс
+// закупки / расчёт наценки) на дату <= dateStr, где для articleRaw нашлась непустая цена -- пробуя,
+// как и everywhere в приложении, от новых к старым, если самый свежий подходящий по дате файл
+// вдруг не содержит именно этот артикул. Оба вида ищутся независимо друг от друга: может найтись
+// только СС, только цена продажи, обе, или ни одной.
+async function reconcileArticleAtDate(articleRaw, dateStr){
+  const result = { cc:null, ccFile:null, ccSeller:null, price:null, priceFile:null, priceSeller:null };
+  const [uploads, sellSnaps] = await Promise.all([loadAllPriceUploadDates(), loadAllSellPriceSnapshotDates()]);
+  const snapshotCache = new Map();
+  const uploadCandidates = uploads.filter(u=>u.date <= dateStr)
+    .sort((a,b)=> b.date.localeCompare(a.date) || new Date(b.createdTime) - new Date(a.createdTime));
+  const sellCandidates = sellSnaps.filter(u=>u.date <= dateStr)
+    .sort((a,b)=> b.date.localeCompare(a.date) || new Date(b.createdTime) - new Date(a.createdTime));
+  async function findFirstMatch(candidates, extractFn){
+    for(const c of candidates){
+      let snap = snapshotCache.get(c.fileId);
+      if(snap === undefined){
+        try { snap = await driveDownloadJSON(c.fileId); } catch(e){ console.error(e); snap = null; }
+        snapshotCache.set(c.fileId, snap);
+      }
+      const value = extractFn(snap, articleRaw);
+      if(value != null) return { value, file:c };
+    }
+    return null;
+  }
+  const ccHit = await findFirstMatch(uploadCandidates, costFromSnapshot);
+  if(ccHit){
+    result.cc = ccHit.value;
+    result.ccFile = ccHit.file;
+    result.ccSeller = sellerNameForSlug(await resolveUploadSellerSlug(ccHit.file, snapshotCache));
+  }
+  const priceHit = await findFirstMatch(sellCandidates, priceFromSnapshot);
+  if(priceHit){
+    result.price = priceHit.value;
+    result.priceFile = priceHit.file;
+    result.priceSeller = sellerNameForSlug(await resolveUploadSellerSlug(priceHit.file, snapshotCache));
+  }
+  return result;
+}
+window.runReconcile = async function(){
+  const articleEl = document.getElementById('reconcile_article');
+  const dateEl = document.getElementById('reconcile_date');
+  const resultEl = document.getElementById('reconcile_result');
+  const article = articleEl ? articleEl.value.trim() : '';
+  const dateStr = dateEl ? dateEl.value : '';
+  if(!article || !dateStr){
+    if(resultEl) resultEl.innerHTML = '<p class="hint">Укажите артикул и дату.</p>';
+    return;
+  }
+  if(resultEl) resultEl.innerHTML = '<p class="hint">Ищу…</p>';
+  try {
+    const r = await reconcileArticleAtDate(article, dateStr);
+    if(!r.ccFile && !r.priceFile){
+      resultEl.innerHTML = `<p class="hint">Ничего не нашлось — нет ни одного прайса/расчёта не позже ${fmtDateLabel(dateStr)}, где встречается артикул «${escapeHtml(article)}».</p>`;
+      return;
+    }
+    const rows = [];
+    if(r.ccFile){
+      rows.push(`<tr><th>Закупочная цена (СС)</th><td><strong>${fmtMoney(r.cc)} ₽</strong></td></tr>`);
+      rows.push(`<tr><th>Документ (закупка)</th><td>${escapeHtml(r.ccFile.title || '—')} <span class="hint">(от ${fmtDateLabel(r.ccFile.date)})</span></td></tr>`);
+      rows.push(`<tr><th>Продавец (закупка)</th><td>${escapeHtml(r.ccSeller)}</td></tr>`);
+    } else {
+      rows.push(`<tr><th>Закупочная цена (СС)</th><td class="hint">не найдена</td></tr>`);
+    }
+    if(r.priceFile){
+      rows.push(`<tr><th>Цена продажи</th><td><strong>${fmtMoney(r.price)} ₽</strong></td></tr>`);
+      rows.push(`<tr><th>Документ (продажа)</th><td>${escapeHtml(r.priceFile.title || '—')} <span class="hint">(от ${fmtDateLabel(r.priceFile.date)})</span></td></tr>`);
+      rows.push(`<tr><th>Продавец (продажа)</th><td>${escapeHtml(r.priceSeller)}</td></tr>`);
+    } else {
+      rows.push(`<tr><th>Цена продажи</th><td class="hint">не найдена</td></tr>`);
+    }
+    resultEl.innerHTML = `<table class="preview">${rows.join('')}</table>`;
+  } catch(e){
+    resultEl.innerHTML = '';
+    toast('Ошибка сверки: ' + e.message, 'err');
+  }
+};
 
 /* ================= STATUSES ================= */
 function renderStatusSelects(){
@@ -2178,7 +2297,7 @@ async function loadAllPriceUploadDates(){
   (r.files||[]).forEach(f=>{
     const parsed = parsePriceUploadFilename(f.title);
     if(!parsed) return;
-    list.push({ date: parsed.date, fileId: f.id, ipSlug: parsed.ipSlug, createdTime: f.createdTime });
+    list.push({ date: parsed.date, fileId: f.id, ipSlug: parsed.ipSlug, createdTime: f.createdTime, title: f.title });
   });
   return list.sort((a,b)=> a.date.localeCompare(b.date) || new Date(a.createdTime) - new Date(b.createdTime));
 }
@@ -2196,7 +2315,7 @@ async function loadAllSellPriceSnapshotDates(){
   files.forEach(f=>{
     const m = f.title.match(/^sellprice_(.+)_(\d{4}-\d{2}-\d{2})_\d{6}\.json$/);
     if(!m) return;
-    list.push({ date: m[2], fileId: f.id, ipSlug: m[1], createdTime: f.createdTime });
+    list.push({ date: m[2], fileId: f.id, ipSlug: m[1], createdTime: f.createdTime, title: f.title });
   });
   return list.sort((a,b)=> a.date.localeCompare(b.date) || new Date(a.createdTime) - new Date(b.createdTime));
 }
