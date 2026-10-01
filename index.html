@@ -487,7 +487,7 @@
   <div class="panel" id="panel-reports">
     <div class="card">
       <h2>Статусы по номерам заявок</h2>
-      <p class="hint">Вставьте номера заявок — через запятую, пробел или каждый с новой строки — и получите их актуальный статус.</p>
+      <p class="hint">Вставьте номера заявок — через запятую, пробел или каждый с новой строки — и получите их актуальный статус. При большой выборке можно отметить нужные заявки галочками и сменить статус сразу у всех.</p>
       <div class="field">
         <label>Номера заявок</label>
         <textarea id="statusLookupInput" rows="3" placeholder="Например: 2060, 2058, 2056"></textarea>
@@ -497,6 +497,16 @@
         <button class="btn secondary" onclick="window.clearOrderStatusLookup()">Очистить</button>
       </div>
       <div id="statusLookupResult"></div>
+      <div id="statusLookupBulkBar" style="display:none; margin-top:10px;">
+        <div class="btn-row" style="align-items:flex-end; flex-wrap:wrap;">
+          <div class="field" style="max-width:220px;">
+            <label>Новый статус для отмеченных</label>
+            <select id="statusLookupBulkStatus"></select>
+          </div>
+          <button class="btn" type="button" onclick="window.applyBulkStatusFromLookup()">Применить ко всем отмеченным</button>
+          <span class="hint" id="statusLookupBulkHint"></span>
+        </div>
+      </div>
     </div>
     <div class="card">
       <h2>Отчёт по продажам</h2>
@@ -564,7 +574,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.37';
+const APP_VERSION = '2026-08-08.38';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -3947,21 +3957,34 @@ function parseOrderNumbersInput(raw){
 function findOrdersByNumber(number){
   return STATE.orders.filter(o=>String(o.orderNumber||'').trim() === number);
 }
+// Массовая смена статуса (по запросу AV: "при большой выборке" — список заявок найден по номерам
+// здесь же) работает поверх ЭТОГО результата поиска: каждая найденная строка получает чекбокс,
+// "Выбрать все" переключает их разом, а применяется статус только к отмеченным и только найденным
+// заявкам (строки "не найдена" чекбокса не получают вовсе). Панель массовой смены статуса скрыта,
+// пока нет ни одной найденной заявки -- нечего применять.
 window.runOrderStatusLookup = function(){
   const input = document.getElementById('statusLookupInput');
   const resultEl = document.getElementById('statusLookupResult');
+  const bulkBar = document.getElementById('statusLookupBulkBar');
   const numbers = parseOrderNumbersInput(input.value);
-  if(!numbers.length){ resultEl.innerHTML = '<p class="hint">Введите хотя бы один номер заявки</p>'; return; }
+  if(!numbers.length){
+    resultEl.innerHTML = '<p class="hint">Введите хотя бы один номер заявки</p>';
+    if(bulkBar) bulkBar.style.display = 'none';
+    return;
+  }
   const rows = [];
+  let foundCount = 0;
   numbers.forEach(num=>{
     const matches = findOrdersByNumber(num);
     if(!matches.length){
-      rows.push(`<tr><td>${escapeHtml(num)}</td><td colspan="4" style="color:#dc2626;">Заявка не найдена</td></tr>`);
+      rows.push(`<tr><td></td><td>${escapeHtml(num)}</td><td colspan="4" style="color:#dc2626;">Заявка не найдена</td></tr>`);
       return;
     }
     matches.forEach(o=>{
+      foundCount++;
       const st = statusOf(o.statusId);
       rows.push(`<tr>
+        <td><input type="checkbox" class="statusLookupCheck" data-order-id="${o.id}" checked style="width:auto;"></td>
         <td><a class="link" href="javascript:void(0)" onclick="window.viewOrderDetails('${o.id}')" style="cursor:pointer;">${escapeHtml(o.orderNumber||'—')}</a></td>
         <td><span style="display:inline-block; width:9px; height:9px; border-radius:50%; background:${escapeHtml(st.color||'#94a3b8')}; margin-right:5px;"></span>${escapeHtml(st.label)}</td>
         <td>${o.orderDate?fmtDateLabel(o.orderDate):'—'}</td>
@@ -3970,14 +3993,72 @@ window.runOrderStatusLookup = function(){
       </tr>`);
     });
   });
-  resultEl.innerHTML = `<table class="preview">
-    <tr><th>№ заявки</th><th>Статус</th><th>Дата заявки</th><th>Клиент</th><th>Артикул</th></tr>
-    ${rows.join('')}
-  </table>`;
+  resultEl.innerHTML = `
+    ${foundCount ? `<label style="display:flex; align-items:center; gap:4px; font-size:12px; font-weight:400; margin-bottom:6px;"><input type="checkbox" id="statusLookupSelectAll" checked onchange="window.toggleAllStatusLookupSelection(this.checked)" style="width:auto;"> Выбрать все (${foundCount})</label>` : ''}
+    <table class="preview">
+      <tr><th></th><th>№ заявки</th><th>Статус</th><th>Дата заявки</th><th>Клиент</th><th>Артикул</th></tr>
+      ${rows.join('')}
+    </table>`;
+  if(bulkBar){
+    bulkBar.style.display = foundCount ? '' : 'none';
+    if(foundCount){
+      const sel = document.getElementById('statusLookupBulkStatus');
+      if(sel) sel.innerHTML = STATE.statuses.map(s=>`<option value="${s.id}">${escapeHtml(s.label)}</option>`).join('');
+      const hint = document.getElementById('statusLookupBulkHint');
+      if(hint) hint.textContent = '';
+    }
+  }
 };
 window.clearOrderStatusLookup = function(){
   document.getElementById('statusLookupInput').value = '';
   document.getElementById('statusLookupResult').innerHTML = '';
+  const bulkBar = document.getElementById('statusLookupBulkBar');
+  if(bulkBar) bulkBar.style.display = 'none';
+};
+window.toggleAllStatusLookupSelection = function(checked){
+  document.querySelectorAll('.statusLookupCheck').forEach(cb=>{ cb.checked = checked; });
+};
+// Применяется только к отмеченным и только там, где переход в выбранный статус вообще разрешён
+// этому конкретному заказу (allowedNextStatusIds) -- как и везде, не только в гриде по одной
+// заявке: не-админ с настроенным statusRules.restrictedStatusId может отметить и заявки, переход
+// которых запрещён, и это не должно тихо проходить -- такие просто пропускаются, а не блокируют
+// применение ко всем остальным, и итог явно сообщает, сколько применилось и сколько пропущено.
+// Одно сохранение на Диск в конце, а не по одной заявке -- иначе при большой выборке (ради которой
+// и делалась эта кнопка) пришлось бы ждать по одному сетевому запросу на каждую заявку.
+window.applyBulkStatusFromLookup = async function(){
+  const hint = document.getElementById('statusLookupBulkHint');
+  const statusSel = document.getElementById('statusLookupBulkStatus');
+  const newStatusId = statusSel ? statusSel.value : '';
+  if(!newStatusId) return;
+  const ids = Array.from(document.querySelectorAll('.statusLookupCheck:checked')).map(cb=>cb.dataset.orderId);
+  if(!ids.length){ if(hint) hint.textContent = 'Отметьте хотя бы одну заявку из списка'; return; }
+  const st = statusOf(newStatusId);
+  if(!confirm(`Сменить статус у отмеченных заявок (${ids.length} шт.) на «${st.label}»?`)) return;
+  let applied = 0, skipped = 0;
+  const now = new Date().toISOString();
+  ids.forEach(id=>{
+    const o = STATE.orders.find(x=>x.id===id);
+    if(!o || !allowedNextStatusIds(o).includes(newStatusId)){ skipped++; return; }
+    o.statusId = newStatusId;
+    o.updatedAt = now;
+    applied++;
+  });
+  renderOrderStats();
+  renderOrdersGrid();
+  renderTodayCallsBanner();
+  if(CALLS_LIST_OPEN) renderTodayCallsGrid();
+  window.runOrderStatusLookup(); // перерисовать результат поиска со свежими статусами
+  if(!applied){
+    if(hint) hint.textContent = '';
+    toast(`Ни одна заявка не изменена — переход в «${st.label}» недоступен для отмеченных`, 'err');
+    return;
+  }
+  try {
+    await saveState();
+    toast(skipped ? `Статус изменён у ${applied} из ${ids.length} (${skipped} пропущено — переход недоступен)` : `Статус изменён у ${applied} заявок`, 'ok');
+  } catch(e){
+    toast('Ошибка сохранения: ' + e.message, 'err');
+  }
 };
 function computeSalesReportTotals(data){
   return {
