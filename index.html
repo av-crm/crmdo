@@ -574,7 +574,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.38';
+const APP_VERSION = '2026-08-08.40';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -2147,7 +2147,8 @@ function orderPlacement(o){
 // не расходиться с колонкой "Размещение, ₽" того же отчёта. Оба слагаемых обязательны -- иначе "—".
 function orderSellerReceived(o){
   const placement = orderPlacement(o);
-  return (o.cc!=null && placement!=null) ? +(o.cc + placement).toFixed(2) : null;
+  const cc = orderTotalCC(o); // сумма СС по всем товарам заявки (для одного товара == o.cc)
+  return (cc!=null && placement!=null) ? +(cc + placement).toFixed(2) : null;
 }
 // Сумма в чеке = Цена продажи (сумма по всем товарам заявки) + Доставка -- тот же расчёт, что уже
 // используется в карточке заявки (см. "Сумма в чеке" в блоке "Информация для отгрузки" и
@@ -4060,12 +4061,20 @@ window.applyBulkStatusFromLookup = async function(){
     toast('Ошибка сохранения: ' + e.message, 'err');
   }
 };
+// В отчёте по продажам "Логистика" = Логистика + Доставка по каждой заявке (по запросу AV), чтобы
+// колонки сходились с "Суммой чека" (Сумма + Доставка): Сумма чека − СС − Логистика(с доставкой) =
+// Размещение. Само поле o.logistics и расчёт Размещения не меняются -- это только отображение/
+// выгрузка отчёта. Если не заполнено ни то, ни другое -- null ("—").
+function reportLogistics(o){
+  if(o.logistics==null && o.delivery==null) return null;
+  return +((Number(o.logistics)||0) + (Number(o.delivery)||0)).toFixed(2);
+}
 function computeSalesReportTotals(data){
   return {
     count: data.length,
     receiptTotal: data.reduce((a,o)=>a+(orderReceiptTotal(o)||0),0),
     cc: data.reduce((a,o)=>a+(orderTotalCC(o)||0),0),
-    logistics: data.reduce((a,o)=>a+(o.logistics!=null?Number(o.logistics):0),0),
+    logistics: data.reduce((a,o)=>a+(reportLogistics(o)||0),0),
     placement: data.reduce((a,o)=>a+(orderPlacement(o)||0),0),
     sellerReceived: data.reduce((a,o)=>a+(orderSellerReceived(o)||0),0),
   };
@@ -4109,7 +4118,7 @@ function renderSalesReportGrid(){
       { name:'Продавец', width:'160px' },
       { name:'ИНН', width:'110px' },
     ],
-    data: data.map(o=>[ o.orderNumber, fmtDateLabel(o.orderDate), orderArticlesList(o).join(', ')||'—', o.serialNumber||'—', orderReceiptTotal(o), orderTotalCC(o), o.logistics, orderPlacement(o), orderSellerReceived(o), o.contragent||'—', o.inn ]),
+    data: data.map(o=>[ o.orderNumber, fmtDateLabel(o.orderDate), orderArticlesList(o).join(', ')||'—', o.serialNumber||'—', orderReceiptTotal(o), orderTotalCC(o), reportLogistics(o), orderPlacement(o), orderSellerReceived(o), o.contragent||'—', o.inn ]),
     search:true, sort:true, pagination:{ limit:15, resetPageOnUpdate:false }, className:{ table:'gridjs-wrapper' },
   });
 }
@@ -4117,7 +4126,7 @@ function buildSalesReportRows(){
   const data = getPaidOrdersForReport();
   const rows = data.map(o=>({
     'Номер заявки': o.orderNumber, 'Дата заявки': fmtDateLabel(o.orderDate), 'Артикул': orderArticlesList(o).join(', '),
-    'Серийный номер': o.serialNumber || '', 'Сумма чека': orderReceiptTotal(o), 'СС': orderTotalCC(o), 'Логистика': o.logistics,
+    'Серийный номер': o.serialNumber || '', 'Сумма чека': orderReceiptTotal(o), 'СС': orderTotalCC(o), 'Логистика': reportLogistics(o),
     'Стоимость размещения': orderPlacement(o), 'Сумма полученная продавцом': orderSellerReceived(o),
     'Продавец': o.contragent || '', 'ИНН': o.inn,
   }));
