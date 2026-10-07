@@ -574,7 +574,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.40';
+const APP_VERSION = '2026-08-08.41';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -1319,6 +1319,7 @@ async function saveState(deleted){
   const deletedOrderIds = (deleted && deleted.orders && deleted.orders.length) ? new Set(deleted.orders) : null;
   const deletedPaymentIds = (deleted && deleted.sellerPayments && deleted.sellerPayments.length) ? new Set(deleted.sellerPayments) : null;
   const deletedLadderIds = (deleted && deleted.priceLadders && deleted.priceLadders.length) ? new Set(deleted.priceLadders) : null;
+  const deletedStatusIds = (deleted && deleted.statuses && deleted.statuses.length) ? new Set(deleted.statuses) : null;
   await ensureDataFolders();
   // Подтягиваем самую свежую версию с Диска прямо перед записью и мёрджим -- сужает окно гонки
   // почти до нуля (см. mergeById выше). Читаем через "текущий" файл (loadSection), а не старым
@@ -1341,7 +1342,10 @@ async function saveState(deleted){
     // выпадающий список в таблице не находит совпадение и показывает первый статус по умолчанию
     // ("Новая") -- выглядит так, будто изменение не сохранилось, хотя на самом деле пропал именно
     // статус-справочник. Чиним тем же способом, что и для заявок/долга: мёрдж по id.
-    STATE.statuses = mergeById(STATE.statuses, (freshSettingsData && freshSettingsData.statuses) || []);
+    // deletedStatusIds: удалённый нарочно статус не должен "воскресать" из свежей версии на Диске
+    // (та же причина, что у заявок/оплат/лестниц выше) -- именно так кнопка "Удалить" у статуса
+    // казалась неработающей: статус удалялся локально, но тут же возвращался из settings_current.json.
+    STATE.statuses = mergeById(STATE.statuses, (freshSettingsData && freshSettingsData.statuses) || [], deletedStatusIds);
     STATE.users = mergeById(STATE.users, (freshSettingsData && freshSettingsData.users) || []);
     STATE.priceLadders = mergeById(STATE.priceLadders, (freshSettingsData && freshSettingsData.priceLadders) || [], deletedLadderIds);
   } catch(e){
@@ -1745,7 +1749,7 @@ async function deleteStatus(id){
     if(STATE.statusRules.allowedNextIds) STATE.statusRules.allowedNextIds = STATE.statusRules.allowedNextIds.filter(x=>x!==id);
   }
   renderStatusList(); renderStatusSelects(); renderOrdersGrid(); renderStatusRulesForm(); renderReportStatusFilter();
-  try { await saveState(); toast('Статус удалён', 'ok'); } catch(e){ toast('Ошибка сохранения: '+e.message, 'err'); }
+  try { await saveState({ statuses: [id] }); toast('Статус удалён', 'ok'); } catch(e){ toast('Ошибка сохранения: '+e.message, 'err'); }
 }
 function statusOf(id){ return STATE.statuses.find(s=>s.id===id) || { id, label:'Неизвестно', color:'#94a3b8' }; }
 // Statuses can be flagged "не в статистике" (e.g. a "Тест" status) — such orders stay fully
