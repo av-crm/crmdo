@@ -574,7 +574,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.41';
+const APP_VERSION = '2026-08-08.42';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -2839,18 +2839,22 @@ window.setOrderClientName = async function(id, val){
 window.copyDeliveryInfo = async function(id){
   const o = STATE.orders.find(x=>x.id===id); if(!o) return;
   const receiptTotal = orderReceiptTotal(o);
-  const totalPrice = orderTotalPrice(o);
-  const returnToSeller = receiptTotal!=null ? +(receiptTotal - (o.delivery||0) - (o.logistics||0)).toFixed(2) : null;
+  // Формат (по запросу AV): Общая стоимость = стоимость товара + доставка; Стоимость = логистика +
+  // доставка (та же reportLogistics, что в отчёте по продажам); Вернуть продавцу = Общая − Стоимость.
+  const cost = reportLogistics(o);
+  const returnToSeller = receiptTotal!=null ? +(receiptTotal - (cost||0)).toFixed(2) : null;
+  const money = v => v!=null ? fmtMoney(v)+' ₽' : '—';
   const text = [
+    `Заказ: ${o.contragent || '—'}`,
+    `Номер заявки: ${o.orderNumber || '—'}`,
+    `Артикул: ${orderArticlesList(o).join(', ') || '—'}`,
     `Имя клиента: ${o.clientName || '—'}`,
     `Контактный телефон: ${o.phone || '—'}`,
     `Адрес доставки: ${o.address || '—'}`,
     `Дата доставки: ${o.deliveryAt ? o.deliveryAt.replace('T', ' ') : '—'}`,
-    `Комментарий менеджера: ${o.managerComment || '—'}`,
-    `Общая стоимость: ${receiptTotal!=null ? fmtMoney(receiptTotal)+' ₽' : '—'}`,
-    `Стоимость доставки: ${o.delivery!=null ? fmtMoney(o.delivery)+' ₽' : '—'}`,
-    `Стоимость товара: ${totalPrice!=null ? fmtMoney(totalPrice)+' ₽' : '—'}`,
-    `Вернуть продавцу: ${returnToSeller!=null ? fmtMoney(returnToSeller)+' ₽' : '—'}`,
+    `Общая стоимость: ${money(receiptTotal)}`,
+    `Стоимость: ${money(cost)}`,
+    `Вернуть продавцу: ${money(returnToSeller)}`,
   ].join('\n');
   try {
     await navigator.clipboard.writeText(text);
