@@ -574,7 +574,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.42';
+const APP_VERSION = '2026-08-08.43';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -1273,6 +1273,7 @@ async function loadLatestState(){
       dealDoneStatusId: (settingsData && settingsData.dealDoneStatusId) || null,
       paidStatusIds: (settingsData && settingsData.paidStatusIds) || null,
       priceLadders: (settingsData && settingsData.priceLadders) || null,
+      deletedStatusIds: (settingsData && settingsData.deletedStatusIds) || [],
     };
   }
   // Nothing in the new locations at all -- either a brand-new Drive folder, or data that was only
@@ -1319,7 +1320,13 @@ async function saveState(deleted){
   const deletedOrderIds = (deleted && deleted.orders && deleted.orders.length) ? new Set(deleted.orders) : null;
   const deletedPaymentIds = (deleted && deleted.sellerPayments && deleted.sellerPayments.length) ? new Set(deleted.sellerPayments) : null;
   const deletedLadderIds = (deleted && deleted.priceLadders && deleted.priceLadders.length) ? new Set(deleted.priceLadders) : null;
-  const deletedStatusIds = (deleted && deleted.statuses && deleted.statuses.length) ? new Set(deleted.statuses) : null;
+  // Удалённые статусы запоминаются НАВСЕГДА (STATE.deletedStatusIds хранится в settings) -- иначе
+  // любая другая вкладка/устройство с устаревшим списком статусов при следующем сохранении
+  // возвращала бы удалённый статус обратно (он есть в её памяти, и мёрдж по id его "спасал").
+  if(deleted && deleted.statuses && deleted.statuses.length){
+    STATE.deletedStatusIds = Array.from(new Set([...(STATE.deletedStatusIds||[]), ...deleted.statuses]));
+  }
+  const deletedStatusIds = (STATE.deletedStatusIds && STATE.deletedStatusIds.length) ? new Set(STATE.deletedStatusIds) : null;
   await ensureDataFolders();
   // Подтягиваем самую свежую версию с Диска прямо перед записью и мёрджим -- сужает окно гонки
   // почти до нуля (см. mergeById выше). Читаем через "текущий" файл (loadSection), а не старым
@@ -1345,7 +1352,10 @@ async function saveState(deleted){
     // deletedStatusIds: удалённый нарочно статус не должен "воскресать" из свежей версии на Диске
     // (та же причина, что у заявок/оплат/лестниц выше) -- именно так кнопка "Удалить" у статуса
     // казалась неработающей: статус удалялся локально, но тут же возвращался из settings_current.json.
-    STATE.statuses = mergeById(STATE.statuses, (freshSettingsData && freshSettingsData.statuses) || [], deletedStatusIds);
+    // Тумбстоуны, записанные другими вкладками/аккаунтами, тоже учитываем.
+    const mergedTomb = new Set([...(STATE.deletedStatusIds||[]), ...((freshSettingsData && freshSettingsData.deletedStatusIds)||[])]);
+    STATE.deletedStatusIds = Array.from(mergedTomb);
+    STATE.statuses = mergeById(STATE.statuses, (freshSettingsData && freshSettingsData.statuses) || [], mergedTomb.size ? mergedTomb : null);
     STATE.users = mergeById(STATE.users, (freshSettingsData && freshSettingsData.users) || []);
     STATE.priceLadders = mergeById(STATE.priceLadders, (freshSettingsData && freshSettingsData.priceLadders) || [], deletedLadderIds);
   } catch(e){
@@ -1355,7 +1365,7 @@ async function saveState(deleted){
   const ts = STATE.savedAt.replace(/[:.]/g,'-');
   const ordersPayload = { orders: STATE.orders, savedAt: STATE.savedAt };
   const debtPayload = { sellerPayments: STATE.sellerPayments, savedAt: STATE.savedAt };
-  const settingsPayload = { statuses: STATE.statuses, users: STATE.users, statusRules: STATE.statusRules, dealDoneStatusId: STATE.dealDoneStatusId, paidStatusIds: STATE.paidStatusIds, priceLadders: STATE.priceLadders, savedAt: STATE.savedAt };
+  const settingsPayload = { statuses: STATE.statuses, users: STATE.users, statusRules: STATE.statusRules, dealDoneStatusId: STATE.dealDoneStatusId, paidStatusIds: STATE.paidStatusIds, priceLadders: STATE.priceLadders, deletedStatusIds: STATE.deletedStatusIds || [], savedAt: STATE.savedAt };
   await Promise.all([
     // История версий -- как и раньше, ничего не удаляется и не перезаписывается.
     driveCreateJSON(`orders_${ts}.json`, FOLDERS.orders, ordersPayload),
@@ -1379,7 +1389,9 @@ async function refreshAll(){
   try {
     const loaded = await loadLatestState();
     if(loaded){
+      STATE.deletedStatusIds = Array.from(new Set([...(STATE.deletedStatusIds||[]), ...(loaded.deletedStatusIds||[])]));
       STATE.statuses = (loaded.statuses && loaded.statuses.length) ? loaded.statuses : DEFAULT_STATUSES;
+      if(STATE.deletedStatusIds.length) STATE.statuses = STATE.statuses.filter(s=>!STATE.deletedStatusIds.includes(s.id));
       // mergeById, а не голая перезапись -- иначе заявка/оплата/лестница, только что добавленная
       // локально (unshift в STATE) и ещё не долетевшая до Диска (её saveState() ещё выполняется --
       // ждёт autofillOrdersCC/Logistics), безвозвратно стирается из памяти, если в этот момент
