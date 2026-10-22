@@ -574,7 +574,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.43';
+const APP_VERSION = '2026-08-08.44';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -4183,11 +4183,27 @@ function exportSalesReportCsv(){
 /* ================= SELLER DEBT (ДП) ================= */
 // ДП per seller (grouped by ИНН) = sum of "Размещение" across that seller's completed (done)
 // orders, minus the sum of manually-entered placement payments for that ИНН.
+// ИНН заявки: собственный o.inn, а если он пуст (старые заявки, созданные до появления поля) --
+// ИНН контрагента из каталога CALC_IP_LIST по точному имени. Так заявки одного продавца не
+// раскалываются на две строки в Долге продавца ("(без ИНН)" и настоящий ИНН).
+function orderInn(o){
+  const own = String(o.inn||'').trim();
+  if(own) return own;
+  const ip = o.contragent ? (CALC_IP_LIST||[]).find(x=>x.name===o.contragent) : null;
+  if(ip && ip.inn) return String(ip.inn).trim();
+  // Запасной вариант: имени нет в каталоге -- берём ИНН других заявок того же продавца, но только
+  // если он однозначный (один и тот же везде), иначе не гадаем.
+  if(o.contragent){
+    const inns = new Set(STATE.orders.filter(x=>x.contragent===o.contragent && String(x.inn||'').trim()).map(x=>String(x.inn).trim()));
+    if(inns.size === 1) return Array.from(inns)[0];
+  }
+  return '';
+}
 function computeSellerDebts(){
   const doneOrders = STATE.orders.filter(o=>isDealDoneStatus(o) && !isStatsExcluded(o));
   const byInn = new Map();
   doneOrders.forEach(o=>{
-    const key = (o.inn||'').trim() || '(без ИНН)';
+    const key = orderInn(o) || '(без ИНН)';
     if(!byInn.has(key)) byInn.set(key, { inn:key, contragents:new Set(), ordersCount:0, placementSum:0 });
     const rec = byInn.get(key);
     if(o.contragent) rec.contragents.add(o.contragent);
