@@ -576,7 +576,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.47';
+const APP_VERSION = '2026-08-08.48';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -1352,44 +1352,51 @@ function pickVersionsToPrune(files, prefix, nowMs){
   });
   return versions.filter(f=>!keep.has(f.id));
 }
-async function collectVersionsToPrune(){
+// collectStats (необязательный объект) заполняется диагностикой: сколько всего файлов-версий найдено
+// в каждой папке -- чтобы по результату было видно, ЧТО именно нашла очистка.
+async function collectVersionsToPrune(collectStats){
+  await ensureDataFolders();
   const targets = [ [FOLDERS.orders,'orders_'], [FOLDERS.debt,'debt_'], [FOLDERS.config,'settings_'] ];
   let toTrash = [];
   for(const [folderId, prefix] of targets){
     if(!folderId) continue;
     const files = await listFolderFilesPaged(folderId, prefix);
-    toTrash = toTrash.concat(pickVersionsToPrune(files, prefix, Date.now()));
+    const toPrune = pickVersionsToPrune(files, prefix, Date.now());
+    if(collectStats) collectStats[prefix] = { total: files.length, prune: toPrune.length };
+    toTrash = toTrash.concat(toPrune);
   }
   return toTrash;
 }
 async function trashFilesParallel(toTrash, onProgress){
-  let done = 0, failed = 0;
+  let done = 0, failed = 0, firstError = '';
   const queue = toTrash.slice();
   async function worker(){
     while(queue.length){
       const f = queue.shift();
-      try { await driveTrashFile(f.id); } catch(e){ failed++; console.error(e); }
+      try { await driveTrashFile(f.id); } catch(e){ failed++; if(!firstError) firstError = e.message; console.error(e); }
       done++;
       if(onProgress && done % 20 === 0) onProgress(done);
     }
   }
   await Promise.all([worker(), worker(), worker(), worker()]);
-  return { done, failed };
+  return { done, failed, firstError };
 }
 window.pruneOldVersions = async function(){
   const hint = document.getElementById('pruneHint');
   if(!isAdmin()){ toast('Очистка доступна только администратору', 'err'); return; }
   try {
     if(hint) hint.textContent = 'Считаю старые версии…';
-    const toTrash = await collectVersionsToPrune();
-    if(!toTrash.length){ if(hint) hint.textContent = 'Старых версий для очистки нет.'; return; }
+    const stats = {};
+    const toTrash = await collectVersionsToPrune(stats);
+    const foundInfo = Object.keys(stats).map(k=>`${k} — найдено ${stats[k].total}, к очистке ${stats[k].prune}`).join('; ');
+    if(!toTrash.length){ if(hint) hint.textContent = `Старых версий для очистки нет. (${foundInfo || 'папки не найдены'})`; return; }
     if(!confirm(`Старых версий к очистке: ${toTrash.length}. Они будут перемещены в Корзину Google Диска (останутся последние 30 версий и по одной за каждый из последних 30 дней). Продолжить?`)){
       if(hint) hint.textContent = '';
       return;
     }
-    const { done, failed } = await trashFilesParallel(toTrash, n=>{ if(hint) hint.textContent = `Очищено ${n} из ${toTrash.length}…`; });
-    if(hint) hint.textContent = `Готово: перемещено в Корзину ${done - failed} из ${toTrash.length}${failed?`, ошибок: ${failed}`:''}.`;
-    toast('Старые версии перемещены в Корзину', 'ok');
+    const { done, failed, firstError } = await trashFilesParallel(toTrash, n=>{ if(hint) hint.textContent = `Очищено ${n} из ${toTrash.length}…`; });
+    if(hint) hint.textContent = `Перемещено в Корзину ${done - failed} из ${toTrash.length}${failed?`, не удалось: ${failed} (${firstError})`:''}. (${foundInfo})`;
+    toast(failed ? `Не удалось переместить ${failed} файлов — см. подробности под кнопкой` : 'Старые версии перемещены в Корзину', failed ? 'err' : 'ok');
   } catch(e){
     if(hint) hint.textContent = 'Ошибка: ' + e.message;
     toast('Ошибка очистки: ' + e.message, 'err');
