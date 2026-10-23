@@ -574,7 +574,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.44';
+const APP_VERSION = '2026-08-08.45';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -3691,6 +3691,9 @@ function parseResellOrdersXlsx(buf){
       address: client.address, comment: client.comment, email: client.email,
       contragent: r['Продавец']!=null ? String(r['Продавец']).trim() : '',
       price: (price!=null && !isNaN(price)) ? price : null,
+      // "Ссылка на товар" -- необязательная колонка (в старых выгрузках её нет), поэтому не входит в
+      // required выше; кладётся в поле заявки link ("Ссылка на товар" в карточке).
+      link: r['Ссылка на товар']!=null ? String(r['Ссылка на товар']).trim() : '',
     };
   }).filter(r=>r.bitrixId);
 }
@@ -3747,16 +3750,24 @@ async function importOrdersRows(rows){
   // номером уже существует -- пропускаем эту строку". String(...) на случай если где-то номер
   // хранится как число, а где-то как строка -- иначе Set не считает их совпадающими.
   const existingNumbers = new Set(STATE.orders.map(o=>o.orderNumber).filter(Boolean).map(String));
-  let added = 0, skipped = 0;
+  let added = 0, skipped = 0, linksFilled = 0;
   const now = new Date().toISOString();
   const newOrders = [];
+  const existingByNumber = new Map(STATE.orders.filter(o=>o.orderNumber).map(o=>[String(o.orderNumber), o]));
   rows.forEach(r=>{
-    if(r.orderNumber && existingNumbers.has(String(r.orderNumber))){ skipped++; return; }
+    if(r.orderNumber && existingNumbers.has(String(r.orderNumber))){
+      skipped++;
+      // Уже существующая заявка: если у неё ссылка на товар пуста, а в файле есть -- дозаполняем
+      // (ранние импорты шли без ссылок). Непустую ссылку никогда не перезаписываем.
+      const ex = existingByNumber.get(String(r.orderNumber));
+      if(ex && r.link && !String(ex.link||'').trim()){ ex.link = r.link; ex.updatedAt = now; linksFilled++; }
+      return;
+    }
     const order = {
       id: uuid(), bitrixId: r.bitrixId, orderNumber: r.orderNumber,
       orderDate: r.orderDate || todayStr(), contragent: r.contragent, inn: r.inn,
       clientName: r.clientName, phone: r.phone, email: r.email || '',
-      price: r.price, cc: null, logistics: null, delivery: null, link: '', article: r.article,
+      price: r.price, cc: null, logistics: null, delivery: null, link: r.link || '', article: r.article,
       address: r.address, comment: r.comment, managerComment: '', serialNumber: '', placementOverride: null, contactAt: null, deliveryAt: null, callHandledAt: null, extraItems: [],
       statusId, source: 'import', createdAt: now, updatedAt: now,
     };
@@ -3770,7 +3781,7 @@ async function importOrdersRows(rows){
     await autofillOrdersCC(newOrders);
     await autofillOrdersLogistics(newOrders);
   }
-  hint.textContent = `Готово: добавлено ${added}, пропущено (уже есть в CRM) ${skipped}.`;
+  hint.textContent = `Готово: добавлено ${added}, пропущено (уже есть в CRM) ${skipped}.` + (linksFilled ? ` Дозаполнено ссылок у существующих заявок: ${linksFilled}.` : '');
   toast(`Импортировано заявок: ${added}${skipped?(', пропущено: '+skipped):''}`, 'ok');
   renderOrderStats(); renderOrdersGrid();
   try { await saveState(); } catch(e){ toast('Заявки импортированы локально, но не сохранились на Диск: ' + e.message, 'err'); }
