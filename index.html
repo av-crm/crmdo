@@ -444,7 +444,7 @@
     </div>
     <div class="card">
       <h2>Хранилище</h2>
-      <p class="hint">Все данные хранятся в вашем Google Диске в папке <b>CRM_Данные</b>, в виде JSON-файлов, разложенных по подпапкам: Заявки, Прайсы, Долг продавца и Настройки (там же — список пользователей и их прав). Копия-версия в историю пишется не чаще раза в 15 минут (текущее состояние сохраняется при каждой правке). Если на Диске заканчивается место — очистите старые версии.</p>
+      <p class="hint">Все данные хранятся в вашем Google Диске в папке <b>CRM_Данные</b>, в виде JSON-файлов, разложенных по подпапкам: Заявки, Прайсы, Долг продавца и Настройки (там же — список пользователей и их прав). Копия-версия в историю пишется не чаще раза в 15 минут (текущее состояние сохраняется при каждой правке). Старые версии (кроме последних 30 и по одной за каждый из последних 30 дней) автоматически отправляются в Корзину раз в сутки, когда CRM открывает администратор; кнопкой ниже можно сделать это сразу.</p>
       <div class="btn-row">
         <a class="btn secondary" id="driveLink2" href="#" target="_blank" style="text-decoration:none;">Открыть папку CRM_Данные на Диске</a>
         <button class="btn secondary" type="button" onclick="window.pruneOldVersions()">Очистить старые версии</button>
@@ -576,7 +576,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.46';
+const APP_VERSION = '2026-08-08.47';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -1038,7 +1038,7 @@ async function driveFetch(url, options){
       }
     } catch(_e){ /* not JSON, keep raw slice */ }
     if(/storageQuotaExceeded/.test(detail)){
-      throw new Error('Закончилось место на Google Диске — освободите место (Настройки → Хранилище → «Очистить старые версии», затем очистите Корзину Диска). Технически: Drive API ' + res.status + ': ' + detail);
+      throw new Error('Закончилось место на Google Диске — освободите место (квота считается по аккаунту того, кто сохраняет: проверьте хранилище своего Google-аккаунта на drive.google.com/settings/storage). Технически: Drive API ' + res.status + ': ' + detail);
     }
     throw new Error('Drive API ' + res.status + ': ' + detail + ' [url: ' + url.split('?')[0] + (url.includes('q=') ? ' q=' + decodeURIComponent((url.split('q=')[1]||'').split('&')[0]) : '') + ']');
   }
@@ -1352,41 +1352,67 @@ function pickVersionsToPrune(files, prefix, nowMs){
   });
   return versions.filter(f=>!keep.has(f.id));
 }
+async function collectVersionsToPrune(){
+  const targets = [ [FOLDERS.orders,'orders_'], [FOLDERS.debt,'debt_'], [FOLDERS.config,'settings_'] ];
+  let toTrash = [];
+  for(const [folderId, prefix] of targets){
+    if(!folderId) continue;
+    const files = await listFolderFilesPaged(folderId, prefix);
+    toTrash = toTrash.concat(pickVersionsToPrune(files, prefix, Date.now()));
+  }
+  return toTrash;
+}
+async function trashFilesParallel(toTrash, onProgress){
+  let done = 0, failed = 0;
+  const queue = toTrash.slice();
+  async function worker(){
+    while(queue.length){
+      const f = queue.shift();
+      try { await driveTrashFile(f.id); } catch(e){ failed++; console.error(e); }
+      done++;
+      if(onProgress && done % 20 === 0) onProgress(done);
+    }
+  }
+  await Promise.all([worker(), worker(), worker(), worker()]);
+  return { done, failed };
+}
 window.pruneOldVersions = async function(){
   const hint = document.getElementById('pruneHint');
   if(!isAdmin()){ toast('Очистка доступна только администратору', 'err'); return; }
   try {
     if(hint) hint.textContent = 'Считаю старые версии…';
-    const targets = [ [FOLDERS.orders,'orders_'], [FOLDERS.debt,'debt_'], [FOLDERS.config,'settings_'] ];
-    let toTrash = [];
-    for(const [folderId, prefix] of targets){
-      if(!folderId) continue;
-      const files = await listFolderFilesPaged(folderId, prefix);
-      toTrash = toTrash.concat(pickVersionsToPrune(files, prefix, Date.now()));
-    }
+    const toTrash = await collectVersionsToPrune();
     if(!toTrash.length){ if(hint) hint.textContent = 'Старых версий для очистки нет.'; return; }
-    if(!confirm(`Старых версий к очистке: ${toTrash.length}. Они будут перемещены в Корзину Google Диска (останутся последние 30 версий и по одной за каждый из последних 30 дней). Чтобы место реально освободилось, потом очистите Корзину на drive.google.com. Продолжить?`)){
+    if(!confirm(`Старых версий к очистке: ${toTrash.length}. Они будут перемещены в Корзину Google Диска (останутся последние 30 версий и по одной за каждый из последних 30 дней). Продолжить?`)){
       if(hint) hint.textContent = '';
       return;
     }
-    let done = 0, failed = 0;
-    const queue = toTrash.slice();
-    async function worker(){
-      while(queue.length){
-        const f = queue.shift();
-        try { await driveTrashFile(f.id); } catch(e){ failed++; console.error(e); }
-        done++;
-        if(hint && done % 20 === 0) hint.textContent = `Очищено ${done} из ${toTrash.length}…`;
-      }
-    }
-    await Promise.all([worker(), worker(), worker(), worker()]);
-    if(hint) hint.textContent = `Готово: перемещено в Корзину ${done - failed} из ${toTrash.length}${failed?`, ошибок: ${failed}`:''}. Теперь очистите Корзину на Google Диске, чтобы освободить место.`;
+    const { done, failed } = await trashFilesParallel(toTrash, n=>{ if(hint) hint.textContent = `Очищено ${n} из ${toTrash.length}…`; });
+    if(hint) hint.textContent = `Готово: перемещено в Корзину ${done - failed} из ${toTrash.length}${failed?`, ошибок: ${failed}`:''}.`;
     toast('Старые версии перемещены в Корзину', 'ok');
   } catch(e){
     if(hint) hint.textContent = 'Ошибка: ' + e.message;
     toast('Ошибка очистки: ' + e.message, 'err');
   }
 };
+// Автоочистка: раз в сутки (на этом браузере) под админом, без вопросов и без тостов -- тот же
+// набор правил, что у кнопки выше (30 последних версий + по одной за каждый из последних 30 дней).
+// Версии -- полные копии всех данных на момент сохранения, актуальное состояние лежит в *_current.json,
+// так что удаляются только старые "точки отката". Любой сбой молча игнорируется.
+const PRUNE_LAST_KEY = 'crm_last_prune_at';
+let PRUNE_RUNNING = false;
+async function maybeAutoPrune(){
+  if(PRUNE_RUNNING || !isAdmin()) return;
+  try {
+    const last = Number(localStorage.getItem(PRUNE_LAST_KEY)) || 0;
+    if(Date.now() - last < 24*3600*1000) return;
+    PRUNE_RUNNING = true;
+    const toTrash = await collectVersionsToPrune();
+    if(toTrash.length) await trashFilesParallel(toTrash);
+    localStorage.setItem(PRUNE_LAST_KEY, String(Date.now()));
+  } catch(e){ console.error('Автоочистка старых версий не удалась:', e); }
+  finally { PRUNE_RUNNING = false; }
+}
 // deleted -- необязательный { orders: [ids...], sellerPayments: [ids...] } со списком id, которые
 // эта же операция только что нарочно удалила локально -- см. комментарий у mergeById выше про то,
 // почему без этого удаление молча откатывается при следующем сохранении.
@@ -1556,6 +1582,7 @@ async function refreshAll(){
     // have to fully reload the page rather than just clicking "Обновить данные" to see their new
     // access, since STATE.users is only refreshed by this function.
     applyAccessControl();
+    maybeAutoPrune(); // не ждём: фоновая очистка старых версий раз в сутки (только админ)
   } catch(e){
     console.error(e);
     document.getElementById('syncInfo').textContent = 'Ошибка загрузки данных.';
