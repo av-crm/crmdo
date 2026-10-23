@@ -444,9 +444,11 @@
     </div>
     <div class="card">
       <h2>Хранилище</h2>
-      <p class="hint">Все данные хранятся в вашем Google Диске в папке <b>CRM_Данные</b>, в виде JSON-файлов, разложенных по подпапкам: Заявки, Прайсы, Долг продавца и Настройки (там же — список пользователей и их прав). Каждое сохранение создаёт новую версию — так сохраняется полная история изменений, ничего не перезаписывается.</p>
+      <p class="hint">Все данные хранятся в вашем Google Диске в папке <b>CRM_Данные</b>, в виде JSON-файлов, разложенных по подпапкам: Заявки, Прайсы, Долг продавца и Настройки (там же — список пользователей и их прав). Копия-версия в историю пишется не чаще раза в 15 минут (текущее состояние сохраняется при каждой правке). Если на Диске заканчивается место — очистите старые версии.</p>
       <div class="btn-row">
         <a class="btn secondary" id="driveLink2" href="#" target="_blank" style="text-decoration:none;">Открыть папку CRM_Данные на Диске</a>
+        <button class="btn secondary" type="button" onclick="window.pruneOldVersions()">Очистить старые версии</button>
+        <span class="hint" id="pruneHint"></span>
       </div>
     </div>
     <div class="card">
@@ -574,7 +576,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.45';
+const APP_VERSION = '2026-08-08.46';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -1035,6 +1037,9 @@ async function driveFetch(url, options){
         detail = [errObj.message, first.reason, first.location].filter(Boolean).join(' | ');
       }
     } catch(_e){ /* not JSON, keep raw slice */ }
+    if(/storageQuotaExceeded/.test(detail)){
+      throw new Error('Закончилось место на Google Диске — освободите место (Настройки → Хранилище → «Очистить старые версии», затем очистите Корзину Диска). Технически: Drive API ' + res.status + ': ' + detail);
+    }
     throw new Error('Drive API ' + res.status + ': ' + detail + ' [url: ' + url.split('?')[0] + (url.includes('q=') ? ' q=' + decodeURIComponent((url.split('q=')[1]||'').split('&')[0]) : '') + ']');
   }
   return res;
@@ -1313,6 +1318,75 @@ function mergeById(localArr, remoteArr, deletedIds){
   });
   return Array.from(byId.values());
 }
+const HISTORY_MIN_INTERVAL_MS = 15 * 60 * 1000;
+const HISTORY_LAST_KEY = 'crm_last_history_write_at';
+// ---- Очистка старых версий (Настройки → Хранилище) ----
+// Оставляет по каждому виду (orders_/debt_/settings_): 30 самых свежих версий + самую свежую версию
+// каждого дня за последние 30 дней. Остальное отправляется в КОРЗИНУ Диска (не удаляется насовсем) --
+// но корзина тоже занимает место, пока её не очистят, поэтому после очистки нужно очистить Корзину.
+// Файлы *_current.json и legacy state_* не трогаются.
+async function listFolderFilesPaged(folderId, prefix){
+  const out = [];
+  let pageToken = '';
+  do {
+    const params = new URLSearchParams({ q: `'${folderId}' in parents and name contains '${prefix}' and trashed=false`, pageSize:'1000', fields:'nextPageToken,files(id,name,createdTime)' });
+    if(pageToken) params.set('pageToken', pageToken);
+    const res = await driveFetch('https://www.googleapis.com/drive/v3/files?' + params.toString());
+    const data = await res.json();
+    (data.files||[]).forEach(f=>out.push({ id:f.id, title:f.name, createdTime:f.createdTime }));
+    pageToken = data.nextPageToken || '';
+  } while(pageToken);
+  return out;
+}
+function pickVersionsToPrune(files, prefix, nowMs){
+  const re = new RegExp('^' + prefix + '\\d{4}-\\d{2}-\\d{2}T[\\d-]+Z\\.json$');
+  const versions = files.filter(f=>re.test(f.title)).sort((a,b)=> new Date(b.createdTime) - new Date(a.createdTime));
+  const keep = new Set(versions.slice(0, 30).map(f=>f.id));
+  const seenDays = new Set();
+  const cutoff = nowMs - 30*24*3600*1000;
+  versions.forEach(f=>{
+    const t = new Date(f.createdTime).getTime();
+    if(t < cutoff) return;
+    const day = f.createdTime.slice(0,10);
+    if(!seenDays.has(day)){ seenDays.add(day); keep.add(f.id); }
+  });
+  return versions.filter(f=>!keep.has(f.id));
+}
+window.pruneOldVersions = async function(){
+  const hint = document.getElementById('pruneHint');
+  if(!isAdmin()){ toast('Очистка доступна только администратору', 'err'); return; }
+  try {
+    if(hint) hint.textContent = 'Считаю старые версии…';
+    const targets = [ [FOLDERS.orders,'orders_'], [FOLDERS.debt,'debt_'], [FOLDERS.config,'settings_'] ];
+    let toTrash = [];
+    for(const [folderId, prefix] of targets){
+      if(!folderId) continue;
+      const files = await listFolderFilesPaged(folderId, prefix);
+      toTrash = toTrash.concat(pickVersionsToPrune(files, prefix, Date.now()));
+    }
+    if(!toTrash.length){ if(hint) hint.textContent = 'Старых версий для очистки нет.'; return; }
+    if(!confirm(`Старых версий к очистке: ${toTrash.length}. Они будут перемещены в Корзину Google Диска (останутся последние 30 версий и по одной за каждый из последних 30 дней). Чтобы место реально освободилось, потом очистите Корзину на drive.google.com. Продолжить?`)){
+      if(hint) hint.textContent = '';
+      return;
+    }
+    let done = 0, failed = 0;
+    const queue = toTrash.slice();
+    async function worker(){
+      while(queue.length){
+        const f = queue.shift();
+        try { await driveTrashFile(f.id); } catch(e){ failed++; console.error(e); }
+        done++;
+        if(hint && done % 20 === 0) hint.textContent = `Очищено ${done} из ${toTrash.length}…`;
+      }
+    }
+    await Promise.all([worker(), worker(), worker(), worker()]);
+    if(hint) hint.textContent = `Готово: перемещено в Корзину ${done - failed} из ${toTrash.length}${failed?`, ошибок: ${failed}`:''}. Теперь очистите Корзину на Google Диске, чтобы освободить место.`;
+    toast('Старые версии перемещены в Корзину', 'ok');
+  } catch(e){
+    if(hint) hint.textContent = 'Ошибка: ' + e.message;
+    toast('Ошибка очистки: ' + e.message, 'err');
+  }
+};
 // deleted -- необязательный { orders: [ids...], sellerPayments: [ids...] } со списком id, которые
 // эта же операция только что нарочно удалила локально -- см. комментарий у mergeById выше про то,
 // почему без этого удаление молча откатывается при следующем сохранении.
@@ -1366,11 +1440,24 @@ async function saveState(deleted){
   const ordersPayload = { orders: STATE.orders, savedAt: STATE.savedAt };
   const debtPayload = { sellerPayments: STATE.sellerPayments, savedAt: STATE.savedAt };
   const settingsPayload = { statuses: STATE.statuses, users: STATE.users, statusRules: STATE.statusRules, dealDoneStatusId: STATE.dealDoneStatusId, paidStatusIds: STATE.paidStatusIds, priceLadders: STATE.priceLadders, deletedStatusIds: STATE.deletedStatusIds || [], savedAt: STATE.savedAt };
+  // История версий пишется не при КАЖДОМ сохранении, а не чаще раза в HISTORY_MIN_INTERVAL_MS, и
+  // "по возможности": её сбой (например, закончилось место на Диске -- storageQuotaExceeded) не
+  // должен ронять само сохранение. Каждая версия -- полная копия всех заявок, и при тысячах заявок
+  // и сохранении после каждой правки это забило Диск (2670 заявок -> тысячи копий по несколько МБ).
+  // Авторитетен "текущий" файл ниже -- он обновляется на месте и места почти не занимает.
+  let lastHistoryAt = 0;
+  try { lastHistoryAt = Number(localStorage.getItem(HISTORY_LAST_KEY)) || 0; } catch(_e){}
+  const historyDue = (Date.now() - lastHistoryAt) >= HISTORY_MIN_INTERVAL_MS;
+  const historyPromise = historyDue
+    ? Promise.all([
+        driveCreateJSON(`orders_${ts}.json`, FOLDERS.orders, ordersPayload),
+        driveCreateJSON(`debt_${ts}.json`, FOLDERS.debt, debtPayload),
+        driveCreateJSON(`settings_${ts}.json`, FOLDERS.config, settingsPayload),
+      ]).then(()=>{ try { localStorage.setItem(HISTORY_LAST_KEY, String(Date.now())); } catch(_e){} })
+        .catch(e=>console.error('Не удалось записать копию в историю версий (сохранение продолжается):', e))
+    : Promise.resolve();
   await Promise.all([
-    // История версий -- как и раньше, ничего не удаляется и не перезаписывается.
-    driveCreateJSON(`orders_${ts}.json`, FOLDERS.orders, ordersPayload),
-    driveCreateJSON(`debt_${ts}.json`, FOLDERS.debt, debtPayload),
-    driveCreateJSON(`settings_${ts}.json`, FOLDERS.config, settingsPayload),
+    historyPromise,
     // "Текущий" файл -- то, что реально читается при загрузке (см. loadSection/loadLatestState).
     driveUpsertJSON('orders_current.json', FOLDERS.orders, ordersPayload, 'orders'),
     driveUpsertJSON('debt_current.json', FOLDERS.debt, debtPayload, 'debt'),
