@@ -443,6 +443,17 @@
       </div>
     </div>
     <div class="card">
+      <h2>Допродажи</h2>
+      <p class="hint">Селлер, которому принадлежат товары допродажи (аксессуары). В карточке заявки кнопка «Допродажа» добавляет товар от его имени: цена, СС и логистика подтягиваются из ЕГО прайса, товар помечается как допродажа (для расчёта мотивации), а размещение и долг считаются по этому селлеру отдельно.</p>
+      <div class="btn-row" style="align-items:flex-end;">
+        <div class="field" style="max-width:360px;">
+          <label>Селлер допродаж</label>
+          <select id="upsellSellerSelect" onchange="window.setUpsellContragent(this.value)"></select>
+        </div>
+        <span class="hint" id="upsellSellerHint"></span>
+      </div>
+    </div>
+    <div class="card">
       <h2>Хранилище</h2>
       <p class="hint">Все данные хранятся в вашем Google Диске в папке <b>CRM_Данные</b>, в виде JSON-файлов, разложенных по подпапкам: Заявки, Прайсы, Долг продавца и Настройки (там же — список пользователей и их прав). Копия-версия в историю пишется не чаще раза в 15 минут (текущее состояние сохраняется при каждой правке). Старые версии (кроме последних 30 и по одной за каждый из последних 30 дней) автоматически отправляются в Корзину раз в сутки, когда CRM открывает администратор; кнопкой ниже можно сделать это сразу.</p>
       <div class="btn-row">
@@ -576,7 +587,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.48';
+const APP_VERSION = '2026-08-08.49';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -1279,6 +1290,7 @@ async function loadLatestState(){
       paidStatusIds: (settingsData && settingsData.paidStatusIds) || null,
       priceLadders: (settingsData && settingsData.priceLadders) || null,
       deletedStatusIds: (settingsData && settingsData.deletedStatusIds) || [],
+      upsellContragent: (settingsData && settingsData.upsellContragent) || '',
     };
   }
   // Nothing in the new locations at all -- either a brand-new Drive folder, or data that was only
@@ -1472,7 +1484,7 @@ async function saveState(deleted){
   const ts = STATE.savedAt.replace(/[:.]/g,'-');
   const ordersPayload = { orders: STATE.orders, savedAt: STATE.savedAt };
   const debtPayload = { sellerPayments: STATE.sellerPayments, savedAt: STATE.savedAt };
-  const settingsPayload = { statuses: STATE.statuses, users: STATE.users, statusRules: STATE.statusRules, dealDoneStatusId: STATE.dealDoneStatusId, paidStatusIds: STATE.paidStatusIds, priceLadders: STATE.priceLadders, deletedStatusIds: STATE.deletedStatusIds || [], savedAt: STATE.savedAt };
+  const settingsPayload = { statuses: STATE.statuses, users: STATE.users, statusRules: STATE.statusRules, dealDoneStatusId: STATE.dealDoneStatusId, paidStatusIds: STATE.paidStatusIds, priceLadders: STATE.priceLadders, deletedStatusIds: STATE.deletedStatusIds || [], upsellContragent: STATE.upsellContragent || '', savedAt: STATE.savedAt };
   // История версий пишется не при КАЖДОМ сохранении, а не чаще раза в HISTORY_MIN_INTERVAL_MS, и
   // "по возможности": её сбой (например, закончилось место на Диске -- storageQuotaExceeded) не
   // должен ронять само сохранение. Каждая версия -- полная копия всех заявок, и при тысячах заявок
@@ -1509,6 +1521,7 @@ async function refreshAll(){
   try {
     const loaded = await loadLatestState();
     if(loaded){
+      STATE.upsellContragent = loaded.upsellContragent || '';
       STATE.deletedStatusIds = Array.from(new Set([...(STATE.deletedStatusIds||[]), ...(loaded.deletedStatusIds||[])]));
       STATE.statuses = (loaded.statuses && loaded.statuses.length) ? loaded.statuses : DEFAULT_STATUSES;
       if(STATE.deletedStatusIds.length) STATE.statuses = STATE.statuses.filter(s=>!STATE.deletedStatusIds.includes(s.id));
@@ -1584,6 +1597,7 @@ async function refreshAll(){
     renderCalcLadderSelect();
     await loadPriceHistory();
     await loadIpList();
+    renderUpsellSettings();
     // Re-apply tab visibility here too (not just from enterApp()'s initial call) -- otherwise
     // someone sitting on the "Доступ не настроен" screen who just got added in Настройки would
     // have to fully reload the page rather than just clicking "Обновить данные" to see their new
@@ -2231,9 +2245,65 @@ function todayStr(){
 // это осталось единственным значением на заявку целиком (Логистика видна и правится только в
 // гриде на главном экране, Доставка -- как и раньше), поэтому у элементов extraItems нет полей
 // logistics/delivery вообще.
+//
+// ДОПРОДАЖА / ТОВАРЫ ДРУГОГО СЕЛЛЕРА: у товара из extraItems могут быть собственные поля
+// { contragent, inn, logistics, upsell, upsellAt, upsellBy }. contragent/inn есть только если селлер
+// товара ОТЛИЧАЕТСЯ от селлера заявки (иначе товар считается принадлежащим продавцу заявки, как
+// раньше). logistics у товара тоже заполняется только для товара другого селлера (его "дельта" из
+// прайса, размещение 0); у обычного дополнительного товара того же селлера логистики нет -- она
+// остаётся единым значением заявки (o.logistics), как и раньше. upsell -- отметка для расчёта
+// мотивации менеджера.
 function orderItems(o){
-  const primary = { id:'primary', article:o.article, price:o.price, cc:o.cc };
+  const primary = { id:'primary', article:o.article, price:o.price, cc:o.cc, logistics:o.logistics };
   return [primary, ...((o.extraItems||[]))];
+}
+function orderTotalLogistics(o){
+  const vals = orderItems(o).map(it=>it.logistics).filter(v=>v!=null);
+  return vals.length ? +vals.reduce((s,v)=>s+Number(v),0).toFixed(2) : null;
+}
+function itemSellerName(o, it){
+  return String((it.id==='primary' ? o.contragent : (it.contragent || o.contragent)) || '').trim();
+}
+function itemSellerInn(o, it){
+  if(it.id==='primary' || !it.contragent || it.contragent === o.contragent) return orderInn(o);
+  if(it.inn) return String(it.inn).trim();
+  const ip = (CALC_IP_LIST||[]).find(x=>x.name===it.contragent);
+  return ip && ip.inn ? String(ip.inn).trim() : '';
+}
+// "Срезы" заявки по селлерам: товары одного селлера собираются вместе и для каждого считается своя
+// экономика. Для заявки с одним селлером срез ровно один и равен всей заявке (старое поведение).
+// Доставка принадлежит селлеру заявки (срезу с основным товаром). placementOverride (ручная правка
+// админа) тоже относится к срезу основного товара.
+function orderSlices(o){
+  const groups = new Map();
+  orderItems(o).forEach(it=>{
+    const name = itemSellerName(o, it), inn = itemSellerInn(o, it);
+    const key = inn || name || '';
+    if(!groups.has(key)) groups.set(key, { key, sellerName:name, inn, items:[], includesPrimary:false });
+    const g = groups.get(key);
+    g.items.push(it);
+    if(it.id==='primary') g.includesPrimary = true;
+  });
+  const round2 = v => +Number(v).toFixed(2);
+  return Array.from(groups.values()).map(g=>{
+    const price = sumItemsFieldOrNull(g.items, 'price'), cc = sumItemsFieldOrNull(g.items, 'cc');
+    const logVals = g.items.map(it=>it.logistics).filter(v=>v!=null);
+    const logistics = (g.includesPrimary && o.logistics==null) ? null : (logVals.length ? round2(logVals.reduce((s,v)=>s+Number(v),0)) : null);
+    const derived = (price!=null && cc!=null && logistics!=null) ? round2(price - cc - logistics) : null;
+    const placement = (g.includesPrimary && o.placementOverride!=null) ? o.placementOverride : derived;
+    const deliveryKnown = g.includesPrimary && o.delivery!=null;
+    const delivery = g.includesPrimary ? (Number(o.delivery)||0) : 0;
+    return Object.assign(g, {
+      price, cc, logistics, derived, placement,
+      sellerReceived: (cc!=null && placement!=null) ? round2(cc + placement) : null,
+      receipt: (price!=null || deliveryKnown) ? round2((price||0) + delivery) : null,
+      logisticsWithDelivery: (logistics!=null || deliveryKnown) ? round2((logistics||0) + delivery) : null,
+    });
+  });
+}
+function sumSlicesOrNull(slices, key){
+  if(!slices.length || slices.some(s=>s[key]==null)) return null;
+  return +slices.reduce((a,s)=>a+Number(s[key]),0).toFixed(2);
 }
 function orderItemCount(o){ return orderItems(o).length; }
 // Сумма/СС считаются известными, только если известен ХОТЯ БЫ ОДИН товар -- иначе "—", а не вводящий
@@ -2269,23 +2339,19 @@ function orderArticleLabel(o){
 // заявки (см. orderTotalPrice/orderTotalCC выше); для заявки с одним товаром это то же самое
 // значение, что и раньше, так что для единственного товара в заявке ничего не меняется.
 function derivedPlacement(o){
-  const price = orderTotalPrice(o), cc = orderTotalCC(o);
-  return (price!=null && cc!=null && o.logistics!=null) ? +(price - cc - o.logistics).toFixed(2) : null;
+  return sumSlicesOrNull(orderSlices(o), 'derived');
 }
 // placementOverride lets the admin correct a wrong auto-calculated Размещение by hand (e.g. when
 // СС/Логистика turned out inaccurate but the real placement value is known) without having to fix
 // the underlying СС/Логистика numbers themselves. null/unset = use the derived value as before.
 function orderPlacement(o){
-  if(o.placementOverride != null) return o.placementOverride;
-  return derivedPlacement(o);
+  return sumSlicesOrNull(orderSlices(o), 'placement');
 }
 // Сумма, полученная продавцом (для отчёта по продажам) = СС (закупка) + Размещение. Использует
 // уже посчитанный orderPlacement (с учётом placementOverride), а не derivedPlacement напрямую, чтобы
 // не расходиться с колонкой "Размещение, ₽" того же отчёта. Оба слагаемых обязательны -- иначе "—".
 function orderSellerReceived(o){
-  const placement = orderPlacement(o);
-  const cc = orderTotalCC(o); // сумма СС по всем товарам заявки (для одного товара == o.cc)
-  return (cc!=null && placement!=null) ? +(cc + placement).toFixed(2) : null;
+  return sumSlicesOrNull(orderSlices(o), 'sellerReceived');
 }
 // Сумма в чеке = Цена продажи (сумма по всем товарам заявки) + Доставка -- тот же расчёт, что уже
 // используется в карточке заявки (см. "Сумма в чеке" в блоке "Информация для отгрузки" и
@@ -2572,9 +2638,10 @@ async function autofillOrdersCC(orders){
   // что проверялся и раньше -- поведение для них не меняется.
   const tasks = [];
   orders.forEach(o=>{
-    if(o.cc==null) tasks.push({ order:o, article:o.article, orderDate:o.orderDate, apply:(cost)=>{ o.cc = cost; } });
+    if(o.cc==null) tasks.push({ order:o, seller:o.contragent, article:o.article, orderDate:o.orderDate, apply:(cost)=>{ o.cc = cost; } });
     (o.extraItems||[]).forEach(it=>{
-      if(it.cc==null) tasks.push({ order:o, article:it.article, orderDate:o.orderDate, apply:(cost)=>{ it.cc = cost; } });
+      // у товара другого селлера (допродажа) СС ищется в прайсе ЕГО селлера, а не селлера заявки
+      if(it.cc==null) tasks.push({ order:o, seller:(it.contragent || o.contragent), article:it.article, orderDate:o.orderDate, apply:(cost)=>{ it.cc = cost; } });
     });
   });
   stats.skippedNoArticle = tasks.filter(t=>!t.article).length;
@@ -2587,7 +2654,7 @@ async function autofillOrdersCC(orders){
   if(!uploads.length) return stats;
   const snapshotCache = new Map(); // fileId -> downloaded snapshot (or null)
   for(const t of targets){
-    const sellerSlug = t.order.contragent ? slugify(t.order.contragent) : null;
+    const sellerSlug = t.seller ? slugify(t.seller) : null;
     const candidates = await candidatesForOrderDate(uploads, t.orderDate, sellerSlug, snapshotCache);
     if(!candidates.length){ stats.skippedNoUpload++; continue; }
     const cost = await firstMatchAcrossCandidates(candidates, t.article, costFromSnapshot, snapshotCache);
@@ -2841,13 +2908,20 @@ window.viewOrderDetails = function(id){
   const receiptTotal = orderReceiptTotal(o);
   const totalPrice = orderTotalPrice(o);
   const totalCC = orderTotalCC(o);
+  // Колонка "Логистика" в таблице товаров показывается, только если в заявке есть товар ДРУГОГО
+  // селлера (допродажа) -- у него своя логистика ("дельта" из его прайса). Логистика основного
+  // товара по-прежнему правится только в гриде на главном экране.
+  const hasCrossItems = (o.extraItems||[]).some(it=>it.contragent && it.contragent !== o.contragent);
   const itemRowsHtml = orderItems(o).map(it=>{
     const isPrimary = it.id === 'primary';
+    const cross = !isPrimary && it.contragent && it.contragent !== o.contragent;
+    const badges = (cross ? `<div class="hint" style="margin:0;">${escapeHtml(it.contragent)}</div>` : '') + (it.upsell ? `<span class="badge" style="background:#7c3aed;">допродажа</span>` : '');
     return `
       <tr>
-        <td>${escapeHtml(it.article)||'—'}</td>
+        <td>${escapeHtml(it.article)||'—'}${badges}</td>
         <td><input type="number" step="0.01" value="${it.price!=null?it.price:''}" style="width:100px;" onchange="window.setOrderItemField('${o.id}','${it.id}','price', this.value)"></td>
         <td><input type="number" step="0.01" value="${it.cc!=null?it.cc:''}" style="width:100px;" onchange="window.setOrderItemField('${o.id}','${it.id}','cc', this.value)"></td>
+        ${hasCrossItems ? (cross ? `<td><input type="number" step="0.01" value="${it.logistics!=null?it.logistics:''}" style="width:100px;" onchange="window.setOrderItemField('${o.id}','${it.id}','logistics', this.value)"></td>` : '<td class="hint">—</td>') : ''}
         <td style="white-space:nowrap;">
           <a class="link" href="#" onclick="event.preventDefault(); ${isPrimary?`window.replaceOrderArticle('${o.id}')`:`window.replaceOrderExtraItem('${o.id}','${it.id}')`}" style="font-size:12px;" title="Подтянет СС и цену продажи из последнего загруженного прайса/расчёта, не из даты заявки">Заменить</a>${isPrimary?'':` · <a class="link" href="#" onclick="event.preventDefault(); window.removeOrderItem('${o.id}','${it.id}')" style="font-size:12px; color:#dc2626;">Убрать</a>`}
         </td>
@@ -2868,20 +2942,23 @@ window.viewOrderDetails = function(id){
     </table>
 
     <table class="preview" style="margin-top:10px;">
-      <thead><tr><th>Артикул</th><th>Сумма</th><th>СС</th><th></th></tr></thead>
+      <thead><tr><th>Артикул</th><th>Сумма</th><th>СС</th>${hasCrossItems?'<th>Логистика</th>':''}<th></th></tr></thead>
       <tbody>
         ${itemRowsHtml}
         <tr>
           <td><strong>Итого</strong></td>
           <td><strong>${totalPrice!=null?fmtMoney(totalPrice)+' ₽':'—'}</strong></td>
           <td><strong>${totalCC!=null?fmtMoney(totalCC)+' ₽':'—'}</strong></td>
+          ${hasCrossItems ? '<td></td>' : ''}
           <td></td>
         </tr>
       </tbody>
     </table>
     <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-top:10px;">
       <input type="text" id="modal_newArticle" placeholder="Артикул товара" style="width:160px;">
+      <select id="modal_newSeller" style="max-width:220px;" title="Чей это товар (для «Добавить товар»)"><option value="">Селлер заявки</option>${(CALC_IP_LIST||[]).map(ip=>`<option value="${escapeHtml(ip.name)}">${escapeHtml(ip.name)}</option>`).join('')}</select>
       <button class="btn" type="button" style="font-size:12px; padding:4px 10px;" onclick="window.addOrderItem('${o.id}')">Добавить товар</button>
+      <button class="btn" type="button" style="font-size:12px; padding:4px 10px; background:#7c3aed; border-color:#7c3aed;" onclick="window.addOrderItem('${o.id}', true)" title="${upsellSellerName() ? 'Товар селлера допродаж: '+escapeHtml(upsellSellerName()) : 'Сначала выберите селлера допродаж в Настройки → Допродажи'}">Допродажа</button>
     </div>
     <span class="hint" id="modal_itemsHint"></span>
     <span class="hint" id="modal_replaceArticleHint"></span>
@@ -3112,34 +3189,79 @@ async function lookupArticlePriceForSeller(article, sellerSlug){
   const sellCandidates = await latestCandidatesForSeller(sellSnaps, sellerSlug, snapshotCache);
   const cc = await firstMatchAcrossCandidates(uploadCandidates, article, costFromSnapshot, snapshotCache);
   const price = await firstMatchAcrossCandidates(sellCandidates, article, priceFromSnapshot, snapshotCache);
-  return { cc, price };
+  // Логистика нужна только для товара ДРУГОГО селлера (допродажа): у него вся "дельта" лежит в
+  // поле логистики расчёта, размещение 0. Для обычного товара того же селлера не используется.
+  const logistics = await firstMatchAcrossCandidates(sellCandidates, article, logisticsFromSnapshot, snapshotCache);
+  return { cc, price, logistics };
 }
+function renderUpsellSettings(){
+  const sel = document.getElementById('upsellSellerSelect');
+  if(!sel) return;
+  const cur = upsellSellerName();
+  const names = (CALC_IP_LIST||[]).map(ip=>ip.name);
+  const extra = (cur && !names.includes(cur)) ? `<option value="${escapeHtml(cur)}" selected>${escapeHtml(cur)} (нет в списке контрагентов)</option>` : '';
+  sel.innerHTML = '<option value="">— не выбран —</option>' + extra + names.map(n=>`<option value="${escapeHtml(n)}" ${n===cur?'selected':''}>${escapeHtml(n)}</option>`).join('');
+}
+window.setUpsellContragent = async function(name){
+  STATE.upsellContragent = name || '';
+  const hint = document.getElementById('upsellSellerHint');
+  try { await saveState(); if(hint) hint.textContent = 'Сохранено'; toast('Селлер допродаж сохранён', 'ok'); }
+  catch(e){ if(hint) hint.textContent = 'Ошибка сохранения'; toast('Ошибка сохранения: ' + e.message, 'err'); }
+};
+function isCrossSeller(o, sellerName){ return !!sellerName && sellerName !== (o.contragent||'').trim() && sellerName !== o.contragent; }
+// Селлер, которому принадлежит товар допродажи (Настройки → Допродажи) -- одна настройка на всю CRM.
+function upsellSellerName(){ return (STATE.upsellContragent || '').trim(); }
 // "Добавить товар" -- добавляет ВТОРОЙ и далее товар в заявку (первый по-прежнему хранится в
 // o.article/price/cc). Артикул берётся из общего поля #modal_newArticle (того же самого, что
 // использует "Заменить" у любого товара в списке ниже) -- подставляет СС и цену продажи из
 // последнего прайса/расчёта этого продавца, как replaceOrderArticle для основного товара, но НЕ
 // трогает логистику -- она не привязана к конкретному товару.
-window.addOrderItem = async function(id){
+// upsell=true ("Допродажа"): товар принадлежит селлеру допродаж из настроек (STATE.upsellContragent),
+// цена/СС/логистика берутся из ЕГО прайса, товар помечается upsell:true (+ когда и кем) для расчёта
+// мотивации менеджера. Обычное "Добавить товар" остаётся товаром того же селлера, что и заявка, если
+// в списке рядом не выбран другой селлер.
+window.addOrderItem = async function(id, upsell){
   const o = STATE.orders.find(x=>x.id===id); if(!o) return;
   const input = document.getElementById('modal_newArticle');
   const hint = document.getElementById('modal_itemsHint');
   const article = input ? input.value.trim() : '';
   if(!article){ if(hint) hint.textContent = 'Укажите артикул товара'; return; }
+  const sellerSel = document.getElementById('modal_newSeller');
+  let sellerName = (o.contragent||'').trim();
+  if(upsell){
+    sellerName = upsellSellerName();
+    if(!sellerName){ if(hint) hint.textContent = 'Сначала выберите селлера допродаж в Настройки → Допродажи'; return; }
+  } else if(sellerSel && sellerSel.value){
+    sellerName = sellerSel.value;
+  }
+  const cross = isCrossSeller(o, sellerName);
   if(hint) hint.textContent = 'Ищу цену закупки и цену продажи в последнем загруженном прайсе…';
   try {
-    const sellerSlug = o.contragent ? slugify(o.contragent) : null;
-    const { cc, price } = await lookupArticlePriceForSeller(article, sellerSlug);
+    const sellerSlug = sellerName ? slugify(sellerName) : null;
+    const { cc, price, logistics } = await lookupArticlePriceForSeller(article, sellerSlug);
     if(!o.extraItems) o.extraItems = [];
-    o.extraItems.push({ id: uuid(), article, cc: cc!=null?cc:null, price: price!=null?price:null });
+    const item = { id: uuid(), article, cc: cc!=null?cc:null, price: price!=null?price:null };
+    if(cross){
+      const ip = (CALC_IP_LIST||[]).find(x=>x.name===sellerName);
+      item.contragent = sellerName;
+      item.inn = ip && ip.inn ? String(ip.inn) : '';
+      item.logistics = logistics!=null ? logistics : null;
+    }
+    if(upsell){
+      item.upsell = true;
+      item.upsellAt = new Date().toISOString();
+      item.upsellBy = currentUserEmail || '';
+    }
+    o.extraItems.push(item);
     o.updatedAt = new Date().toISOString();
     if(input) input.value = '';
     markOrdersDirty();
     await saveState();
     renderOrdersGrid();
     const parts = [];
-    if(cc!=null) parts.push('СС'); if(price!=null) parts.push('цена продажи');
-    if(hint) hint.textContent = parts.length ? `Товар добавлен, подтянуто: ${parts.join(', ')}` : 'Товар добавлен, но в последнем прайсе/расчёте такого артикула не нашлось — заполните СС/цену вручную';
-    toast('Товар добавлен в заявку', 'ok');
+    if(cc!=null) parts.push('СС'); if(price!=null) parts.push('цена продажи'); if(cross && logistics!=null) parts.push('логистика');
+    if(hint) hint.textContent = parts.length ? `${upsell?'Допродажа добавлена':'Товар добавлен'}, подтянуто: ${parts.join(', ')}` : 'Товар добавлен, но в последнем прайсе/расчёте такого артикула не нашлось — заполните СС/цену вручную';
+    toast(upsell ? 'Допродажа добавлена в заявку' : 'Товар добавлен в заявку', 'ok');
     window.viewOrderDetails(id);
   } catch(e){
     if(hint) hint.textContent = 'Ошибка: ' + e.message;
@@ -3157,11 +3279,13 @@ window.replaceOrderExtraItem = async function(id, itemId){
   if(!newArticle){ if(hint) hint.textContent = 'Укажите новый артикул'; return; }
   if(hint) hint.textContent = 'Ищу цену закупки и цену продажи в последнем загруженном прайсе…';
   try {
-    const sellerSlug = o.contragent ? slugify(o.contragent) : null;
-    const { cc, price } = await lookupArticlePriceForSeller(newArticle, sellerSlug);
+    const itemSeller = item.contragent || o.contragent;
+    const sellerSlug = itemSeller ? slugify(itemSeller) : null;
+    const { cc, price, logistics } = await lookupArticlePriceForSeller(newArticle, sellerSlug);
     item.article = newArticle;
     item.cc = cc!=null ? cc : null;
     item.price = price!=null ? price : null;
+    if(item.contragent) item.logistics = logistics!=null ? logistics : null; // товар другого селлера
     o.updatedAt = new Date().toISOString();
     if(input) input.value = '';
     markOrdersDirty();
@@ -3430,7 +3554,7 @@ function renderOrdersGrid(){
         const d = JSON.parse(cell);
         const lockedAttrs = d.locked ? 'disabled title="Заявка отгружена — логистика зафиксирована"' : '';
         const lockedStyle = d.locked ? 'opacity:.5;' : '';
-        return gridjs.html(`<input type="number" value="${d.logistics!=null?d.logistics:''}" placeholder="0.00" step="0.01" ${lockedAttrs} style="width:85px;font-size:12px;padding:4px;border:1px solid var(--border);border-radius:6px;${lockedStyle}" onchange="window.setOrderLogistics('${d.id}', this.value)">`);
+        return gridjs.html(`<input type="number" value="${d.logistics!=null?d.logistics:''}" placeholder="0.00" step="0.01" ${lockedAttrs} style="width:85px;font-size:12px;padding:4px;border:1px solid var(--border);border-radius:6px;${lockedStyle}" onchange="window.setOrderLogistics('${d.id}', this.value)">${d.extraLog ? `<div class="hint" style="margin:2px 0 0;" title="Логистика товаров другого селлера (допродажа) -- правится в карточке заявки">+ ${fmtMoney(d.extraLog)} доп.</div>` : ''}`);
       }},
   ];
   const rowBase = data.map(o=>[
@@ -3441,7 +3565,7 @@ function renderOrdersGrid(){
     JSON.stringify({ id:o.id, price:orderTotalPrice(o), multi: orderItemCount(o)>1 }),
     JSON.stringify({ id:o.id, cc:orderTotalCC(o), multi: orderItemCount(o)>1 }),
     JSON.stringify({ id:o.id, delivery:o.delivery }),
-    JSON.stringify({ id:o.id, logistics:o.logistics, locked: isLogisticsLocked(o) }),
+    JSON.stringify({ id:o.id, logistics:o.logistics, locked: isLogisticsLocked(o), extraLog: (o.extraItems||[]).reduce((s,it)=>s+(Number(it.logistics)||0),0) }),
   ]);
   if(isAdmin){
     // Пустое поле = используется автоматический расчёт (Сумма − СС − Логистика); можно ввести
@@ -3461,7 +3585,7 @@ function renderOrdersGrid(){
       }},
     { name:'Контрагент' },
   );
-  data.forEach((o,i)=> rowBase[i].push(JSON.stringify({ id:o.id, label: orderArticleLabel(o), multi: orderItemCount(o)>1, articles: orderArticlesList(o) }), o.contragent));
+  data.forEach((o,i)=> rowBase[i].push(JSON.stringify({ id:o.id, label: orderArticleLabel(o), multi: orderItemCount(o)>1, articles: orderArticlesList(o) }), [o.contragent, ...orderSlices(o).slice(1).map(s=>s.sellerName)].filter(Boolean).join(' + ')));
   ORDERS_GRID = renderGridInto(ORDERS_GRID, el, {
     columns,
     data: rowBase,
@@ -3688,7 +3812,7 @@ function exportOrders(fmt){
     // если товаров несколько.
     const row = {
       '№ заявки': o.orderNumber, 'Дата заявки': o.orderDate, Клиент: o.clientName, Телефон: o.phone, Email: o.email,
-      Статус: statusOf(o.statusId).label, Сумма: orderTotalPrice(o), 'Доставка, ₽': o.delivery, 'СС, ₽': orderTotalCC(o), 'Логистика, ₽': o.logistics,
+      Статус: statusOf(o.statusId).label, Сумма: orderTotalPrice(o), 'Доставка, ₽': o.delivery, 'СС, ₽': orderTotalCC(o), 'Логистика, ₽': orderTotalLogistics(o), 'Допродажа, ₽': sumItemsFieldOrNull((o.extraItems||[]).filter(it=>it.upsell), 'price'),
     };
     if(isAdmin) row['Размещение, ₽'] = orderPlacement(o);
     Object.assign(row, {
@@ -4007,7 +4131,7 @@ let REPORT_CONTRAGENT_KNOWN = new Set();
 const REPORT_NO_CONTRAGENT = '(без продавца)';
 function reportKnownContragents(){
   const set = new Set();
-  STATE.orders.forEach(o=>set.add((o.contragent||'').trim() || REPORT_NO_CONTRAGENT));
+  STATE.orders.forEach(o=>orderSlices(o).forEach(s=>set.add(s.sellerName || REPORT_NO_CONTRAGENT)));
   return Array.from(set).sort((a,b)=>a.localeCompare(b,'ru'));
 }
 function ensureReportContragentFilter(){
@@ -4071,7 +4195,8 @@ function getPaidOrdersForReport(){
   ensureReportContragentFilter();
   return STATE.orders.filter(o=>{
     if(!REPORT_STATUS_FILTER.has(o.statusId) || isStatsExcluded(o)) return false;
-    if(!REPORT_CONTRAGENT_FILTER.has((o.contragent||'').trim() || REPORT_NO_CONTRAGENT)) return false;
+    // Заявка попадает в отчёт, если выбран ХОТЯ БЫ ОДИН из селлеров её товаров (см. reportRow).
+    if(!orderSlices(o).some(s=>REPORT_CONTRAGENT_FILTER.has(s.sellerName || REPORT_NO_CONTRAGENT))) return false;
     if(REPORT_DATE_FROM && (!o.orderDate || o.orderDate < REPORT_DATE_FROM)) return false;
     if(REPORT_DATE_TO && (!o.orderDate || o.orderDate > REPORT_DATE_TO)) return false;
     return true;
@@ -4217,18 +4342,43 @@ window.applyBulkStatusFromLookup = async function(){
 // колонки сходились с "Суммой чека" (Сумма + Доставка): Сумма чека − СС − Логистика(с доставкой) =
 // Размещение. Само поле o.logistics и расчёт Размещения не меняются -- это только отображение/
 // выгрузка отчёта. Если не заполнено ни то, ни другое -- null ("—").
+// (для заявки целиком, с учётом логистики товаров других селлеров -- см. orderTotalLogistics)
 function reportLogistics(o){
-  if(o.logistics==null && o.delivery==null) return null;
-  return +((Number(o.logistics)||0) + (Number(o.delivery)||0)).toFixed(2);
+  const log = orderTotalLogistics(o);
+  if(log==null && o.delivery==null) return null;
+  return +((Number(log)||0) + (Number(o.delivery)||0)).toFixed(2);
+}
+// Строка отчёта по заявке с учётом выбранных чекбоксами селлеров (REPORT_CONTRAGENT_FILTER): если
+// выбраны ВСЕ селлеры заявки -- суммы по всем товарам в одной строке; если только часть -- только
+// экономика товаров выбранных селлеров (доставка относится к селлеру заявки). Для заявки с одним
+// селлером это ровно прежние значения.
+function reportRow(o){
+  const slices = orderSlices(o).filter(s=>!REPORT_CONTRAGENT_FILTER || REPORT_CONTRAGENT_FILTER.has(s.sellerName || REPORT_NO_CONTRAGENT));
+  const nullableSum = key => {
+    const vals = slices.map(s=>s[key]).filter(v=>v!=null);
+    return vals.length ? +vals.reduce((a,v)=>a+Number(v),0).toFixed(2) : null;
+  };
+  return {
+    slices,
+    receipt: nullableSum('receipt'),
+    cc: nullableSum('cc'),
+    logistics: nullableSum('logisticsWithDelivery'),
+    placement: sumSlicesOrNull(slices, 'placement'),
+    sellerReceived: sumSlicesOrNull(slices, 'sellerReceived'),
+    articles: slices.flatMap(s=>s.items.map(it=>it.article).filter(Boolean)),
+    contragent: slices.map(s=>s.sellerName).filter(Boolean).join(' + '),
+    inn: slices.map(s=>s.inn).filter(Boolean).join(', '),
+  };
 }
 function computeSalesReportTotals(data){
+  const rows = data.map(reportRow);
   return {
     count: data.length,
-    receiptTotal: data.reduce((a,o)=>a+(orderReceiptTotal(o)||0),0),
-    cc: data.reduce((a,o)=>a+(orderTotalCC(o)||0),0),
-    logistics: data.reduce((a,o)=>a+(reportLogistics(o)||0),0),
-    placement: data.reduce((a,o)=>a+(orderPlacement(o)||0),0),
-    sellerReceived: data.reduce((a,o)=>a+(orderSellerReceived(o)||0),0),
+    receiptTotal: rows.reduce((a,r)=>a+(r.receipt||0),0),
+    cc: rows.reduce((a,r)=>a+(r.cc||0),0),
+    logistics: rows.reduce((a,r)=>a+(r.logistics||0),0),
+    placement: rows.reduce((a,r)=>a+(r.placement||0),0),
+    sellerReceived: rows.reduce((a,r)=>a+(r.sellerReceived||0),0),
   };
 }
 function renderSalesReportTotals(data){
@@ -4270,18 +4420,21 @@ function renderSalesReportGrid(){
       { name:'Продавец', width:'160px' },
       { name:'ИНН', width:'110px' },
     ],
-    data: data.map(o=>[ o.orderNumber, fmtDateLabel(o.orderDate), orderArticlesList(o).join(', ')||'—', o.serialNumber||'—', orderReceiptTotal(o), orderTotalCC(o), reportLogistics(o), orderPlacement(o), orderSellerReceived(o), o.contragent||'—', o.inn ]),
+    data: data.map(o=>{ const r = reportRow(o); return [ o.orderNumber, fmtDateLabel(o.orderDate), r.articles.join(', ')||'—', o.serialNumber||'—', r.receipt, r.cc, r.logistics, r.placement, r.sellerReceived, r.contragent||'—', r.inn||o.inn ]; }),
     search:true, sort:true, pagination:{ limit:15, resetPageOnUpdate:false }, className:{ table:'gridjs-wrapper' },
   });
 }
 function buildSalesReportRows(){
   const data = getPaidOrdersForReport();
-  const rows = data.map(o=>({
-    'Номер заявки': o.orderNumber, 'Дата заявки': fmtDateLabel(o.orderDate), 'Артикул': orderArticlesList(o).join(', '),
-    'Серийный номер': o.serialNumber || '', 'Сумма чека': orderReceiptTotal(o), 'СС': orderTotalCC(o), 'Логистика': reportLogistics(o),
-    'Стоимость размещения': orderPlacement(o), 'Сумма полученная продавцом': orderSellerReceived(o),
-    'Продавец': o.contragent || '', 'ИНН': o.inn,
-  }));
+  const rows = data.map(o=>{
+    const r = reportRow(o);
+    return {
+      'Номер заявки': o.orderNumber, 'Дата заявки': fmtDateLabel(o.orderDate), 'Артикул': r.articles.join(', '),
+      'Серийный номер': o.serialNumber || '', 'Сумма чека': r.receipt, 'СС': r.cc, 'Логистика': r.logistics,
+      'Стоимость размещения': r.placement, 'Сумма полученная продавцом': r.sellerReceived,
+      'Продавец': r.contragent || '', 'ИНН': r.inn || o.inn,
+    };
+  });
   if(rows.length){
     const t = computeSalesReportTotals(data);
     rows.push({
@@ -4334,13 +4487,17 @@ function orderInn(o){
 function computeSellerDebts(){
   const doneOrders = STATE.orders.filter(o=>isDealDoneStatus(o) && !isStatsExcluded(o));
   const byInn = new Map();
+  // По срезам селлеров (см. orderSlices): размещение товара другого селлера (допродажа) относится к
+  // ЕГО долгу, а не к долгу селлера заявки. Для заявки с одним селлером срез один -- как раньше.
   doneOrders.forEach(o=>{
-    const key = orderInn(o) || '(без ИНН)';
-    if(!byInn.has(key)) byInn.set(key, { inn:key, contragents:new Set(), ordersCount:0, placementSum:0 });
-    const rec = byInn.get(key);
-    if(o.contragent) rec.contragents.add(o.contragent);
-    rec.ordersCount++;
-    rec.placementSum += (orderPlacement(o)||0);
+    orderSlices(o).forEach(s=>{
+      const key = s.inn || '(без ИНН)';
+      if(!byInn.has(key)) byInn.set(key, { inn:key, contragents:new Set(), ordersCount:0, placementSum:0 });
+      const rec = byInn.get(key);
+      if(s.sellerName) rec.contragents.add(s.sellerName);
+      rec.ordersCount++;
+      rec.placementSum += (s.placement||0);
+    });
   });
   const paidByInn = new Map();
   STATE.sellerPayments.forEach(p=>{
@@ -4869,6 +5026,7 @@ async function addCalcIp(){
   document.getElementById('calc_ipInn').value = '';
   document.getElementById('calc_ipAdd').style.display = 'none';
   renderCalcIpSelect();
+  renderUpsellSettings();
   document.getElementById('calc_ip').value = CALC_IP_LIST[CALC_IP_LIST.length-1].id;
   try { await saveIpList(); toast('Контрагент добавлен', 'ok'); } catch(e){ toast('Ошибка сохранения контрагента: '+e.message, 'err'); }
 }
