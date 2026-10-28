@@ -602,7 +602,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.50';
+const APP_VERSION = '2026-08-08.51';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -3098,8 +3098,9 @@ window.viewOrderDetails = function(id){
       </tbody>
     </table>
     <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-top:10px;">
-      <input type="text" id="modal_newArticle" placeholder="Артикул товара" style="width:160px;">
-      <select id="modal_newSeller" style="max-width:220px;" title="Чей это товар (для «Добавить товар»)"><option value="">Селлер заявки</option>${(CALC_IP_LIST||[]).map(ip=>`<option value="${escapeHtml(ip.name)}">${escapeHtml(ip.name)}</option>`).join('')}</select>
+      <select id="modal_newSeller" style="max-width:220px;" title="Чей это товар" onchange="window.loadArticleOptions()"><option value="">Селлер заявки</option>${(CALC_IP_LIST||[]).map(ip=>`<option value="${escapeHtml(ip.name)}"${ip.name===defaultItemSellerName(o)?' selected':''}>${escapeHtml(ip.name)}</option>`).join('')}</select>
+      <select id="modal_newArticlePick" style="max-width:260px;" title="Артикулы из последнего прайса селлера" onchange="window.pickArticleOption()"><option value="">Выберите товар из прайса…</option></select>
+      <input type="text" id="modal_newArticle" placeholder="или введите артикул" style="width:160px;">
       <button class="btn" type="button" style="font-size:12px; padding:4px 10px;" onclick="window.addOrderItem('${o.id}')">Добавить товар</button>
       <button class="btn" type="button" style="font-size:12px; padding:4px 10px; background:#7c3aed; border-color:#7c3aed;" onclick="window.addOrderItem('${o.id}', true)" title="${upsellSellerName() ? 'Товар селлера допродаж: '+escapeHtml(upsellSellerName()) : 'Сначала выберите селлера допродаж в Настройки → Допродажи'}">Допродажа</button>
     </div>
@@ -3171,6 +3172,7 @@ window.viewOrderDetails = function(id){
     <p class="hint">Все правки в этой карточке (статус, товары, имя, email, продавец, комментарий менеджера, серийный номер, ссылка на товар) сохраняются на Диск сразу же, без отдельной кнопки. Логистика и Размещение здесь не показываются — эти поля доступны только на главном экране списка заявок.</p>
   `;
   modalBg.classList.add('show');
+  if(window.loadArticleOptions) window.loadArticleOptions();
 };
 window.setOrderClientName = async function(id, val){
   const o = STATE.orders.find(x=>x.id===id); if(!o) return;
@@ -3354,6 +3356,47 @@ window.setUpsellContragent = async function(name){
 function isCrossSeller(o, sellerName){ return !!sellerName && sellerName !== (o.contragent||'').trim() && sellerName !== o.contragent; }
 // Селлер, которому принадлежит товар допродажи (Настройки → Допродажи) -- одна настройка на всю CRM.
 function upsellSellerName(){ return (STATE.upsellContragent || '').trim(); }
+// Селлер по умолчанию для «Добавить товар»: ИП Шаим (если есть в списке ИП), иначе селлер заявки.
+function defaultItemSellerName(o){
+  const list = CALC_IP_LIST || [];
+  const shaim = list.find(ip=>/шаим/i.test(ip.name||''));
+  if(shaim) return shaim.name;
+  return (o && o.contragent) || '';
+}
+const ARTICLE_OPTIONS_CACHE = new Map(); // slug -> [{article,name}]
+async function articleOptionsForSeller(slug){
+  if(ARTICLE_OPTIONS_CACHE.has(slug)) return ARTICLE_OPTIONS_CACHE.get(slug);
+  const uploads = (await loadAllPriceUploadDates()).filter(u=>u.ipSlug===slug).reverse(); // новые первыми
+  let result = [];
+  for(const u of uploads.slice(0,3)){
+    let snap = null;
+    try { snap = await driveDownloadJSON(u.fileId); } catch(e){ console.error(e); }
+    if(snap && (snap.items||[]).length){
+      result = snap.items.filter(it=>it.article).map(it=>({ article:String(it.article), name:it.name||'' }));
+      break;
+    }
+  }
+  ARTICLE_OPTIONS_CACHE.set(slug, result);
+  return result;
+}
+window.loadArticleOptions = async function(){
+  const sel = document.getElementById('modal_newArticlePick');
+  const sellerSel = document.getElementById('modal_newSeller');
+  if(!sel) return;
+  const name = sellerSel ? sellerSel.value : '';
+  sel.innerHTML = '<option value="">Загрузка списка…</option>';
+  try {
+    const opts = name ? await articleOptionsForSeller(slugify(name)) : [];
+    if(sellerSel && sellerSel.value !== name) return; // селлера успели переключить
+    sel.innerHTML = '<option value="">' + (opts.length ? 'Выберите товар из прайса…' : 'В прайсе селлера нет товаров — введите артикул') + '</option>'
+      + opts.map(o=>`<option value="${escapeHtml(o.article)}">${escapeHtml(o.article)}${o.name?' — '+escapeHtml(o.name):''}</option>`).join('');
+  } catch(e){ console.error(e); sel.innerHTML = '<option value="">Не удалось загрузить список</option>'; }
+};
+window.pickArticleOption = function(){
+  const sel = document.getElementById('modal_newArticlePick');
+  const input = document.getElementById('modal_newArticle');
+  if(sel && input && sel.value) input.value = sel.value;
+};
 // "Добавить товар" -- добавляет ВТОРОЙ и далее товар в заявку (первый по-прежнему хранится в
 // o.article/price/cc). Артикул берётся из общего поля #modal_newArticle (того же самого, что
 // использует "Заменить" у любого товара в списке ниже) -- подставляет СС и цену продажи из
