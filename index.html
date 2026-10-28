@@ -142,6 +142,7 @@
     <button class="tab-btn" data-tab="reports" onclick="switchTab('reports')">Отчёты</button>
     <button class="tab-btn" data-tab="debt" onclick="switchTab('debt')">Долг продавца</button>
     <button class="tab-btn" data-tab="reconcile" onclick="switchTab('reconcile')">Сверка</button>
+    <button class="tab-btn" data-tab="stock" onclick="switchTab('stock')">Остатки</button>
     <button class="tab-btn" data-tab="settings" onclick="switchTab('settings')">Настройки</button>
   </div>
 
@@ -387,6 +388,19 @@
     </div>
   </div>
 
+  <!-- STOCK TAB -->
+  <div class="panel" id="panel-stock">
+    <div class="card">
+      <h2>Остатки</h2>
+      <p class="hint">Остатки ведутся для селлеров, у которых в последней загрузке прайса («Прайсы») есть колонка «Кол-во» / «Количество» / «Остаток» — она задаёт текущий остаток на дату загрузки. Дальше остаток уменьшают заявки в статусах «Оплачена», «Выставлен счёт», «Сделка завершена» (с датой заявки не раньше даты загрузки) на количество штук товара в заявке. Новая загрузка с количеством сбрасывает остаток.</p>
+      <div class="btn-row" style="align-items:flex-end;">
+        <div class="field" style="max-width:260px;"><label>Поиск</label><input type="text" id="stockFilter" placeholder="Артикул, название, селлер" oninput="window.renderStockTable()"></div>
+        <button class="btn secondary" type="button" onclick="window.refreshStock()">Обновить</button>
+      </div>
+      <div id="stockTable" style="margin-top:12px;"></div>
+    </div>
+  </div>
+
   <!-- SETTINGS TAB -->
   <div class="panel" id="panel-settings">
     <div class="card">
@@ -487,6 +501,7 @@
           <label style="display:flex;align-items:center;gap:4px;font-size:12px;font-weight:400;"><input type="checkbox" class="u_section" value="reports" checked style="width:auto;"> Отчёты</label>
           <label style="display:flex;align-items:center;gap:4px;font-size:12px;font-weight:400;"><input type="checkbox" class="u_section" value="debt" checked style="width:auto;"> Долг продавца</label>
           <label style="display:flex;align-items:center;gap:4px;font-size:12px;font-weight:400;"><input type="checkbox" class="u_section" value="reconcile" checked style="width:auto;"> Сверка</label>
+          <label style="display:flex;align-items:center;gap:4px;font-size:12px;font-weight:400;"><input type="checkbox" class="u_section" value="stock" checked style="width:auto;"> Остатки</label>
           <label style="display:flex;align-items:center;gap:4px;font-size:12px;font-weight:400;"><input type="checkbox" class="u_section" value="settings" checked style="width:auto;"> Настройки</label>
         </div>
       </div>
@@ -587,7 +602,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.49';
+const APP_VERSION = '2026-08-08.50';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -658,6 +673,7 @@ const ACCESS_SECTIONS = [
   { id:'reports', label:'Отчёты' },
   { id:'debt', label:'Долг продавца' },
   { id:'reconcile', label:'Сверка' },
+  { id:'stock', label:'Остатки' },
   { id:'settings', label:'Настройки' },
 ];
 let currentUserEmail = null;
@@ -1603,6 +1619,7 @@ async function refreshAll(){
     // have to fully reload the page rather than just clicking "Обновить данные" to see their new
     // access, since STATE.users is only refreshed by this function.
     applyAccessControl();
+    loadStockBaselines().catch(e=>console.error(e)); // фоном: остатки
     maybeAutoPrune(); // не ждём: фоновая очистка старых версий раз в сутки (только админ)
   } catch(e){
     console.error(e);
@@ -1620,6 +1637,7 @@ function switchTab(name){
   // without needing every single order-mutating function to know about these tabs.
   if(name==='reports'){ renderReportContragentFilter(); renderSalesReportGrid(); }
   if(name==='debt'){ renderDebtGrid(); renderDebtPaymentsGrid(); }
+  if(name==='stock'){ if(!STOCK.loaded && !STOCK.loading){ window.refreshStock(); } else window.renderStockTable(); }
 }
 // ================= RECONCILE (Сверка) =================
 // Простая проверка "что было в прайсе на такую-то дату по такому-то артикулу", без привязки к
@@ -1716,6 +1734,126 @@ window.runReconcile = async function(){
     resultEl.innerHTML = '';
     toast('Ошибка сверки: ' + e.message, 'err');
   }
+};
+
+/* ================= STOCK (Остатки) =================
+   Учёт остатков ведётся по селлеру, у которого в загрузке прайса (Прайсы) есть колонка количества
+   ("Кол-во"/"Количество"/"Остаток"). Последняя такая загрузка селлера = ТЕКУЩИЙ остаток на её дату
+   (сброс, а не добавление). Остаток сейчас = остаток из загрузки − штук в заявках в статусах
+   "оплачено" (Оплачена / Выставлен счёт / Сделка завершена), у которых дата заявки не раньше даты
+   загрузки. Количество штук в заявке -- поле qty у товара (по умолчанию 1). */
+let STOCK = { loaded:false, loading:false, bySeller:new Map() };
+function paidLikeStatusIds(){
+  const set = new Set(STATE.paidStatusIds || []);
+  if(STATE.dealDoneStatusId) set.add(STATE.dealDoneStatusId);
+  return set;
+}
+async function loadStockBaselines(){
+  if(STOCK.loading) return;
+  STOCK.loading = true;
+  try {
+    const uploads = await loadAllPriceUploadDates();
+    const bySlug = new Map();
+    uploads.forEach(u=>{ if(u.ipSlug){ if(!bySlug.has(u.ipSlug)) bySlug.set(u.ipSlug, []); bySlug.get(u.ipSlug).push(u); } });
+    const result = new Map();
+    for(const [slug, list] of bySlug){
+      const sorted = list.slice().sort((a,b)=> b.date.localeCompare(a.date) || new Date(b.createdTime) - new Date(a.createdTime));
+      for(const u of sorted.slice(0, 5)){ // последняя загрузка С количеством (не глубже 5 файлов назад)
+        let snap = null;
+        try { snap = await driveDownloadJSON(u.fileId); } catch(e){ console.error(e); }
+        if(snap && snap.hasQty){
+          const items = new Map();
+          (snap.items||[]).forEach(it=>{
+            if(it.article && it.qty!=null) items.set(normalizeArticleForMatch(it.article), { article:String(it.article), name:it.name||'', qty:Number(it.qty)||0 });
+          });
+          result.set(slug, { slug, sellerName: sellerNameForSlug(slug), date: u.date, title: u.title, items });
+          break;
+        }
+      }
+    }
+    STOCK.bySeller = result;
+    STOCK.loaded = true;
+  } catch(e){ console.error('Не удалось загрузить остатки:', e); }
+  finally { STOCK.loading = false; }
+}
+// Сколько штук по артикулам (нормализованным) продано в оплаченных заявках этого селлера с даты загрузки.
+function soldQtyMap(baseline){
+  const paid = paidLikeStatusIds();
+  const sold = new Map();
+  STATE.orders.forEach(o=>{
+    if(!paid.has(o.statusId) || isStatsExcluded(o)) return;
+    if(!o.orderDate || o.orderDate < baseline.date) return;
+    orderItems(o).forEach(it=>{
+      if(slugify(itemSellerName(o, it)) !== baseline.slug || !it.article) return;
+      const key = normalizeArticleForMatch(it.article);
+      sold.set(key, (sold.get(key)||0) + (Number(it.qty)||1));
+    });
+  });
+  return sold;
+}
+function stockInfoForItem(o, it){
+  if(!STOCK.loaded || !it.article) return null;
+  const b = STOCK.bySeller.get(slugify(itemSellerName(o, it)));
+  if(!b) return null;
+  const key = normalizeArticleForMatch(it.article);
+  const e = b.items.get(key);
+  if(!e) return null;
+  const sold = soldQtyMap(b).get(key) || 0;
+  return { baseline:e.qty, sold, remaining:e.qty - sold, since:b.date };
+}
+function stockRows(){
+  const rows = [];
+  STOCK.bySeller.forEach(b=>{
+    const sold = soldQtyMap(b);
+    b.items.forEach((e,key)=>{
+      const s = sold.get(key)||0;
+      rows.push({ seller:b.sellerName, article:e.article, name:e.name, baseline:e.qty, sold:s, remaining:e.qty - s, date:b.date });
+    });
+  });
+  return rows.sort((a,b)=> a.seller.localeCompare(b.seller,'ru') || a.article.localeCompare(b.article));
+}
+window.renderStockTable = function(){
+  const el = document.getElementById('stockTable'); if(!el) return;
+  if(STOCK.loading){ el.innerHTML = '<div class="loading">Загрузка остатков…</div>'; return; }
+  if(!STOCK.loaded || !STOCK.bySeller.size){
+    el.innerHTML = '<div class="empty">Остатки не ведутся: загрузите в «Прайсы» файл селлера с колонкой «Кол-во» (или «Количество»/«Остаток»).</div>';
+    return;
+  }
+  const q = (document.getElementById('stockFilter')||{}).value || '';
+  const needle = q.trim().toLowerCase();
+  const rows = stockRows().filter(r=>!needle || (r.article+' '+r.name+' '+r.seller).toLowerCase().includes(needle));
+  el.innerHTML = `<table class="preview">
+    <tr><th>Селлер</th><th>Артикул</th><th>Название</th><th>Остаток при загрузке</th><th>Продано (оплачено)</th><th>Остаток сейчас</th><th>Загрузка от</th></tr>
+    ${rows.map(r=>`<tr>
+      <td>${escapeHtml(r.seller)}</td><td>${escapeHtml(r.article)}</td><td>${escapeHtml(r.name)}</td>
+      <td>${r.baseline}</td><td>${r.sold}</td>
+      <td><strong style="${r.remaining<=0?'color:#dc2626;':''}">${r.remaining}</strong></td>
+      <td>${fmtDateLabel(r.date)}</td>
+    </tr>`).join('') || '<tr><td colspan="7" class="hint">Ничего не найдено</td></tr>'}
+  </table>`;
+};
+window.refreshStock = async function(){
+  const el = document.getElementById('stockTable');
+  if(el) el.innerHTML = '<div class="loading">Загрузка остатков…</div>';
+  STOCK.loading = false;
+  await loadStockBaselines();
+  window.renderStockTable();
+};
+// Количество штук у товара. Цена, СС и логистика товара пересчитываются пропорционально (в карточке
+// они -- сумма по строке, а не за штуку), чтобы количество не расходилось с суммой.
+window.setOrderItemQty = async function(id, itemId, val){
+  const o = STATE.orders.find(x=>x.id===id); if(!o) return;
+  const item = (o.extraItems||[]).find(it=>it.id===itemId); if(!item) return;
+  const newQty = Math.max(1, Math.round(Number(val)||1));
+  const oldQty = Math.max(1, Number(item.qty)||1);
+  if(newQty === oldQty){ window.viewOrderDetails(id); return; }
+  ['price','cc','logistics'].forEach(f=>{ if(item[f]!=null) item[f] = +(Number(item[f]) / oldQty * newQty).toFixed(2); });
+  item.qty = newQty;
+  o.updatedAt = new Date().toISOString();
+  try { await saveState(); toast(`Количество: ${newQty} шт., сумма, СС и логистика пересчитаны`, 'ok'); }
+  catch(e){ markOrdersDirty(); toast('Не удалось сохранить сразу, нажмите «Сохранить изменения»: ' + e.message, 'err'); }
+  renderOrdersGrid();
+  window.viewOrderDetails(id);
 };
 
 /* ================= STATUSES ================= */
@@ -2912,15 +3050,19 @@ window.viewOrderDetails = function(id){
   // селлера (допродажа) -- у него своя логистика ("дельта" из его прайса). Логистика основного
   // товара по-прежнему правится только в гриде на главном экране.
   const hasCrossItems = (o.extraItems||[]).some(it=>it.contragent && it.contragent !== o.contragent);
+  const hasExtras = (o.extraItems||[]).length > 0; // колонка "Кол-во" нужна, только если есть доп. товары
   const itemRowsHtml = orderItems(o).map(it=>{
     const isPrimary = it.id === 'primary';
     const cross = !isPrimary && it.contragent && it.contragent !== o.contragent;
-    const badges = (cross ? `<div class="hint" style="margin:0;">${escapeHtml(it.contragent)}</div>` : '') + (it.upsell ? `<span class="badge" style="background:#7c3aed;">допродажа</span>` : '');
+    const stock = stockInfoForItem(o, it);
+    const stockHtml = stock ? `<div class="hint" style="margin:0; ${stock.remaining < (Number(it.qty)||1) ? 'color:#dc2626; font-weight:600;' : ''}" title="Остаток по загрузке от ${fmtDateLabel(stock.since)}: ${stock.baseline} шт., продано (оплачено) ${stock.sold} шт.">Остаток: ${stock.remaining} шт.</div>` : '';
+    const badges = (cross ? `<div class="hint" style="margin:0;">${escapeHtml(it.contragent)}</div>` : '') + (it.upsell ? `<span class="badge" style="background:#7c3aed;">допродажа</span>` : '') + stockHtml;
     return `
       <tr>
         <td>${escapeHtml(it.article)||'—'}${badges}</td>
         <td><input type="number" step="0.01" value="${it.price!=null?it.price:''}" style="width:100px;" onchange="window.setOrderItemField('${o.id}','${it.id}','price', this.value)"></td>
         <td><input type="number" step="0.01" value="${it.cc!=null?it.cc:''}" style="width:100px;" onchange="window.setOrderItemField('${o.id}','${it.id}','cc', this.value)"></td>
+        ${hasExtras ? (isPrimary ? '<td class="hint">1</td>' : `<td><input type="number" min="1" step="1" value="${Number(it.qty)||1}" style="width:60px;" title="Количество штук (цена, СС и логистика пересчитываются пропорционально)" onchange="window.setOrderItemQty('${o.id}','${it.id}', this.value)"></td>`) : ''}
         ${hasCrossItems ? (cross ? `<td><input type="number" step="0.01" value="${it.logistics!=null?it.logistics:''}" style="width:100px;" onchange="window.setOrderItemField('${o.id}','${it.id}','logistics', this.value)"></td>` : '<td class="hint">—</td>') : ''}
         <td style="white-space:nowrap;">
           <a class="link" href="#" onclick="event.preventDefault(); ${isPrimary?`window.replaceOrderArticle('${o.id}')`:`window.replaceOrderExtraItem('${o.id}','${it.id}')`}" style="font-size:12px;" title="Подтянет СС и цену продажи из последнего загруженного прайса/расчёта, не из даты заявки">Заменить</a>${isPrimary?'':` · <a class="link" href="#" onclick="event.preventDefault(); window.removeOrderItem('${o.id}','${it.id}')" style="font-size:12px; color:#dc2626;">Убрать</a>`}
@@ -2942,13 +3084,14 @@ window.viewOrderDetails = function(id){
     </table>
 
     <table class="preview" style="margin-top:10px;">
-      <thead><tr><th>Артикул</th><th>Сумма</th><th>СС</th>${hasCrossItems?'<th>Логистика</th>':''}<th></th></tr></thead>
+      <thead><tr><th>Артикул</th><th>Сумма</th><th>СС</th>${hasExtras?'<th>Кол-во</th>':''}${hasCrossItems?'<th>Логистика</th>':''}<th></th></tr></thead>
       <tbody>
         ${itemRowsHtml}
         <tr>
           <td><strong>Итого</strong></td>
           <td><strong>${totalPrice!=null?fmtMoney(totalPrice)+' ₽':'—'}</strong></td>
           <td><strong>${totalCC!=null?fmtMoney(totalCC)+' ₽':'—'}</strong></td>
+          ${hasExtras ? '<td></td>' : ''}
           ${hasCrossItems ? '<td></td>' : ''}
           <td></td>
         </tr>
@@ -4627,11 +4770,17 @@ async function saveRawUploadSnapshot(parsed){
     type:'price_upload', uploadedAt: now.toISOString(), date: dateStr, ip,
     itemsCount: parsed.items.length,
     priceCols: parsed.priceCols.map(pc=>({ label: pc.label })),
-    items: parsed.items.map(it=>({ name:it.name, article:it.article, sap:it.sap, prices: it.prices })),
+    hasQty: !!parsed.hasQty,
+    items: parsed.items.map(it=>{
+      const row = { name:it.name, article:it.article, sap:it.sap, prices: it.prices };
+      if(parsed.hasQty) row.qty = it.qty;
+      return row;
+    }),
   };
   try {
     await driveCreateJSON(`price_upload_${slugify(ip.name)}_${dateStr}_${timeStr}.json`, FOLDERS.prices, snapshot);
     await loadPriceHistory();
+    if(parsed.hasQty){ toast('В загрузке есть колонка количества — остатки обновлены', 'ok'); loadStockBaselines().catch(e=>console.error(e)); }
   } catch(e){
     console.error(e);
     toast('Не удалось сохранить историю загрузки: ' + e.message, 'err');
@@ -5047,9 +5196,13 @@ function parseCalcWorkbookRows(rows){
   }
   if(headerRowIdx===-1){ toast('Не нашёл строку заголовков (колонку «Наименование»)', 'err'); return null; }
   const headerRow = rows[headerRowIdx];
+  let qtyCol = -1;
   headerRow.forEach((v,c)=>{
     if(typeof v==='string' && v.includes('Артикул') && !v.includes('SAP')) articleCol=c;
     if(typeof v==='string' && v.includes('SAP')) sapCol=c;
+    // Колонка количества (остатков): "Кол-во"/"Количество"/"Остаток" -- если она есть, загрузка
+    // включает учёт остатков по этому селлеру (см. loadStockBaselines).
+    if(qtyCol===-1 && typeof v==='string' && /кол-?во|количество|остат/i.test(v)) qtyCol = c;
   });
   const priceCols = []; const seenDates = {};
   headerRow.forEach((v,c)=>{
@@ -5072,9 +5225,11 @@ function parseCalcWorkbookRows(rows){
       const val = (typeof raw==='number' && raw>0) ? raw : null;
       return { label: pc.label, value: val };
     });
-    items.push({ id:uuid(), name:name.trim(), article: articleCol!==-1 ? (row[articleCol] ?? '') : '', sap: sapCol!==-1 ? (row[sapCol] ?? '') : '', prices, logisticsOverride:null, placementOverride:null });
+    const qtyRaw = qtyCol!==-1 ? row[qtyCol] : null;
+    const qty = (typeof qtyRaw==='number' && qtyRaw>=0) ? qtyRaw : (qtyCol!==-1 && qtyRaw!=null && qtyRaw!=='' && !isNaN(Number(qtyRaw)) && Number(qtyRaw)>=0 ? Number(qtyRaw) : null);
+    items.push({ id:uuid(), name:name.trim(), article: articleCol!==-1 ? (row[articleCol] ?? '') : '', sap: sapCol!==-1 ? (row[sapCol] ?? '') : '', prices, qty, logisticsOverride:null, placementOverride:null });
   }
-  return { items, priceCols };
+  return { items, priceCols, hasQty: qtyCol!==-1 };
 }
 function setupCalcDropzone(){
   const dropEl = document.getElementById('calc_drop');
