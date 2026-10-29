@@ -602,7 +602,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.51';
+const APP_VERSION = '2026-08-08.52';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -3063,7 +3063,7 @@ window.viewOrderDetails = function(id){
         <td><input type="number" step="0.01" value="${it.price!=null?it.price:''}" style="width:100px;" onchange="window.setOrderItemField('${o.id}','${it.id}','price', this.value)"></td>
         <td><input type="number" step="0.01" value="${it.cc!=null?it.cc:''}" style="width:100px;" onchange="window.setOrderItemField('${o.id}','${it.id}','cc', this.value)"></td>
         ${hasExtras ? (isPrimary ? '<td class="hint">1</td>' : `<td><input type="number" min="1" step="1" value="${Number(it.qty)||1}" style="width:60px;" title="Количество штук (цена, СС и логистика пересчитываются пропорционально)" onchange="window.setOrderItemQty('${o.id}','${it.id}', this.value)"></td>`) : ''}
-        ${hasCrossItems ? (cross ? `<td><input type="number" step="0.01" value="${it.logistics!=null?it.logistics:''}" style="width:100px;" onchange="window.setOrderItemField('${o.id}','${it.id}','logistics', this.value)"></td>` : '<td class="hint">—</td>') : ''}
+        ${hasCrossItems ? '<td class="hint">—</td>' : ''}
         <td style="white-space:nowrap;">
           <a class="link" href="#" onclick="event.preventDefault(); ${isPrimary?`window.replaceOrderArticle('${o.id}')`:`window.replaceOrderExtraItem('${o.id}','${it.id}')`}" style="font-size:12px;" title="Подтянет СС и цену продажи из последнего загруженного прайса/расчёта, не из даты заявки">Заменить</a>${isPrimary?'':` · <a class="link" href="#" onclick="event.preventDefault(); window.removeOrderItem('${o.id}','${it.id}')" style="font-size:12px; color:#dc2626;">Убрать</a>`}
         </td>
@@ -3363,7 +3363,7 @@ function defaultItemSellerName(o){
   if(shaim) return shaim.name;
   return (o && o.contragent) || '';
 }
-const ARTICLE_OPTIONS_CACHE = new Map(); // slug -> [{article,name}]
+const ARTICLE_OPTIONS_CACHE = new Map(); // slug -> [{article,name,sell}]
 async function articleOptionsForSeller(slug){
   if(ARTICLE_OPTIONS_CACHE.has(slug)) return ARTICLE_OPTIONS_CACHE.get(slug);
   const uploads = (await loadAllPriceUploadDates()).filter(u=>u.ipSlug===slug).reverse(); // новые первыми
@@ -3372,10 +3372,22 @@ async function articleOptionsForSeller(slug){
     let snap = null;
     try { snap = await driveDownloadJSON(u.fileId); } catch(e){ console.error(e); }
     if(snap && (snap.items||[]).length){
-      result = snap.items.filter(it=>it.article).map(it=>({ article:String(it.article), name:it.name||'' }));
+      result = snap.items.filter(it=>it.article).map(it=>({ article:String(it.article), name:it.name||'', sell:null }));
       break;
     }
   }
+  // Цена продажи -- из последнего расчёта (sellprice_*) этого селлера, у кого она есть для артикула.
+  try {
+    const sells = (await loadAllSellPriceSnapshotDates()).filter(u=>u.ipSlug===slug).reverse();
+    for(const u of sells.slice(0,3)){
+      const snap = await driveDownloadJSON(u.fileId);
+      const map = new Map();
+      ((snap&&snap.items)||[]).forEach(it=>{ if(it.article && it.sell!=null) map.set(normalizeArticleForMatch(it.article), Number(it.sell)); });
+      let any = false;
+      result.forEach(r=>{ if(r.sell==null){ const v = map.get(normalizeArticleForMatch(r.article)); if(v!=null){ r.sell = v; any = true; } } });
+      if(!result.some(r=>r.sell==null)) break;
+    }
+  } catch(e){ console.error(e); }
   ARTICLE_OPTIONS_CACHE.set(slug, result);
   return result;
 }
@@ -3388,8 +3400,8 @@ window.loadArticleOptions = async function(){
   try {
     const opts = name ? await articleOptionsForSeller(slugify(name)) : [];
     if(sellerSel && sellerSel.value !== name) return; // селлера успели переключить
-    sel.innerHTML = '<option value="">' + (opts.length ? 'Выберите товар из прайса…' : 'В прайсе селлера нет товаров — введите артикул') + '</option>'
-      + opts.map(o=>`<option value="${escapeHtml(o.article)}">${escapeHtml(o.article)}${o.name?' — '+escapeHtml(o.name):''}</option>`).join('');
+    sel.innerHTML = '<option value="">' + (opts.length ? 'Выберите товар из прайса…' : 'Нет списка товаров — введите артикул') + '</option>'
+      + opts.map(o=>`<option value="${escapeHtml(o.article)}">${escapeHtml(o.name || o.article)}${o.sell!=null?' — '+fmtMoney(o.sell):''}</option>`).join('');
   } catch(e){ console.error(e); sel.innerHTML = '<option value="">Не удалось загрузить список</option>'; }
 };
 window.pickArticleOption = function(){
