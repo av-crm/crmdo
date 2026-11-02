@@ -126,6 +126,7 @@
     </div>
     <div class="btn-row">
       <button class="btn secondary" onclick="refreshAll()">↻ Обновить данные</button>
+      <button class="btn secondary" onclick="window.cleanupAll()" title="Очистить кэш в памяти браузера и отправить старые версии файлов в Корзину Google Диска">🧹 Очистить</button>
       <a class="btn secondary" id="driveLink" href="#" target="_blank" style="text-decoration:none;">Открыть папку на Диске</a>
       <button class="btn secondary" onclick="signOut()">Выйти</button>
     </div>
@@ -494,7 +495,7 @@
     </div>
     <div class="card">
       <h2>Хранилище</h2>
-      <p class="hint">Все данные хранятся в вашем Google Диске в папке <b>CRM_Данные</b>, в виде JSON-файлов, разложенных по подпапкам: Заявки, Прайсы, Долг продавца и Настройки (там же — список пользователей и их прав). Копия-версия в историю пишется не чаще раза в 15 минут (текущее состояние сохраняется при каждой правке). Старые версии (кроме последних 30 и по одной за каждый из последних 30 дней) автоматически отправляются в Корзину раз в сутки, когда CRM открывает администратор; кнопкой ниже можно сделать это сразу.</p>
+      <p class="hint">Все данные хранятся в вашем Google Диске в папке <b>CRM_Данные</b>, в виде JSON-файлов, разложенных по подпапкам: Заявки, Прайсы, Долг продавца и Настройки (там же — список пользователей и их прав). Копия-версия в историю пишется не чаще раза в 15 минут (текущее состояние сохраняется при каждой правке). Старые версии (кроме последних 30 и по одной за каждый из последних 30 дней) автоматически отправляются в Корзину раз в сутки, когда CRM открывает любой пользователь; кнопкой ниже (или кнопкой «Очистить» в шапке — она доступна всем) можно сделать это сразу.</p>
       <div class="btn-row">
         <a class="btn secondary" id="driveLink2" href="#" target="_blank" style="text-decoration:none;">Открыть папку CRM_Данные на Диске</a>
         <button class="btn secondary" type="button" onclick="window.pruneOldVersions()">Очистить старые версии</button>
@@ -628,7 +629,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.55';
+const APP_VERSION = '2026-08-08.56';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -1436,9 +1437,17 @@ async function trashFilesParallel(toTrash, onProgress){
   await Promise.all([worker(), worker(), worker(), worker()]);
   return { done, failed, firstError };
 }
+// Кнопка в шапке (доступна всем): сброс кэшей в памяти + очистка старых версий файлов на Диске.
+window.cleanupAll = async function(){
+  try { PA.cache.clear(); PA.data = null; ARTICLE_OPTIONS_CACHE.clear(); STOCK.loaded = false; STOCK.bySeller = new Map(); } catch(e){ console.error(e); }
+  toast('Кэш в памяти очищен', 'ok');
+  await window.pruneOldVersions();
+  loadStockBaselines().catch(e=>console.error(e));
+};
 window.pruneOldVersions = async function(){
-  const hint = document.getElementById('pruneHint');
-  if(!isAdmin()){ toast('Очистка доступна только администратору', 'err'); return; }
+  const hintEl = document.getElementById('pruneHint');
+  // У пользователей без доступа к «Настройкам» нет поля под кнопкой -- сообщаем уведомлениями.
+  const hint = hintEl || { set textContent(v){ if(v) toast(v, 'ok'); } };
   try {
     if(hint) hint.textContent = 'Считаю старые версии…';
     const stats = {};
@@ -1457,14 +1466,14 @@ window.pruneOldVersions = async function(){
     toast('Ошибка очистки: ' + e.message, 'err');
   }
 };
-// Автоочистка: раз в сутки (на этом браузере) под админом, без вопросов и без тостов -- тот же
+// Автоочистка: раз в сутки (на этом браузере) у любого пользователя, без вопросов и без тостов -- тот же
 // набор правил, что у кнопки выше (30 последних версий + по одной за каждый из последних 30 дней).
 // Версии -- полные копии всех данных на момент сохранения, актуальное состояние лежит в *_current.json,
 // так что удаляются только старые "точки отката". Любой сбой молча игнорируется.
 const PRUNE_LAST_KEY = 'crm_last_prune_at';
 let PRUNE_RUNNING = false;
 async function maybeAutoPrune(){
-  if(PRUNE_RUNNING || !isAdmin()) return;
+  if(PRUNE_RUNNING) return;
   try {
     const last = Number(localStorage.getItem(PRUNE_LAST_KEY)) || 0;
     if(Date.now() - last < 24*3600*1000) return;
@@ -1647,7 +1656,7 @@ async function refreshAll(){
     // access, since STATE.users is only refreshed by this function.
     applyAccessControl();
     loadStockBaselines().catch(e=>console.error(e)); // фоном: остатки
-    maybeAutoPrune(); // не ждём: фоновая очистка старых версий раз в сутки (только админ)
+    maybeAutoPrune(); // не ждём: фоновая очистка старых версий раз в сутки (у любого пользователя)
   } catch(e){
     console.error(e);
     document.getElementById('syncInfo').textContent = 'Ошибка загрузки данных.';
