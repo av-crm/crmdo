@@ -143,6 +143,7 @@
     <button class="tab-btn" data-tab="debt" onclick="switchTab('debt')">Долг продавца</button>
     <button class="tab-btn" data-tab="reconcile" onclick="switchTab('reconcile')">Сверка</button>
     <button class="tab-btn" data-tab="stock" onclick="switchTab('stock')">Остатки</button>
+    <button class="tab-btn" data-tab="priceanalysis" onclick="switchTab('priceanalysis')">Анализ цен</button>
     <button class="tab-btn" data-tab="settings" onclick="switchTab('settings')">Настройки</button>
   </div>
 
@@ -388,6 +389,30 @@
     </div>
   </div>
 
+  <!-- PRICE ANALYSIS TAB -->
+  <div class="panel" id="panel-priceanalysis">
+    <div class="card">
+      <h2>Анализ цен</h2>
+      <p class="hint">Как меняются цены каждого селлера и как они соотносятся друг с другом. Данные — из загруженных прайсов («Прайсы»): цена закупки (СС) или цена продажи из расчётов.</p>
+      <div class="btn-row" style="align-items:flex-end;flex-wrap:wrap;">
+        <div class="field" style="max-width:200px;"><label>Цена</label>
+          <select id="pa_kind" onchange="window.paOnKindChange()"><option value="cc">Цена закупки (СС)</option><option value="sell">Цена продажи</option></select></div>
+        <div class="field" style="max-width:150px;"><label>Разрез</label>
+          <select id="pa_mode" onchange="window.paSetDefaults(); window.runPriceAnalysis()"><option value="day">По дням</option><option value="week">По неделям</option></select></div>
+        <div class="field" style="max-width:170px;"><label>С</label><input type="date" id="pa_from"></div>
+        <div class="field" style="max-width:170px;"><label>По</label><input type="date" id="pa_to"></div>
+        <button class="btn" type="button" onclick="window.runPriceAnalysis()">Построить</button>
+      </div>
+      <div style="margin-top:10px;"><label style="font-size:12px;">Селлеры</label>
+        <div id="pa_sellers" style="display:flex;gap:14px;flex-wrap:wrap;"></div></div>
+      <div id="pa_summary" style="margin-top:14px;"></div>
+      <div id="pa_compare" style="margin-top:14px;"></div>
+      <div id="pa_charts" style="margin-top:14px;"></div>
+      <div style="margin-top:14px;"><input type="text" id="pa_filter" placeholder="Поиск по артикулу / названию в таблице" style="max-width:320px;" oninput="window.paRenderTable()"></div>
+      <div id="pa_table" style="margin-top:8px;overflow-x:auto;"></div>
+    </div>
+  </div>
+
   <!-- STOCK TAB -->
   <div class="panel" id="panel-stock">
     <div class="card">
@@ -502,6 +527,7 @@
           <label style="display:flex;align-items:center;gap:4px;font-size:12px;font-weight:400;"><input type="checkbox" class="u_section" value="debt" checked style="width:auto;"> Долг продавца</label>
           <label style="display:flex;align-items:center;gap:4px;font-size:12px;font-weight:400;"><input type="checkbox" class="u_section" value="reconcile" checked style="width:auto;"> Сверка</label>
           <label style="display:flex;align-items:center;gap:4px;font-size:12px;font-weight:400;"><input type="checkbox" class="u_section" value="stock" checked style="width:auto;"> Остатки</label>
+          <label style="display:flex;align-items:center;gap:4px;font-size:12px;font-weight:400;"><input type="checkbox" class="u_section" value="priceanalysis" checked style="width:auto;"> Анализ цен</label>
           <label style="display:flex;align-items:center;gap:4px;font-size:12px;font-weight:400;"><input type="checkbox" class="u_section" value="settings" checked style="width:auto;"> Настройки</label>
         </div>
       </div>
@@ -602,7 +628,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.54';
+const APP_VERSION = '2026-08-08.55';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -674,6 +700,7 @@ const ACCESS_SECTIONS = [
   { id:'debt', label:'Долг продавца' },
   { id:'reconcile', label:'Сверка' },
   { id:'stock', label:'Остатки' },
+  { id:'priceanalysis', label:'Анализ цен' },
   { id:'settings', label:'Настройки' },
 ];
 let currentUserEmail = null;
@@ -1637,6 +1664,7 @@ function switchTab(name){
   // without needing every single order-mutating function to know about these tabs.
   if(name==='reports'){ renderReportContragentFilter(); renderSalesReportGrid(); }
   if(name==='debt'){ renderDebtGrid(); renderDebtPaymentsGrid(); }
+  if(name==='priceanalysis'){ window.openPriceAnalysis(); }
   if(name==='stock'){ if(!STOCK.loaded && !STOCK.loading){ window.refreshStock(); } else window.renderStockTable(); }
 }
 // ================= RECONCILE (Сверка) =================
@@ -1856,6 +1884,228 @@ window.setOrderItemQty = async function(id, itemId, val){
   catch(e){ markOrdersDirty(); toast('Не удалось сохранить сразу, нажмите «Сохранить изменения»: ' + e.message, 'err'); }
   renderOrdersGrid();
   window.viewOrderDetails(id);
+};
+
+/* ================= АНАЛИЗ ЦЕН (динамика цен по селлерам) =================
+   Источники: price_upload_* (цена закупки/СС: последняя непустая цена позиции в загрузке) и
+   sellprice_* (цена продажи). Цена артикула на день D у селлера = значение из самой свежей загрузки
+   не позже D (ступенчато, "тянется" вперёд до следующей загрузки). Индекс цен селлера на день =
+   средняя цена по ОБЩИМ артикулам (артикулы, у которых есть цена у всех сравниваемых селлеров на
+   последний день периода) -- набор фиксирован на весь период, поэтому линия не скачет из-за
+   смены ассортимента. Недели -- с понедельника, значение недели = среднее дневных значений. */
+const PA = { cache:new Map(), data:null, running:false };
+const PA_COLORS = ['#2563eb','#dc2626','#16a34a','#d97706','#7c3aed','#0891b2','#db2777','#65a30d'];
+function paAddDays(dateStr, n){ const d = new Date(dateStr+'T00:00:00Z'); d.setUTCDate(d.getUTCDate()+n); return d.toISOString().slice(0,10); }
+function paWeekStart(dateStr){ const d = new Date(dateStr+'T00:00:00Z'); const wd = (d.getUTCDay()+6)%7; return paAddDays(dateStr, -wd); }
+function paMonthStart(dateStr){ return dateStr.slice(0,8)+'01'; }
+function paDays(from, to){ const out = []; for(let d=from; d<=to; d=paAddDays(d,1)) out.push(d); return out; }
+function paShortDate(d){ return d.slice(8,10)+'.'+d.slice(5,7); }
+async function paDownload(fileId){
+  if(PA.cache.has(fileId)) return PA.cache.get(fileId);
+  const snap = await driveDownloadJSON(fileId);
+  PA.cache.set(fileId, snap);
+  return snap;
+}
+async function paMapLimit(list, limit, fn){
+  const res = new Array(list.length); let i = 0;
+  await Promise.all(Array.from({length:Math.min(limit,list.length)}, async ()=>{
+    while(i < list.length){ const k = i++; res[k] = await fn(list[k]); }
+  }));
+  return res;
+}
+// Значение позиции в загрузке: для закупки -- последняя непустая цена, для продажи -- sell.
+function paItemValue(kind, it){
+  if(kind==='sell'){ const v = Number(it.sell); return (it.sell!=null && isFinite(v) && v>0) ? v : null; }
+  const prices = it.prices || [];
+  for(let i=prices.length-1; i>=0; i--){ const v = prices[i] && prices[i].value; if(v!=null && isFinite(Number(v)) && Number(v)>0) return Number(v); }
+  return null;
+}
+// Список селлеров, у которых есть данные нужного вида (по именам файлов, без скачивания).
+async function paListSellers(kind){
+  const files = kind==='sell' ? await loadAllSellPriceSnapshotDates() : await loadAllPriceUploadDates();
+  const bySlug = new Map();
+  files.forEach(f=>{ if(!f.ipSlug) return; if(!bySlug.has(f.ipSlug)) bySlug.set(f.ipSlug, []); bySlug.get(f.ipSlug).push(f); });
+  return bySlug;
+}
+// Строит данные: { days, sellers:[{slug,name,color,daily:{day->avg}, prices:{article->value на конец периода}}], commonArticles, names }
+async function paBuild(kind, from, to, selectedSlugs){
+  const bySlug = await paListSellers(kind);
+  const slugs = Array.from(bySlug.keys()).filter(s=>!selectedSlugs || selectedSlugs.includes(s));
+  const names = new Map(); // нормализованный артикул -> {article,name}
+  const perSeller = [];
+  for(const slug of slugs){
+    const files = bySlug.get(slug).slice().sort((a,b)=> a.date.localeCompare(b.date) || new Date(a.createdTime)-new Date(b.createdTime));
+    const before = files.filter(f=>f.date < from);
+    const need = [].concat(before.length ? [before[before.length-1]] : [], files.filter(f=>f.date>=from && f.date<=to));
+    if(!need.length) continue;
+    const snaps = await paMapLimit(need, 6, async f=>{ try { return { f, snap: await paDownload(f.fileId) }; } catch(e){ console.error(e); return { f, snap:null }; } });
+    perSeller.push({ slug, snaps: snaps.filter(x=>x.snap) });
+  }
+  const days = paDays(from, to);
+  // Ступенчатое состояние по дням для каждого селлера
+  const sellers = perSeller.map((ps,idx)=>{
+    const state = new Map(); // norm article -> value
+    const byDay = new Map();
+    ps.snaps.forEach(x=>{ const d = x.f.date < from ? from : x.f.date; if(!byDay.has(d)) byDay.set(d, []); byDay.get(d).push(x.snap); });
+    const perDay = {}; // day -> Map snapshot (копия состояния)
+    days.forEach(d=>{
+      (byDay.get(d)||[]).forEach(snap=>{
+        (snap.items||[]).forEach(it=>{
+          if(!it.article) return;
+          const v = paItemValue(kind, it); if(v==null) return;
+          const key = normalizeArticleForMatch(it.article);
+          state.set(key, v);
+          if(!names.has(key)) names.set(key, { article:String(it.article), name: it.name||'' });
+          else if(!names.get(key).name && it.name) names.get(key).name = it.name;
+        });
+      });
+      perDay[d] = new Map(state);
+    });
+    return { slug: ps.slug, name: sellerNameForSlug(ps.slug), color: PA_COLORS[idx % PA_COLORS.length], perDay };
+  });
+  // Общие артикулы: цена есть у ВСЕХ сравниваемых селлеров на последний день
+  const withData = sellers.filter(s=>s.perDay[to] && s.perDay[to].size);
+  let common = [];
+  if(withData.length){
+    common = Array.from(withData[0].perDay[to].keys()).filter(k=>withData.every(s=>s.perDay[to].has(k)));
+  }
+  sellers.forEach(s=>{
+    s.daily = {};
+    days.forEach(d=>{
+      const m = s.perDay[d]; if(!m || !m.size || !common.length){ s.daily[d] = null; return; }
+      let sum = 0, n = 0; common.forEach(k=>{ if(m.has(k)){ sum += m.get(k); n++; } });
+      s.daily[d] = n===common.length ? sum/n : null; // день без полного набора общих артикулов -- пропуск
+    });
+    s.last = s.perDay[to] || new Map();
+  });
+  return { kind, from, to, days, sellers, common, names };
+}
+// Агрегация по неделям (понедельник): среднее из дневных значений
+function paAggregate(data, mode){
+  if(mode!=='week') return { labels: data.days.slice(), keys: data.days.slice(), series: data.sellers.map(s=>({ ...s, values: data.days.map(d=>s.daily[d]) })) };
+  const keys = []; const idx = new Map();
+  data.days.forEach(d=>{ const w = paWeekStart(d); if(!idx.has(w)){ idx.set(w, keys.length); keys.push(w); } });
+  const series = data.sellers.map(s=>{
+    const sums = keys.map(()=>0), cnt = keys.map(()=>0);
+    data.days.forEach(d=>{ const v = s.daily[d]; if(v==null) return; const k = idx.get(paWeekStart(d)); sums[k]+=v; cnt[k]++; });
+    return { ...s, values: keys.map((_,k)=>cnt[k]?sums[k]/cnt[k]:null) };
+  });
+  return { labels: keys, keys, series };
+}
+// Простой SVG-график (без внешних библиотек): несколько линий, пропуски = разрыв линии.
+function paSvgChart(labels, lines, mode, height){
+  const W = 760, H = height || 240, L = 62, R = 14, T = 12, B = 30;
+  const all = []; lines.forEach(l=>l.values.forEach(v=>{ if(v!=null) all.push(v); }));
+  if(!all.length) return '<div class="hint">Нет данных за выбранный период</div>';
+  let min = Math.min(...all), max = Math.max(...all);
+  if(min===max){ min = min*0.98; max = max*1.02 || 1; }
+  const pad = (max-min)*0.1; min = Math.max(0, min-pad); max = max+pad;
+  const n = labels.length;
+  const x = i => L + (n<=1 ? (W-L-R)/2 : i*(W-L-R)/(n-1));
+  const y = v => T + (max-v)*(H-T-B)/(max-min);
+  let svg = `<svg viewBox="0 0 ${W} ${H}" style="width:100%;max-width:${W}px;height:auto;font-family:inherit;">`;
+  for(let g=0; g<=4; g++){
+    const v = min + (max-min)*g/4, yy = y(v);
+    svg += `<line x1="${L}" x2="${W-R}" y1="${yy}" y2="${yy}" stroke="#e5e7eb"/><text x="${L-6}" y="${yy+4}" font-size="11" text-anchor="end" fill="#6b7280">${Math.round(v).toLocaleString('ru-RU')}</text>`;
+  }
+  const step = Math.max(1, Math.ceil(n/10));
+  labels.forEach((lb,i)=>{ if(i%step===0 || i===n-1) svg += `<text x="${x(i)}" y="${H-10}" font-size="11" text-anchor="middle" fill="#6b7280">${mode==='week' ? paShortDate(lb)+'+' : paShortDate(lb)}</text>`; });
+  lines.forEach(l=>{
+    let path = '', pen = false;
+    l.values.forEach((v,i)=>{ if(v==null){ pen = false; return; } path += (pen?'L':'M')+x(i).toFixed(1)+' '+y(v).toFixed(1)+' '; pen = true; });
+    svg += `<path d="${path}" fill="none" stroke="${l.color}" stroke-width="2"/>`;
+    l.values.forEach((v,i)=>{ if(v==null) return;
+      const tip = `${l.name}: ${Math.round(v).toLocaleString('ru-RU')} ₽, ${mode==='week' ? 'неделя с ' : ''}${fmtDateLabel(labels[i])}`;
+      svg += `<circle cx="${x(i).toFixed(1)}" cy="${y(v).toFixed(1)}" r="${n>40?2:3}" fill="${l.color}"><title>${escapeHtml(tip)}</title></circle>`;
+    });
+  });
+  return svg + '</svg>';
+}
+function paFirstLast(values){
+  let first = null, last = null;
+  values.forEach(v=>{ if(v!=null){ if(first==null) first = v; last = v; } });
+  return { first, last, pct: (first!=null && last!=null && first>0) ? (last-first)/first*100 : null };
+}
+function paPctHtml(p){ if(p==null) return '—'; const c = p>0?'#dc2626':(p<0?'#16a34a':'#6b7280'); return `<span style="color:${c};">${p>0?'+':''}${p.toFixed(1).replace('.',',')}%</span>`; }
+window.paRender = function(){
+  const D = PA.data; if(!D) return;
+  const mode = document.getElementById('pa_mode').value;
+  const agg = paAggregate(D, mode);
+  const unit = D.kind==='sell' ? 'цена продажи' : 'цена закупки (СС)';
+  const sum = document.getElementById('pa_summary'), cmp = document.getElementById('pa_compare'), ch = document.getElementById('pa_charts'), tb = document.getElementById('pa_table');
+  if(!agg.series.length){ sum.innerHTML = '<div class="empty">Нет загрузок за выбранный период у выбранных селлеров.</div>'; cmp.innerHTML = ch.innerHTML = tb.innerHTML = ''; return; }
+  // Сводка
+  sum.innerHTML = `<p class="hint">Индекс цен = средняя ${unit} по общим артикулам (${D.common.length} шт.), у которых есть цена у всех сравниваемых селлеров на ${fmtDateLabel(D.to)}.</p>
+    <table class="preview"><tr><th>Селлер</th><th>Индекс в начале, ₽</th><th>Индекс в конце, ₽</th><th>Изменение</th><th>Позиций в прайсе</th></tr>
+    ${agg.series.map(s=>{ const fl = paFirstLast(s.values); return `<tr><td><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:${s.color};margin-right:6px;"></span>${escapeHtml(s.name)}</td><td>${fl.first!=null?fmtMoney(fl.first):'—'}</td><td>${fl.last!=null?fmtMoney(fl.last):'—'}</td><td>${paPctHtml(fl.pct)}</td><td>${s.last.size}</td></tr>`; }).join('')}</table>`;
+  // Сводный график
+  cmp.innerHTML = '<h3>Все селлеры</h3>' + (D.common.length ? paSvgChart(agg.labels, agg.series, mode, 280) + '<div style="display:flex;gap:14px;flex-wrap:wrap;font-size:12px;">' + agg.series.map(s=>`<span><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:${s.color};margin-right:4px;"></span>${escapeHtml(s.name)}</span>`).join('') + '</div>' : '<div class="hint">Нет общих артикулов у всех выбранных селлеров — сводный индекс не посчитать. Выберите селлеров с пересекающимся ассортиментом или смотрите таблицу ниже.</div>');
+  // По графику на селлера
+  ch.innerHTML = '<h3>По селлерам</h3><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(380px,1fr));gap:16px;">' +
+    agg.series.map(s=>`<div class="card" style="padding:10px;"><strong>${escapeHtml(s.name)}</strong> ${paPctHtml(paFirstLast(s.values).pct)}${paSvgChart(agg.labels, [s], mode, 200)}</div>`).join('') + '</div>';
+  window.paRenderTable();
+};
+// Таблица "артикул × селлер" на последний день периода
+window.paRenderTable = function(){
+  const D = PA.data; const tb = document.getElementById('pa_table'); if(!D || !tb) return;
+  const q = ((document.getElementById('pa_filter')||{}).value||'').trim().toLowerCase();
+  const keys = new Set(); D.sellers.forEach(s=>s.last.forEach((v,k)=>keys.add(k)));
+  const rows = [];
+  keys.forEach(k=>{
+    const vals = D.sellers.map(s=>s.last.has(k) ? s.last.get(k) : null);
+    const present = vals.filter(v=>v!=null);
+    if(present.length < 2) return; // сравнивать нечего
+    const nm = D.names.get(k) || { article:k, name:'' };
+    if(q && !(nm.article+' '+nm.name).toLowerCase().includes(q)) return;
+    const mn = Math.min(...present), mx = Math.max(...present);
+    rows.push({ nm, vals, mn, mx, diff: mx-mn, pct: mn>0 ? (mx-mn)/mn*100 : null, cheapest: D.sellers[vals.indexOf(mn)].name });
+  });
+  rows.sort((a,b)=>(b.pct||0)-(a.pct||0));
+  const shown = rows.slice(0, 300);
+  tb.innerHTML = `<h3>Сравнение по артикулам на ${fmtDateLabel(D.to)}</h3>
+    <p class="hint">Артикулы, у которых есть цена минимум у двух селлеров; сверху — с наибольшим разбросом. Зелёным выделена минимальная цена. Найдено: ${rows.length}${rows.length>shown.length?' (показаны первые 300)':''}.</p>
+    <table class="preview"><tr><th>Артикул</th><th>Название</th>${D.sellers.map(s=>`<th>${escapeHtml(s.name)}</th>`).join('')}<th>Разброс, ₽</th><th>Разброс, %</th><th>Дешевле всех</th></tr>
+    ${shown.map(r=>`<tr><td>${escapeHtml(r.nm.article)}</td><td>${escapeHtml(r.nm.name)}</td>${r.vals.map(v=>`<td style="${v!=null&&v===r.mn?'color:#16a34a;font-weight:600;':''}">${v!=null?fmtMoney(v):'—'}</td>`).join('')}<td>${fmtMoney(r.diff)}</td><td>${r.pct!=null?r.pct.toFixed(1).replace('.',','):'—'}</td><td>${escapeHtml(r.cheapest)}</td></tr>`).join('') || `<tr><td colspan="${5+D.sellers.length}" class="hint">Ничего не найдено</td></tr>`}</table>`;
+};
+async function paLoadSellerChecks(force){
+  const kind = document.getElementById('pa_kind').value;
+  const box = document.getElementById('pa_sellers');
+  const prev = new Set(Array.from(box.querySelectorAll('input:checked')).map(i=>i.value));
+  const hadAny = box.querySelectorAll('input').length>0;
+  const bySlug = await paListSellers(kind);
+  const slugs = Array.from(bySlug.keys()).sort((a,b)=>sellerNameForSlug(a).localeCompare(sellerNameForSlug(b),'ru'));
+  box.innerHTML = slugs.map(s=>`<label style="display:flex;align-items:center;gap:4px;font-size:13px;font-weight:400;"><input type="checkbox" class="pa_seller" value="${escapeHtml(s)}" ${(!hadAny||prev.has(s))?'checked':''} style="width:auto;"> ${escapeHtml(sellerNameForSlug(s))}</label>`).join('') || '<span class="hint">Нет загруженных прайсов</span>';
+}
+window.paSetDefaults = function(){
+  const mode = document.getElementById('pa_mode').value, today = todayStr();
+  document.getElementById('pa_to').value = today;
+  document.getElementById('pa_from').value = mode==='week' ? paAddDays(today, -83) : paMonthStart(today);
+};
+window.paOnKindChange = async function(){ await paLoadSellerChecks(); window.runPriceAnalysis(); };
+window.runPriceAnalysis = async function(){
+  if(PA.running) return;
+  PA.running = true;
+  const sum = document.getElementById('pa_summary');
+  try {
+    const kind = document.getElementById('pa_kind').value;
+    let from = document.getElementById('pa_from').value, to = document.getElementById('pa_to').value;
+    if(!from || !to){ sum.innerHTML = '<div class="empty">Укажите период.</div>'; return; }
+    if(from > to){ const t = from; from = to; to = t; }
+    if(paDays(from,to).length > 400){ sum.innerHTML = '<div class="empty">Период слишком длинный (максимум 400 дней).</div>'; return; }
+    const checked = Array.from(document.querySelectorAll('#pa_sellers .pa_seller:checked')).map(i=>i.value);
+    if(!checked.length && document.querySelectorAll('#pa_sellers .pa_seller').length){ sum.innerHTML = '<div class="empty">Отметьте хотя бы одного селлера.</div>'; return; }
+    sum.innerHTML = '<div class="loading">Загрузка прайсов и расчёт…</div>';
+    PA.data = await paBuild(kind, from, to, checked);
+    window.paRender();
+  } catch(e){
+    console.error(e);
+    sum.innerHTML = '<div class="empty">Ошибка: ' + escapeHtml(e.message) + '</div>';
+  } finally { PA.running = false; }
+};
+window.openPriceAnalysis = async function(){
+  if(!document.getElementById('pa_from').value) window.paSetDefaults();
+  if(!document.querySelectorAll('#pa_sellers input').length) await paLoadSellerChecks();
+  if(!PA.data) window.runPriceAnalysis(); else window.paRender();
 };
 
 /* ================= STATUSES ================= */
