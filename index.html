@@ -602,7 +602,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.53';
+const APP_VERSION = '2026-08-08.54';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -5263,9 +5263,18 @@ function parseCalcWorkbookRows(rows){
   });
   const priceCols = []; const seenDates = {};
   headerRow.forEach((v,c)=>{
+    // Дата в шапке может быть настоящей датой Excel ИЛИ текстом "02.11.2026" / "2.11.26" / "02/11/2026"
+    // (формат партнёра, например «Хасуева_Доска_объявлений_кост»).
+    let dayMonth = null;
     if(v instanceof Date){
       // Use UTC getters (not toLocaleDateString) so the label doesn't shift with timezone/epoch quirks
-      let label = String(v.getUTCDate()).padStart(2,'0') + '.' + String(v.getUTCMonth()+1).padStart(2,'0');
+      dayMonth = [v.getUTCDate(), v.getUTCMonth()+1];
+    } else if(typeof v==='string'){
+      const m = v.trim().match(/^(\d{1,2})[.\/-](\d{1,2})[.\/-](\d{2}|\d{4})$/);
+      if(m && +m[1]>=1 && +m[1]<=31 && +m[2]>=1 && +m[2]<=12) dayMonth = [+m[1], +m[2]];
+    }
+    if(dayMonth){
+      let label = String(dayMonth[0]).padStart(2,'0') + '.' + String(dayMonth[1]).padStart(2,'0');
       seenDates[label] = (seenDates[label]||0) + 1;
       if(seenDates[label] > 1) label += ' (' + seenDates[label] + ')';
       priceCols.push({ index:c, label });
