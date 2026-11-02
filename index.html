@@ -629,7 +629,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.56';
+const APP_VERSION = '2026-08-08.57';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -1410,12 +1410,13 @@ function pickVersionsToPrune(files, prefix, nowMs){
 }
 // collectStats (необязательный объект) заполняется диагностикой: сколько всего файлов-версий найдено
 // в каждой папке -- чтобы по результату было видно, ЧТО именно нашла очистка.
-async function collectVersionsToPrune(collectStats){
+async function collectVersionsToPrune(collectStats, onStage){
   await ensureDataFolders();
   const targets = [ [FOLDERS.orders,'orders_'], [FOLDERS.debt,'debt_'], [FOLDERS.config,'settings_'] ];
   let toTrash = [];
   for(const [folderId, prefix] of targets){
     if(!folderId) continue;
+    if(onStage) onStage(prefix);
     const files = await listFolderFilesPaged(folderId, prefix);
     const toPrune = pickVersionsToPrune(files, prefix, Date.now());
     if(collectStats) collectStats[prefix] = { total: files.length, prune: toPrune.length };
@@ -1431,40 +1432,84 @@ async function trashFilesParallel(toTrash, onProgress){
       const f = queue.shift();
       try { await driveTrashFile(f.id); } catch(e){ failed++; if(!firstError) firstError = e.message; console.error(e); }
       done++;
-      if(onProgress && done % 20 === 0) onProgress(done);
+      if(onProgress && (done % 5 === 0 || queue.length === 0)) onProgress(done);
     }
   }
   await Promise.all([worker(), worker(), worker(), worker()]);
   return { done, failed, firstError };
 }
+// Панель прогресса (внизу справа): для долгих операций. Возвращает контроллер:
+// set(текст, готово, всего) -- без готово/всего полоса "бегущая"; finish(текст, ok) -- итог (остаётся, пока не закроют).
+function progressPanel(title){
+  let el = document.getElementById('progressPanel');
+  if(!el){
+    el = document.createElement('div'); el.id = 'progressPanel';
+    el.style.cssText = 'position:fixed;right:16px;bottom:16px;width:340px;background:#fff;border:1px solid #d1d5db;border-radius:10px;box-shadow:0 6px 24px rgba(0,0,0,.18);padding:12px 14px;z-index:9999;font-size:13px;';
+    document.body.appendChild(el);
+  }
+  el.innerHTML = `<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;"><strong id="pp_title"></strong><button type="button" id="pp_close" style="display:none;border:0;background:none;font-size:16px;cursor:pointer;" onclick="this.closest('#progressPanel').remove()">✕</button></div>
+    <div id="pp_text" style="margin:6px 0;color:#374151;"></div>
+    <div style="height:8px;background:#e5e7eb;border-radius:4px;overflow:hidden;"><div id="pp_bar" style="height:100%;width:30%;background:#2563eb;border-radius:4px;transition:width .2s;"></div></div>
+    <div id="pp_pct" style="margin-top:4px;color:#6b7280;font-size:12px;"></div>`;
+  el.querySelector('#pp_title').textContent = title;
+  const bar = el.querySelector('#pp_bar'), text = el.querySelector('#pp_text'), pct = el.querySelector('#pp_pct');
+  let tick = null, pos = 0;
+  function startIndeterminate(){ stopIndeterminate(); tick = setInterval(()=>{ pos = (pos+7)%100; bar.style.width = '30%'; bar.style.marginLeft = Math.min(pos,70)+'%'; }, 120); }
+  function stopIndeterminate(){ if(tick){ clearInterval(tick); tick = null; } bar.style.marginLeft = '0'; }
+  startIndeterminate();
+  return {
+    set(t, done, total){
+      if(!el.isConnected) return;
+      text.textContent = t;
+      if(total){ stopIndeterminate(); const w = Math.min(100, Math.round(done/total*100)); bar.style.width = w+'%'; pct.textContent = `${done} из ${total} (${w}%)`; }
+      else { pct.textContent = ''; if(!tick) startIndeterminate(); }
+    },
+    finish(t, ok){
+      stopIndeterminate();
+      if(!el.isConnected) return;
+      text.textContent = t; bar.style.width = '100%'; bar.style.background = ok===false ? '#dc2626' : '#16a34a';
+      pct.textContent = ok===false ? 'Завершено с ошибками' : 'Готово';
+      el.querySelector('#pp_close').style.display = '';
+    }
+  };
+}
 // Кнопка в шапке (доступна всем): сброс кэшей в памяти + очистка старых версий файлов на Диске.
 window.cleanupAll = async function(){
   try { PA.cache.clear(); PA.data = null; ARTICLE_OPTIONS_CACHE.clear(); STOCK.loaded = false; STOCK.bySeller = new Map(); } catch(e){ console.error(e); }
-  toast('Кэш в памяти очищен', 'ok');
-  await window.pruneOldVersions();
+  await window.pruneOldVersions(true);
   loadStockBaselines().catch(e=>console.error(e));
 };
-window.pruneOldVersions = async function(){
-  const hintEl = document.getElementById('pruneHint');
-  // У пользователей без доступа к «Настройкам» нет поля под кнопкой -- сообщаем уведомлениями.
-  const hint = hintEl || { set textContent(v){ if(v) toast(v, 'ok'); } };
+const PRUNE_FOLDER_LABELS = { 'orders_':'заявки', 'debt_':'долг продавца', 'settings_':'настройки' };
+window.pruneOldVersions = async function(memoryCleared){
+  if(PRUNE_RUNNING){ toast('Очистка уже выполняется', 'ok'); return; }
+  PRUNE_RUNNING = true;
+  const hint = document.getElementById('pruneHint');
+  const say = t=>{ if(hint) hint.textContent = t; };
+  const pp = progressPanel('Очистка');
+  const memNote = memoryCleared===true ? 'Кэш в памяти очищен. ' : '';
   try {
-    if(hint) hint.textContent = 'Считаю старые версии…';
+    pp.set(memNote + 'Ищу старые версии на Google Диске…'); say('Считаю старые версии…');
     const stats = {};
-    const toTrash = await collectVersionsToPrune(stats);
-    const foundInfo = Object.keys(stats).map(k=>`${k} — найдено ${stats[k].total}, к очистке ${stats[k].prune}`).join('; ');
-    if(!toTrash.length){ if(hint) hint.textContent = `Старых версий для очистки нет. (${foundInfo || 'папки не найдены'})`; return; }
-    if(!confirm(`Старых версий к очистке: ${toTrash.length}. Они будут перемещены в Корзину Google Диска (останутся последние 30 версий и по одной за каждый из последних 30 дней). Продолжить?`)){
-      if(hint) hint.textContent = '';
-      return;
+    const toTrash = await collectVersionsToPrune(stats, prefix=>pp.set(memNote + `Просматриваю папку: ${PRUNE_FOLDER_LABELS[prefix]||prefix}…`));
+    const foundInfo = Object.keys(stats).map(k=>`${PRUNE_FOLDER_LABELS[k]||k}: всего ${stats[k].total}, к очистке ${stats[k].prune}`).join('; ');
+    if(!toTrash.length){
+      const msg = memNote + `Старых версий для очистки нет. (${foundInfo || 'папки не найдены'})`;
+      say(msg); pp.finish(msg, true); return;
     }
-    const { done, failed, firstError } = await trashFilesParallel(toTrash, n=>{ if(hint) hint.textContent = `Очищено ${n} из ${toTrash.length}…`; });
-    if(hint) hint.textContent = `Перемещено в Корзину ${done - failed} из ${toTrash.length}${failed?`, не удалось: ${failed} (${firstError})`:''}. (${foundInfo})`;
-    toast(failed ? `Не удалось переместить ${failed} файлов — см. подробности под кнопкой` : 'Старые версии перемещены в Корзину', failed ? 'err' : 'ok');
+    // Подтверждение: панель остаётся на экране (полоса ждёт), пока пользователь решает.
+    pp.set(`Найдено старых версий: ${toTrash.length}. Ожидаю подтверждения…`);
+    if(!confirm(`Старых версий к очистке: ${toTrash.length}. Они будут перемещены в Корзину Google Диска (останутся последние 30 версий и по одной за каждый из последних 30 дней). Продолжить?`)){
+      say(''); pp.finish(memNote + 'Очистка файлов отменена.', true); return;
+    }
+    pp.set(`Перемещаю в Корзину…`, 0, toTrash.length);
+    const { done, failed, firstError } = await trashFilesParallel(toTrash, n=>{ say(`Очищено ${n} из ${toTrash.length}…`); pp.set('Перемещаю в Корзину…', n, toTrash.length); });
+    const msg = memNote + `Перемещено в Корзину ${done - failed} из ${toTrash.length}${failed?`, не удалось: ${failed} (${firstError})`:''}. (${foundInfo})`;
+    say(msg); pp.finish(msg, !failed);
+    toast(failed ? `Не удалось переместить ${failed} файлов — см. панель справа внизу` : 'Старые версии перемещены в Корзину', failed ? 'err' : 'ok');
   } catch(e){
-    if(hint) hint.textContent = 'Ошибка: ' + e.message;
+    say('Ошибка: ' + e.message); pp.finish('Ошибка: ' + e.message, false);
     toast('Ошибка очистки: ' + e.message, 'err');
-  }
+  } finally { PRUNE_RUNNING = false; }
 };
 // Автоочистка: раз в сутки (на этом браузере) у любого пользователя, без вопросов и без тостов -- тот же
 // набор правил, что у кнопки выше (30 последних версий + по одной за каждый из последних 30 дней).
