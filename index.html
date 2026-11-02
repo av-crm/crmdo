@@ -392,7 +392,7 @@
   <div class="panel" id="panel-stock">
     <div class="card">
       <h2>Остатки</h2>
-      <p class="hint">Остатки ведутся для селлеров, у которых в последней загрузке прайса («Прайсы») есть колонка «Кол-во» / «Количество» / «Остаток» — она задаёт текущий остаток на дату загрузки. Дальше остаток уменьшают заявки в статусах «Оплачена», «Выставлен счёт», «Сделка завершена» (с датой заявки не раньше даты загрузки) на количество штук товара в заявке. Новая загрузка с количеством сбрасывает остаток.</p>
+      <p class="hint">Остатки ведутся для селлеров, у которых в последней загрузке прайса («Прайсы») есть колонка «Кол-во» / «Количество» / «Остаток» — она задаёт текущий остаток на дату загрузки. Дальше остаток уменьшают заявки в статусах «Оплачена», «Выставлен счёт», «Подтверждён», «Сделка завершена» (с датой заявки не раньше даты загрузки) на количество штук товара в заявке. Новая загрузка с количеством сбрасывает остаток.</p>
       <div class="btn-row" style="align-items:flex-end;">
         <div class="field" style="max-width:260px;"><label>Поиск</label><input type="text" id="stockFilter" placeholder="Артикул, название, селлер" oninput="window.renderStockTable()"></div>
         <button class="btn secondary" type="button" onclick="window.refreshStock()">Обновить</button>
@@ -602,7 +602,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.52';
+const APP_VERSION = '2026-08-08.53';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -1746,6 +1746,8 @@ let STOCK = { loaded:false, loading:false, bySeller:new Map() };
 function paidLikeStatusIds(){
   const set = new Set(STATE.paidStatusIds || []);
   if(STATE.dealDoneStatusId) set.add(STATE.dealDoneStatusId);
+  // Статус «Подтверждён/Подтверждена» тоже списывает остаток (ищем по названию статуса).
+  (STATE.statuses||[]).forEach(st=>{ if(/подтвержд/i.test(st.label||'')) set.add(st.id); });
   return set;
 }
 async function loadStockBaselines(){
