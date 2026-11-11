@@ -629,7 +629,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.58';
+const APP_VERSION = '2026-08-08.59';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -1549,17 +1549,23 @@ async function saveState(deleted){
     STATE.deletedStatusIds = Array.from(new Set([...(STATE.deletedStatusIds||[]), ...deleted.statuses]));
   }
   const deletedStatusIds = (STATE.deletedStatusIds && STATE.deletedStatusIds.length) ? new Set(STATE.deletedStatusIds) : null;
+  const T0 = Date.now(), timing = {};
+  const stage = (name)=>{ timing[name] = Date.now() - T0; const h = document.getElementById('ordersSaveHint'); if(h && h.textContent.startsWith('Сохранение')) h.textContent = 'Сохранение… (' + name + ')'; };
+  let freshOrdersData = null, freshDebtData = null, freshSettingsData = null;
+  stage('подготовка');
   await ensureDataFolders();
   // Подтягиваем самую свежую версию с Диска прямо перед записью и мёрджим -- сужает окно гонки
   // почти до нуля (см. mergeById выше). Читаем через "текущий" файл (loadSection), а не старым
   // contains-поиском -- см. driveUpsertJSON про то, почему это важно именно здесь. Если подтянуть
   // не удалось (например, сеть) -- сохраняем как есть локально, это лучше, чем вообще не сохранить.
   try {
-    const [freshOrdersData, freshDebtData, freshSettingsData] = await Promise.all([
+    stage('читаю свежие данные с Диска');
+    [freshOrdersData, freshDebtData, freshSettingsData] = await Promise.all([
       loadSection('orders_current.json', FOLDERS.orders, 'orders_', 'orders'),
       loadSection('debt_current.json', FOLDERS.debt, 'debt_', 'debt'),
       loadSection('settings_current.json', FOLDERS.config, 'settings_', 'settings'),
     ]);
+    stage('объединяю с чужими правками');
     STATE.orders = mergeById(STATE.orders, (freshOrdersData && freshOrdersData.orders) || [], deletedOrderIds);
     STATE.sellerPayments = mergeById(STATE.sellerPayments, (freshDebtData && freshDebtData.sellerPayments) || [], deletedPaymentIds);
     // НАЙДЕННЫЙ БАГ (заявка 902): статусы/пользователи раньше НЕ мёрджились, в отличие от заявок и
@@ -1593,24 +1599,38 @@ async function saveState(deleted){
   // должен ронять само сохранение. Каждая версия -- полная копия всех заявок, и при тысячах заявок
   // и сохранении после каждой правки это забило Диск (2670 заявок -> тысячи копий по несколько МБ).
   // Авторитетен "текущий" файл ниже -- он обновляется на месте и места почти не занимает.
+  // Не пишем на Диск то, что не изменилось: если после мёрджа раздел совпадает с только что
+  // прочитанной копией на Диске (без служебного savedAt), запись (и копия в историю) лишняя --
+  // раньше КАЖДОЕ сохранение заново заливало все три файла, даже если менялись только заявки.
+  const sigOf = obj => { if(!obj) return null; const c = { ...obj }; delete c.savedAt; return JSON.stringify(c); };
+  const unchanged = {
+    orders: !!freshOrdersData && sigOf(ordersPayload) === sigOf(freshOrdersData),
+    debt: !!freshDebtData && sigOf(debtPayload) === sigOf(freshDebtData),
+    settings: !!freshSettingsData && sigOf(settingsPayload) === sigOf(freshSettingsData),
+  };
   let lastHistoryAt = 0;
   try { lastHistoryAt = Number(localStorage.getItem(HISTORY_LAST_KEY)) || 0; } catch(_e){}
   const historyDue = (Date.now() - lastHistoryAt) >= HISTORY_MIN_INTERVAL_MS;
-  const historyPromise = historyDue
+  const historyPromise = (historyDue && !(unchanged.orders && unchanged.debt && unchanged.settings))
     ? Promise.all([
-        driveCreateJSON(`orders_${ts}.json`, FOLDERS.orders, ordersPayload),
-        driveCreateJSON(`debt_${ts}.json`, FOLDERS.debt, debtPayload),
-        driveCreateJSON(`settings_${ts}.json`, FOLDERS.config, settingsPayload),
+        unchanged.orders ? null : driveCreateJSON(`orders_${ts}.json`, FOLDERS.orders, ordersPayload),
+        unchanged.debt ? null : driveCreateJSON(`debt_${ts}.json`, FOLDERS.debt, debtPayload),
+        unchanged.settings ? null : driveCreateJSON(`settings_${ts}.json`, FOLDERS.config, settingsPayload),
       ]).then(()=>{ try { localStorage.setItem(HISTORY_LAST_KEY, String(Date.now())); } catch(_e){} })
         .catch(e=>console.error('Не удалось записать копию в историю версий (сохранение продолжается):', e))
     : Promise.resolve();
+  stage('записываю на Диск' + (unchanged.orders ? '' : ' заявки') + (unchanged.debt ? '' : ' долг') + (unchanged.settings ? '' : ' настройки'));
+  const timed = (name, p)=> p.then(r=>{ timing['запись '+name] = Date.now() - T0; return r; });
   await Promise.all([
     historyPromise,
     // "Текущий" файл -- то, что реально читается при загрузке (см. loadSection/loadLatestState).
-    driveUpsertJSON('orders_current.json', FOLDERS.orders, ordersPayload, 'orders'),
-    driveUpsertJSON('debt_current.json', FOLDERS.debt, debtPayload, 'debt'),
-    driveUpsertJSON('settings_current.json', FOLDERS.config, settingsPayload, 'settings'),
+    unchanged.orders ? null : timed('заявок', driveUpsertJSON('orders_current.json', FOLDERS.orders, ordersPayload, 'orders')),
+    unchanged.debt ? null : timed('долга', driveUpsertJSON('debt_current.json', FOLDERS.debt, debtPayload, 'debt')),
+    unchanged.settings ? null : timed('настроек', driveUpsertJSON('settings_current.json', FOLDERS.config, settingsPayload, 'settings')),
   ]);
+  timing['итого'] = Date.now() - T0;
+  window.LAST_SAVE_TIMING = timing; // подробности, если сохранение снова станет медленным: console → LAST_SAVE_TIMING
+  console.info('Сохранение, мс:', JSON.stringify(timing), 'не менялось:', JSON.stringify(unchanged));
   // Мёрдж мог подтянуть чужие заявки/оплаты, которых не было в этой вкладке -- перерисовываем,
   // чтобы экран не разошёлся с тем, что реально теперь сохранено на Диске.
   renderOrdersGrid(); renderOrderStats(); renderDebtGrid(); renderDebtPaymentsGrid(); renderSalesReportGrid();
