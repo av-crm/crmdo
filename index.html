@@ -629,7 +629,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.57';
+const APP_VERSION = '2026-08-08.58';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -1385,11 +1385,11 @@ async function listFolderFilesPaged(folderId, prefix){
   const out = [];
   let pageToken = '';
   do {
-    const params = new URLSearchParams({ q: `'${folderId}' in parents and name contains '${prefix}' and trashed=false`, pageSize:'1000', fields:'nextPageToken,files(id,name,createdTime)' });
+    const params = new URLSearchParams({ q: `'${folderId}' in parents and name contains '${prefix}' and trashed=false`, pageSize:'1000', fields:'nextPageToken,files(id,name,createdTime,ownedByMe)' });
     if(pageToken) params.set('pageToken', pageToken);
     const res = await driveFetch('https://www.googleapis.com/drive/v3/files?' + params.toString());
     const data = await res.json();
-    (data.files||[]).forEach(f=>out.push({ id:f.id, title:f.name, createdTime:f.createdTime }));
+    (data.files||[]).forEach(f=>out.push({ id:f.id, title:f.name, createdTime:f.createdTime, ownedByMe:f.ownedByMe }));
     pageToken = data.nextPageToken || '';
   } while(pageToken);
   return out;
@@ -1418,8 +1418,12 @@ async function collectVersionsToPrune(collectStats, onStage){
     if(!folderId) continue;
     if(onStage) onStage(prefix);
     const files = await listFolderFilesPaged(folderId, prefix);
-    const toPrune = pickVersionsToPrune(files, prefix, Date.now());
-    if(collectStats) collectStats[prefix] = { total: files.length, prune: toPrune.length };
+    const allPrune = pickVersionsToPrune(files, prefix, Date.now());
+    // Google Диск разрешает отправлять в Корзину только файлы, где вы ВЛАДЕЛЕЦ (версии, которые
+    // создал другой пользователь, вам удалить нельзя -- 403 insufficientFilePermissions).
+    // Такие пропускаем: их уберёт сам владелец при своей очистке.
+    const toPrune = allPrune.filter(f=>f.ownedByMe !== false);
+    if(collectStats) collectStats[prefix] = { total: files.length, prune: toPrune.length, foreign: allPrune.length - toPrune.length };
     toTrash = toTrash.concat(toPrune);
   }
   return toTrash;
@@ -1492,8 +1496,10 @@ window.pruneOldVersions = async function(memoryCleared){
     const stats = {};
     const toTrash = await collectVersionsToPrune(stats, prefix=>pp.set(memNote + `Просматриваю папку: ${PRUNE_FOLDER_LABELS[prefix]||prefix}…`));
     const foundInfo = Object.keys(stats).map(k=>`${PRUNE_FOLDER_LABELS[k]||k}: всего ${stats[k].total}, к очистке ${stats[k].prune}`).join('; ');
+    const foreign = Object.keys(stats).reduce((n,k)=>n+(stats[k].foreign||0),0);
+    const foreignNote = foreign ? ` Ещё ${foreign} старых версий создали другие пользователи — их может удалить только владелец файла.` : '';
     if(!toTrash.length){
-      const msg = memNote + `Старых версий для очистки нет. (${foundInfo || 'папки не найдены'})`;
+      const msg = memNote + `Ваших старых версий для очистки нет. (${foundInfo || 'папки не найдены'})` + foreignNote;
       say(msg); pp.finish(msg, true); return;
     }
     // Подтверждение: панель остаётся на экране (полоса ждёт), пока пользователь решает.
@@ -1503,7 +1509,7 @@ window.pruneOldVersions = async function(memoryCleared){
     }
     pp.set(`Перемещаю в Корзину…`, 0, toTrash.length);
     const { done, failed, firstError } = await trashFilesParallel(toTrash, n=>{ say(`Очищено ${n} из ${toTrash.length}…`); pp.set('Перемещаю в Корзину…', n, toTrash.length); });
-    const msg = memNote + `Перемещено в Корзину ${done - failed} из ${toTrash.length}${failed?`, не удалось: ${failed} (${firstError})`:''}. (${foundInfo})`;
+    const msg = memNote + `Перемещено в Корзину ${done - failed} из ${toTrash.length}${failed?`, не удалось: ${failed} (${firstError})`:''}. (${foundInfo})` + foreignNote;
     say(msg); pp.finish(msg, !failed);
     toast(failed ? `Не удалось переместить ${failed} файлов — см. панель справа внизу` : 'Старые версии перемещены в Корзину', failed ? 'err' : 'ok');
   } catch(e){
