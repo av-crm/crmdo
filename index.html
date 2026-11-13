@@ -629,7 +629,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.60';
+const APP_VERSION = '2026-08-08.61';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -2203,6 +2203,35 @@ window.openPriceAnalysis = async function(){
   if(!PA.data) window.runPriceAnalysis(); else window.paRender();
 };
 
+/* ================= ФРОД: подсветка заявок с телефоном из заявок в статусе «ФРОД» =================
+   Статус ФРОД определяется по названию (содержит «фрод»/«fraud»). Телефоны сравниваются по последним
+   10 цифрам (+7 / 8 / скобки / пробелы не важны). Заявка НЕ в статусе ФРОД, у которой телефон есть
+   среди телефонов заявок ФРОД, получает оранжевый номер заявки. */
+function normPhone(ph){
+  const d = String(ph||'').replace(/\D/g,'');
+  return d.length >= 10 ? d.slice(-10) : '';
+}
+function fraudStatusIds(){
+  return new Set((STATE.statuses||[]).filter(st=>/фрод|fraud/i.test(st.label||'')).map(st=>st.id));
+}
+// Map: телефон(10 цифр) -> [номера заявок в статусе ФРОД]
+function fraudPhoneMap(){
+  const ids = fraudStatusIds(); const map = new Map();
+  if(!ids.size) return map;
+  STATE.orders.forEach(o=>{
+    if(!ids.has(o.statusId)) return;
+    const k = normPhone(o.phone); if(!k) return;
+    if(!map.has(k)) map.set(k, []);
+    map.get(k).push(o.orderNumber || '—');
+  });
+  return map;
+}
+// Список номеров ФРОД-заявок с тем же телефоном (пусто, если сама заявка во ФРОД или совпадений нет).
+function fraudMatchesFor(o, map, ids){
+  if(!map.size || ids.has(o.statusId)) return [];
+  return map.get(normPhone(o.phone)) || [];
+}
+
 /* ================= STATUSES ================= */
 function renderStatusSelects(){
   const sel = document.getElementById('f_status');
@@ -3419,6 +3448,7 @@ window.viewOrderDetails = function(id){
   modalBody.innerHTML = `
     <button class="close" onclick="closeModal()">✕</button>
     <h2>Заявка № ${escapeHtml(o.orderNumber||'—')}</h2>
+    ${(()=>{ const m = fraudMatchesFor(o, fraudPhoneMap(), fraudStatusIds()); return m.length ? `<div style="background:#fff7ed;border:1px solid #f97316;color:#9a3412;border-radius:8px;padding:8px 12px;margin:8px 0;font-size:13px;">⚠ Телефон клиента совпадает с заявкой в статусе ФРОД (№ ${escapeHtml(m.join(', '))}). Проверьте заявку внимательнее.</div>` : ''; })()}
 
     <h3>Заказ</h3>
     <table class="preview">
@@ -4054,10 +4084,13 @@ function renderOrdersGrid(){
   // просто скрывается CSS), т.к. этот же приём (hide, not real ACL) уже используется во всём
   // приложении -- см. applyAccessControl.
   const isAdmin = currentUserEmail === ADMIN_EMAIL;
+  const fraudMap = fraudPhoneMap(), fraudIds = fraudStatusIds();
   const columns = [
     { name:'№ заявки', width:'90px', formatter:(cell)=>{
         const d = JSON.parse(cell);
-        return gridjs.html(`<a class="link" href="javascript:void(0)" onclick="window.viewOrderDetails('${d.id}')" title="Подробнее о заявке" style="cursor:pointer;">${escapeHtml(d.orderNumber||'—')}</a>`);
+        const fraudStyle = d.fraud ? 'background:#f97316;color:#fff;font-weight:700;padding:2px 8px;border-radius:6px;text-decoration:none;' : '';
+        const fraudTitle = d.fraud ? `ВНИМАНИЕ: телефон совпадает с заявкой в статусе ФРОД (№ ${escapeHtml(d.fraud.join(', '))})` : 'Подробнее о заявке';
+        return gridjs.html(`<a class="link" href="javascript:void(0)" onclick="window.viewOrderDetails('${d.id}')" title="${fraudTitle}" style="cursor:pointer;${fraudStyle}">${escapeHtml(d.orderNumber||'—')}</a>`);
       }},
     { name:'Дата заявки', width:'130px', formatter:(cell)=>{
         const d = JSON.parse(cell);
@@ -4103,7 +4136,7 @@ function renderOrdersGrid(){
       }},
   ];
   const rowBase = data.map(o=>[
-    JSON.stringify({ id:o.id, orderNumber:o.orderNumber }),
+    JSON.stringify({ id:o.id, orderNumber:o.orderNumber, fraud: (()=>{ const m = fraudMatchesFor(o, fraudMap, fraudIds); return m.length ? m : null; })() }),
     JSON.stringify({ id:o.id, orderDate:o.orderDate }),
     o.clientName, o.phone,
     JSON.stringify({ id:o.id, statusId:o.statusId }),
