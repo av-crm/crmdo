@@ -629,7 +629,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.59';
+const APP_VERSION = '2026-08-08.60';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -788,10 +788,10 @@ function renderGridInto(gridInstance, container, config){
   inst.render(container);
   return inst;
 }
-function toast(msg, type){
+function toast(msg, type, ms){
   const t = document.getElementById('toast');
   t.textContent = msg; t.className = 'toast show' + (type ? ' '+type : '');
-  clearTimeout(t._h); t._h = setTimeout(()=>t.classList.remove('show'), 3500);
+  clearTimeout(t._h); t._h = setTimeout(()=>t.classList.remove('show'), ms || 3500);
 }
 function fmtMoney(n){ if(n==null||isNaN(n)) return '—'; return Number(n).toLocaleString('ru-RU',{minimumFractionDigits:2, maximumFractionDigits:2}); }
 // Whole-rubles version for the dashboard stat cards, where decimals just add width/clutter.
@@ -1073,7 +1073,14 @@ async function openDriveFolderPicker(){
 async function driveFetch(url, options){
   options = options || {};
   if(!accessToken) throw new Error('Не выполнен вход через Google');
+  const reqStart = Date.now();
   const res = await fetch(url, { cache: 'no-store', ...options, headers: { ...(options.headers||{}), Authorization: 'Bearer ' + accessToken } });
+  // Диагностика медленных сохранений: запоминаем запросы к Диску дольше 3 с (метод, путь, статус, время).
+  const reqMs = Date.now() - reqStart;
+  if(reqMs > 3000){
+    (window.SLOW_REQUESTS = window.SLOW_REQUESTS || []).push({ at: new Date().toISOString(), method: options.method || 'GET', path: url.split('?')[0].replace('https://www.googleapis.com',''), status: res.status, sec: Math.round(reqMs/100)/10 });
+    if(window.SLOW_REQUESTS.length > 50) window.SLOW_REQUESTS.shift();
+  }
   if(res.status === 401){
     accessToken = null; sessionStorage.removeItem(TOKEN_KEY);
     document.getElementById('authGate').style.display = 'block';
@@ -1630,6 +1637,14 @@ async function saveState(deleted){
   ]);
   timing['итого'] = Date.now() - T0;
   window.LAST_SAVE_TIMING = timing; // подробности, если сохранение снова станет медленным: console → LAST_SAVE_TIMING
+  if(timing['итого'] > 8000){
+    // Долгое сохранение: показываем разбивку прямо на экране (чтобы можно было сфотографировать/переслать).
+    const slow = (window.SLOW_REQUESTS||[]).filter(r=>Date.parse(r.at) >= T0).map(r=>`${r.method} ${r.path.split('/').slice(-2).join('/')} ${r.sec} с (${r.status})`).join('; ');
+    const msg = `Сохранение заняло ${Math.round(timing['итого']/1000)} с. ` + Object.keys(timing).map(k=>`${k}: ${Math.round(timing[k]/1000)} с`).join(', ') + (slow ? `. Медленные запросы: ${slow}` : '');
+    window.LAST_SLOW_SAVE = msg;
+    const h = document.getElementById('ordersSaveHint'); if(h) h.setAttribute('title', msg);
+    toast(msg, 'err', 30000);
+  }
   console.info('Сохранение, мс:', JSON.stringify(timing), 'не менялось:', JSON.stringify(unchanged));
   // Мёрдж мог подтянуть чужие заявки/оплаты, которых не было в этой вкладке -- перерисовываем,
   // чтобы экран не разошёлся с тем, что реально теперь сохранено на Диске.
