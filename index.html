@@ -629,7 +629,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.61';
+const APP_VERSION = '2026-08-08.63';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -1618,7 +1618,7 @@ async function saveState(deleted){
   let lastHistoryAt = 0;
   try { lastHistoryAt = Number(localStorage.getItem(HISTORY_LAST_KEY)) || 0; } catch(_e){}
   const historyDue = (Date.now() - lastHistoryAt) >= HISTORY_MIN_INTERVAL_MS;
-  const historyPromise = (historyDue && !(unchanged.orders && unchanged.debt && unchanged.settings))
+  const startHistory = ()=> (historyDue && !(unchanged.orders && unchanged.debt && unchanged.settings))
     ? Promise.all([
         unchanged.orders ? null : driveCreateJSON(`orders_${ts}.json`, FOLDERS.orders, ordersPayload),
         unchanged.debt ? null : driveCreateJSON(`debt_${ts}.json`, FOLDERS.debt, debtPayload),
@@ -1629,13 +1629,17 @@ async function saveState(deleted){
   stage('записываю на Диск' + (unchanged.orders ? '' : ' заявки') + (unchanged.debt ? '' : ' долг') + (unchanged.settings ? '' : ' настройки'));
   const timed = (name, p)=> p.then(r=>{ timing['запись '+name] = Date.now() - T0; return r; });
   await Promise.all([
-    historyPromise,
     // "Текущий" файл -- то, что реально читается при загрузке (см. loadSection/loadLatestState).
     unchanged.orders ? null : timed('заявок', driveUpsertJSON('orders_current.json', FOLDERS.orders, ordersPayload, 'orders')),
     unchanged.debt ? null : timed('долга', driveUpsertJSON('debt_current.json', FOLDERS.debt, debtPayload, 'debt')),
     unchanged.settings ? null : timed('настроек', driveUpsertJSON('settings_current.json', FOLDERS.config, settingsPayload, 'settings')),
   ]);
   timing['итого'] = Date.now() - T0;
+  timing['размер заявок, КБ'] = Math.round(JSON.stringify(ordersPayload).length / 1024);
+  // Копия в историю -- ПОСЛЕ основной записи и без ожидания: раньше она шла параллельно и делила
+  // с основной записью исходящий канал (обе заливали все заявки), из-за чего сохранение
+  // занимало до 9 с. Для пользователя сохранение завершено, когда обновлён "текущий" файл.
+  startHistory();
   window.LAST_SAVE_TIMING = timing; // подробности, если сохранение снова станет медленным: console → LAST_SAVE_TIMING
   if(timing['итого'] > 8000){
     // Долгое сохранение: показываем разбивку прямо на экране (чтобы можно было сфотографировать/переслать).
@@ -2417,7 +2421,8 @@ function statusOf(id){ return STATE.statuses.find(s=>s.id===id) || { id, label:'
 // visible/editable in the orders table, but are excluded from all stats/dashboard/report/debt math.
 function isStatsExcluded(o){
   const st = STATE.statuses.find(s=>s.id===o.statusId);
-  return !!(st && st.excludeStats);
+  // Статус ФРОД (по названию) всегда вне статистики, отчётов и дашбордов -- без отдельной галочки.
+  return !!(st && (st.excludeStats || /фрод|fraud/i.test(st.label||'')));
 }
 // Which status counts as "сделка завершена" for Долг продавца / Стоимость размещения -- see
 // STATE.dealDoneStatusId's comment near the top of the file for why this isn't just a hardcoded id.
@@ -4209,8 +4214,7 @@ function getTodayCallOrders(){
   return STATE.orders.filter(o=>{
     if(!o.contactAt) return false;
     if(o.contactAt.slice(0,10) > today) return false;
-    const st = STATE.statuses.find(s=>s.id===o.statusId);
-    if(st && st.excludeStats) return false;
+    if(isStatsExcluded(o)) return false;
     // Звонок отмечен как "Решено" (см. setOrderCallHandled) -- висит в списке до тех пор, пока
     // заново не поменяется сама дата "Когда связаться с клиентом" (см. setOrderContactAt, который
     // сбрасывает этот флаг), а не до конца сессии/до перезагрузки.
