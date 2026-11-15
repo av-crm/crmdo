@@ -629,7 +629,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.63';
+const APP_VERSION = '2026-08-08.65';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -2421,8 +2421,8 @@ function statusOf(id){ return STATE.statuses.find(s=>s.id===id) || { id, label:'
 // visible/editable in the orders table, but are excluded from all stats/dashboard/report/debt math.
 function isStatsExcluded(o){
   const st = STATE.statuses.find(s=>s.id===o.statusId);
-  // Статус ФРОД (по названию) всегда вне статистики, отчётов и дашбордов -- без отдельной галочки.
-  return !!(st && (st.excludeStats || /фрод|fraud/i.test(st.label||'')));
+  // Статусы ФРОД / Тест / Дубль (по названию) всегда вне статистики, отчётов и дашбордов -- без отдельной галочки.
+  return !!(st && (st.excludeStats || /фрод|fraud|тест|test|дубл/i.test(st.label||'')));
 }
 // Which status counts as "сделка завершена" for Долг продавца / Стоимость размещения -- see
 // STATE.dealDoneStatusId's comment near the top of the file for why this isn't just a hardcoded id.
@@ -4359,13 +4359,19 @@ window.ordersGoPage = function(p){
 window.applyOrdersFilter = function(){
   ordersPage = 0;
   renderOrdersGrid();
-  const total = STATE.orders.length;
-  const shown = getFilteredOrders().length;
+  // В счётчике не считаем служебные статусы ФРОД / Тест / Дубль (по названию) -- если только пользователь
+  // сам не выбрал один из них в фильтре "Статус": тогда считаем как есть.
+  const isNoise = o=>{ const st = STATE.statuses.find(x=>x.id===o.statusId); return !!(st && /фрод|fraud|тест|test|дубл/i.test(st.label||'')); };
+  const selStatus = document.getElementById('filterStatus');
+  const selectedNoise = !!(selStatus && selStatus.value && selStatus.value !== 'all' && STATE.orders.some(o=>o.statusId===selStatus.value && isNoise(o)));
+  const total = selectedNoise ? STATE.orders.length : STATE.orders.filter(o=>!isNoise(o)).length;
+  const shown = selectedNoise ? getFilteredOrders().length : getFilteredOrders().filter(o=>!isNoise(o)).length;
+  const noiseNote = selectedNoise ? '' : ' без Фрод/Тест/Дубль';
   const sel = document.getElementById('filterStatus');
   const label = (sel.selectedOptions && sel.selectedOptions[0] && sel.selectedOptions[0].textContent) || 'Все статусы';
   const from = document.getElementById('filterDateFrom').value, to = document.getElementById('filterDateTo').value;
   const periodLabel = (from || to) ? `, период: ${from || 'начало'} — ${to || 'сегодня'}` : '';
-  toast(`Показано ${shown} из ${total} (статус: ${label}${periodLabel})`, 'ok');
+  toast(`Показано ${shown} из ${total}${noiseNote} (статус: ${label}${periodLabel})`, 'ok');
 };
 // Live typing/status-select/date filter changes (not the explicit "Искать" button) -- also jump
 // back to page 1 of the new filtered set, just without the toast popping up on every keystroke.
