@@ -629,7 +629,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.65';
+const APP_VERSION = '2026-08-08.67';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -2236,6 +2236,40 @@ function fraudMatchesFor(o, map, ids){
   return map.get(normPhone(o.phone)) || [];
 }
 
+// ---- История клиента: заявки того же клиента (совпадение по телефону -- последние 10 цифр -- ИЛИ по email) ----
+function normEmail(e){ const v = String(e||'').trim().toLowerCase(); return v.includes('@') ? v : ''; }
+function clientOrdersFor(o){
+  const ph = normPhone(o.phone), em = normEmail(o.email);
+  if(!ph && !em) return null;
+  return STATE.orders.filter(x=> x.id===o.id || (ph && normPhone(x.phone)===ph) || (em && normEmail(x.email)===em))
+    .sort((a,b)=> String(b.orderDate||'').localeCompare(String(a.orderDate||'')) || String(b.orderNumber||'').localeCompare(String(a.orderNumber||''), undefined, {numeric:true}));
+}
+function clientHistoryHtml(o){
+  const head = '<h3 style="margin-top:16px;">У этого клиента заявки</h3>';
+  const list = clientOrdersFor(o);
+  if(!list) return head + '<p class="hint">Не указаны ни телефон, ни email — найти другие заявки клиента нельзя.</p>';
+  if(list.length <= 1) return head + '<p class="hint">Других заявок по этому телефону/email нет — это первая заявка клиента.</p>';
+  const fraudIds = fraudStatusIds();
+  const isDone = x=> isPaidLikeStatus(x) || isDealDoneStatus(x); // оплачен / выставлен счёт / сделка завершена
+  const doneOrders = list.filter(isDone);
+  const doneSum = doneOrders.reduce((a,x)=>a+(orderTotalPrice(x)||0), 0);
+  const fraudN = list.filter(x=>x.id!==o.id && fraudIds.has(x.statusId)).length;
+  const rows = list.map(x=>{
+    const st = STATE.statuses.find(t=>t.id===x.statusId);
+    const color = st && st.color ? st.color : '#6b7280';
+    const cur = x.id===o.id;
+    const fr = fraudIds.has(x.statusId);
+    return `<tr style="${cur?'background:#eff6ff;':(fr?'background:#fff7ed;':'')}">
+      <td><a class="link" href="javascript:void(0)" onclick="window.viewOrderDetails('${x.id}')" style="cursor:pointer;">${escapeHtml(x.orderNumber||'—')}</a>${cur?' <span class="hint">(эта)</span>':''}</td>
+      <td style="text-align:right;">${orderTotalPrice(x)!=null ? fmtMoney(orderTotalPrice(x)) + ' ₽' : '—'}</td>
+      <td><span style="color:${escapeHtml(color)};font-weight:600;">${escapeHtml(st ? st.label : '—')}</span></td>
+    </tr>`;
+  }).join('');
+  const warn = fraudN ? `<div style="background:#fff7ed;border:1px solid #f97316;color:#9a3412;border-radius:8px;padding:6px 10px;margin:6px 0;font-size:13px;">⚠ У клиента есть заявки в статусе ФРОД: ${fraudN}</div>` : '';
+  return head + warn + `<div style="max-height:260px;overflow:auto;"><table class="preview"><thead><tr><th>Номер</th><th>Сумма</th><th>Статус</th></tr></thead><tbody>${rows}</tbody></table></div>
+    <p style="margin:8px 0 0;"><b>Сумма выполненных заказов</b> (оплачен, выставлен счёт, сделка завершена): <strong>${fmtMoney(doneSum)} ₽</strong> <span class="hint">(заявок: ${doneOrders.length})</span></p>`;
+}
+
 /* ================= STATUSES ================= */
 function renderStatusSelects(){
   const sel = document.getElementById('f_status');
@@ -3550,6 +3584,8 @@ window.viewOrderDetails = function(id){
       <tr><th>Серийный номер</th><td><input type="text" value="${escapeHtml(o.serialNumber||'')}" placeholder="SN-000000" style="width:100%;box-sizing:border-box;" onchange="window.setOrderSerialNumber('${o.id}', this.value)"></td></tr>
       <tr><th>Сумма в чеке</th><td><strong>${receiptTotal!=null?fmtMoney(receiptTotal)+' ₽':'—'}</strong> <span class="hint">(Сумма ${totalPrice!=null?fmtMoney(totalPrice)+' ₽':'—'} + Доставка ${o.delivery!=null?fmtMoney(o.delivery)+' ₽':'—'})</span></td></tr>
     </table>
+
+    ${clientHistoryHtml(o)}
 
     <p class="hint">Все правки в этой карточке (статус, товары, имя, email, продавец, комментарий менеджера, серийный номер, ссылка на товар) сохраняются на Диск сразу же, без отдельной кнопки. Логистика и Размещение здесь не показываются — эти поля доступны только на главном экране списка заявок.</p>
   `;
