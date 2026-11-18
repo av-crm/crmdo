@@ -218,6 +218,10 @@
           <select id="filterStatus" onchange="window.onOrdersFilterChange()"><option value="">Все статусы</option></select>
         </div>
         <div>
+          <label>Служебные статусы (по умолчанию скрыты)</label>
+          <div id="filterNoise" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;min-height:34px;"></div>
+        </div>
+        <div>
           <label>Дата заявки с</label>
           <input type="date" id="filterDateFrom" onchange="window.onOrdersFilterChange()">
         </div>
@@ -614,6 +618,14 @@
       </div>
     </div>
     <div class="card">
+      <h2>Долг по платежам (динамика)</h2>
+      <p class="hint">Показывает, какой долг (размещение по заказам в статусе «сделка завершена») накопился к дате каждой оплаты и сколько осталось после неё. Дата начисления — «Дата заявки» заказа (отдельной даты завершения сделки в CRM нет).</p>
+      <div class="btn-row" style="align-items:flex-end;">
+        <div class="field" style="max-width:340px;"><label>ИНН продавца</label><select id="debtTl_inn" onchange="window.renderDebtTimeline()"><option value="">— выберите ИНН —</option></select></div>
+      </div>
+      <div id="debtTimeline" style="margin-top:10px;"></div>
+    </div>
+    <div class="card">
       <h2>История оплат</h2>
       <div id="debtPaymentsGrid"></div>
     </div>
@@ -629,7 +641,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.67';
+const APP_VERSION = '2026-08-08.69';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -2276,6 +2288,7 @@ function renderStatusSelects(){
   sel.innerHTML = STATE.statuses.map(s=>`<option value="${s.id}">${escapeHtml(s.label)}</option>`).join('');
   const filt = document.getElementById('filterStatus');
   filt.innerHTML = '<option value="">Все статусы</option>' + STATE.statuses.map(s=>`<option value="${s.id}">${escapeHtml(s.label)}</option>`).join('');
+  renderNoiseFilter();
   const imp = document.getElementById('import_status');
   imp.innerHTML = STATE.statuses.map(s=>`<option value="${s.id}">${escapeHtml(s.label)}</option>`).join('');
 }
@@ -4080,6 +4093,33 @@ function compareOrdersDefault(a, b){
   }
   return String(b.orderDate||'').localeCompare(String(a.orderDate||''));
 }
+// Служебные статусы (ФРОД / Тест / Дубль -- по названию): в списке заявок по умолчанию скрыты, чтобы не
+// мешали; нужные можно включить галочками в фильтре «Служебные статусы». Если в фильтре «Статус»
+// выбран такой статус напрямую -- заявки показываются всегда.
+const NOISE_STATUS_RE = /фрод|fraud|тест|test|дубл/i;
+const NOISE_SHOW_KEY = 'crm_orders_show_noise';
+let ORDERS_SHOW_NOISE = new Set();
+try { ORDERS_SHOW_NOISE = new Set(JSON.parse(localStorage.getItem(NOISE_SHOW_KEY) || '[]')); } catch(_e){}
+function noiseStatuses(){ return (STATE.statuses||[]).filter(st=>NOISE_STATUS_RE.test(st.label||'')); }
+function isNoiseOrder(o){ const st = (STATE.statuses||[]).find(x=>x.id===o.statusId); return !!(st && NOISE_STATUS_RE.test(st.label||'')); }
+function noiseHidden(o, statusFilter){
+  if(!isNoiseOrder(o)) return false;
+  if(statusFilter && o.statusId === statusFilter) return false;
+  return !ORDERS_SHOW_NOISE.has(o.statusId);
+}
+function renderNoiseFilter(){
+  const el = document.getElementById('filterNoise'); if(!el) return;
+  const list = noiseStatuses();
+  // убираем из запомненного то, чего больше нет
+  ORDERS_SHOW_NOISE = new Set(Array.from(ORDERS_SHOW_NOISE).filter(id=>list.some(st=>st.id===id)));
+  el.innerHTML = list.length ? list.map(st=>`<label style="display:flex;align-items:center;gap:4px;font-size:13px;font-weight:400;"><input type="checkbox" ${ORDERS_SHOW_NOISE.has(st.id)?'checked':''} style="width:auto;" onchange="window.toggleNoiseStatus('${st.id}', this.checked)"> ${escapeHtml(st.label)}</label>`).join('') : '<span class="hint">Нет статусов Фрод / Тест / Дубль</span>';
+}
+window.toggleNoiseStatus = function(id, on){
+  if(on) ORDERS_SHOW_NOISE.add(id); else ORDERS_SHOW_NOISE.delete(id);
+  try { localStorage.setItem(NOISE_SHOW_KEY, JSON.stringify(Array.from(ORDERS_SHOW_NOISE))); } catch(_e){}
+  ordersPage = 0;
+  renderOrdersGrid();
+};
 function getFilteredOrders(){
   const statusFilter = document.getElementById('filterStatus').value;
   const q = (document.getElementById('filterSearch').value || '').toLowerCase().trim();
@@ -4092,6 +4132,7 @@ function getFilteredOrders(){
   const dateTo = document.getElementById('filterDateTo').value || null;
   return STATE.orders.filter(o=>{
     if(statusFilter && o.statusId !== statusFilter) return false;
+    if(noiseHidden(o, statusFilter)) return false;
     if(dateFrom && (!o.orderDate || o.orderDate < dateFrom)) return false;
     if(dateTo && (!o.orderDate || o.orderDate > dateTo)) return false;
     if(q){
@@ -4395,14 +4436,13 @@ window.ordersGoPage = function(p){
 window.applyOrdersFilter = function(){
   ordersPage = 0;
   renderOrdersGrid();
-  // В счётчике не считаем служебные статусы ФРОД / Тест / Дубль (по названию) -- если только пользователь
-  // сам не выбрал один из них в фильтре "Статус": тогда считаем как есть.
-  const isNoise = o=>{ const st = STATE.statuses.find(x=>x.id===o.statusId); return !!(st && /фрод|fraud|тест|test|дубл/i.test(st.label||'')); };
-  const selStatus = document.getElementById('filterStatus');
-  const selectedNoise = !!(selStatus && selStatus.value && selStatus.value !== 'all' && STATE.orders.some(o=>o.statusId===selStatus.value && isNoise(o)));
-  const total = selectedNoise ? STATE.orders.length : STATE.orders.filter(o=>!isNoise(o)).length;
-  const shown = selectedNoise ? getFilteredOrders().length : getFilteredOrders().filter(o=>!isNoise(o)).length;
-  const noiseNote = selectedNoise ? '' : ' без Фрод/Тест/Дубль';
+  // Счётчик согласован со списком: служебные статусы (ФРОД / Тест / Дубль) считаются, только если
+  // они включены в фильтре «Служебные статусы» или выбраны в фильтре «Статус».
+  const selStatusV = document.getElementById('filterStatus').value;
+  const total = STATE.orders.filter(o=>!noiseHidden(o, selStatusV)).length;
+  const shown = getFilteredOrders().length;
+  const hiddenN = STATE.orders.filter(o=>noiseHidden(o, selStatusV)).length;
+  const noiseNote = hiddenN ? ` (скрыто служебных: ${hiddenN})` : '';
   const sel = document.getElementById('filterStatus');
   const label = (sel.selectedOptions && sel.selectedOptions[0] && sel.selectedOptions[0].textContent) || 'Все статусы';
   const from = document.getElementById('filterDateFrom').value, to = document.getElementById('filterDateTo').value;
@@ -5142,6 +5182,43 @@ function computeSellerDebts(){
 // ИНН продавцов, у которых уже есть строка в таблице ДП (computeSellerDebts), плюс весь каталог
 // контрагентов (CALC_IP_LIST), чтобы можно было внести оплату и до появления первой завершённой
 // сделки по этому продавцу. Дедуп по ИНН, приоритет -- название из таблицы ДП.
+// Динамика долга по платежам для одного ИНН: на дату каждой оплаты -- сколько накопилось размещения
+// (заказы "сделка завершена" с датой заявки не позже даты оплаты) и каков долг до/после оплаты.
+function debtTimelineFor(inn){
+  const key = inn || '(без ИНН)';
+  const done = [];
+  STATE.orders.filter(o=>isDealDoneStatus(o) && !isStatsExcluded(o)).forEach(o=>{
+    orderSlices(o).forEach(sl=>{
+      if((sl.inn || '(без ИНН)') !== key) return;
+      done.push({ date: o.orderDate || '', number: o.orderNumber, placement: sl.placement||0 });
+    });
+  });
+  const pays = STATE.sellerPayments.filter(p=>((p.inn||'').trim() || '(без ИНН)') === key)
+    .map(p=>({ date: p.date || String(p.createdAt||'').slice(0,10), amount: Number(p.amount)||0 }))
+    .sort((a,b)=>a.date.localeCompare(b.date));
+  let paidBefore = 0;
+  const rows = pays.map(p=>{
+    const accrued = done.filter(d=>d.date && d.date <= p.date);
+    const accruedSum = accrued.reduce((a,d)=>a+d.placement,0);
+    const debtBefore = +(accruedSum - paidBefore).toFixed(2);
+    paidBefore += p.amount;
+    return { date:p.date, amount:p.amount, ordersCount:accrued.length, accruedSum:+accruedSum.toFixed(2), debtBefore, debtAfter:+(accruedSum - paidBefore).toFixed(2) };
+  });
+  const totalAccrued = +done.reduce((a,d)=>a+d.placement,0).toFixed(2);
+  return { rows, totalAccrued, totalOrders: done.length, totalPaid: paidBefore, debtNow: +(totalAccrued - paidBefore).toFixed(2) };
+}
+window.renderDebtTimeline = function(){
+  const el = document.getElementById('debtTimeline'); const sel = document.getElementById('debtTl_inn');
+  if(!el || !sel) return;
+  const inn = sel.value;
+  if(!inn){ el.innerHTML = '<div class="hint">Выберите ИНН продавца.</div>'; return; }
+  const T = debtTimelineFor(inn);
+  if(!T.rows.length){ el.innerHTML = `<div class="hint">По этому ИНН нет оплат. Накоплено размещения: ${fmtMoney(T.totalAccrued)} ₽ (заказов: ${T.totalOrders}).</div>`; return; }
+  el.innerHTML = `<table class="preview"><thead><tr><th>Дата оплаты</th><th>Сумма оплаты, ₽</th><th>Накоплено размещения к дате, ₽</th><th>Заказов к дате</th><th>Долг до оплаты, ₽</th><th>Долг после оплаты, ₽</th></tr></thead><tbody>
+    ${T.rows.map((r,i)=>`<tr${i===0?' style="background:#eff6ff;"':''}><td>${fmtDateLabel(r.date)}${i===0?' <span class="hint">(первая)</span>':''}</td><td>${fmtMoney(r.amount)}</td><td>${fmtMoney(r.accruedSum)}</td><td>${r.ordersCount}</td><td><strong>${fmtMoney(r.debtBefore)}</strong></td><td>${fmtMoney(r.debtAfter)}</td></tr>`).join('')}
+    <tr><td><b>Сейчас</b></td><td>${fmtMoney(T.totalPaid)}</td><td>${fmtMoney(T.totalAccrued)}</td><td>${T.totalOrders}</td><td></td><td><strong>${fmtMoney(T.debtNow)}</strong></td></tr>
+  </tbody></table>`;
+};
 function renderDebtInnSelect(){
   const sel = document.getElementById('debt_inn');
   if(!sel) return;
@@ -5152,6 +5229,9 @@ function renderDebtInnSelect(){
   const entries = Array.from(map.entries()).sort((a,b)=> a[1].localeCompare(b[1], 'ru'));
   sel.innerHTML = '<option value="">— выберите ИНН —</option>' + entries.map(([inn,label])=>`<option value="${escapeHtml(inn)}">${escapeHtml(label)}</option>`).join('');
   if(current && map.has(current)) sel.value = current;
+  // тот же список для блока «Долг по платежам (динамика)»
+  const tl = document.getElementById('debtTl_inn');
+  if(tl){ const cur = tl.value; tl.innerHTML = sel.innerHTML; if(cur && map.has(cur)) tl.value = cur; window.renderDebtTimeline(); }
 }
 function renderDebtGrid(){
   renderDebtInnSelect();
