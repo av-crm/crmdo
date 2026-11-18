@@ -641,7 +641,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.69';
+const APP_VERSION = '2026-08-08.70';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -5233,6 +5233,28 @@ function renderDebtInnSelect(){
   const tl = document.getElementById('debtTl_inn');
   if(tl){ const cur = tl.value; tl.innerHTML = sel.innerHTML; if(cur && map.has(cur)) tl.value = cur; window.renderDebtTimeline(); }
 }
+// Выгрузка завершённых заказов продавца (по клику на число в таблице ДП): те самые заказы, из которых
+// складывается "Стоимость размещения" этого ИНН -- номер заявки; артикул; сумма заказа; СС; размещение.
+function debtOrdersRows(inn){
+  const key = inn || '(без ИНН)';
+  const rows = [];
+  STATE.orders.filter(o=>isDealDoneStatus(o) && !isStatsExcluded(o)).forEach(o=>{
+    orderSlices(o).forEach(sl=>{
+      if((sl.inn || '(без ИНН)') !== key) return;
+      rows.push({ number:o.orderNumber||'', date:o.orderDate||'', article: sl.items.map(it=>it.article).filter(Boolean).join(', '), price:sl.price, cc:sl.cc, placement:sl.placement });
+    });
+  });
+  return rows.sort((a,b)=> String(a.number).localeCompare(String(b.number), undefined, {numeric:true}));
+}
+window.exportDebtOrders = function(inn){
+  const rows = debtOrdersRows(inn);
+  if(!rows.length){ toast('Нет завершённых заказов по этому ИНН', 'err'); return; }
+  const num = v => v==null ? '' : String(+Number(v).toFixed(2)).replace('.', ','); // запятая -- чтобы русский Excel понял число
+  const out = rows.map(r=>({ number:r.number, article:r.article, price:num(r.price), cc:num(r.cc), placement:num(r.placement) }));
+  const total = rows.reduce((a,r)=>a+(Number(r.placement)||0),0);
+  downloadBlob(`dolg_${String(inn).replace(/\W+/g,'')}_zavershennye_${todayStr()}.csv`, toCSV(out, ['number','article','price','cc','placement'], ['Номер заявки','Артикул','Сумма заказа','СС','Размещение']), 'text/csv;charset=utf-8');
+  toast(`Выгружено заказов: ${rows.length}, размещение: ${fmtMoney(total)} ₽`, 'ok');
+};
 function renderDebtGrid(){
   renderDebtInnSelect();
   const el = document.getElementById('debtGrid');
@@ -5247,7 +5269,10 @@ function renderDebtGrid(){
     columns: [
       { name:'Контрагент' },
       { name:'ИНН', width:'120px' },
-      { name:'Завершённых заказов', width:'110px' },
+      { name:'Завершённых заказов', width:'110px', formatter:(cell,row)=>{
+          const inn = row && row.cells && row.cells[1] ? row.cells[1].data : '';
+          return gridjs.html(`<a class="link" href="javascript:void(0)" style="cursor:pointer;" title="Скачать CSV: номер заявки, артикул, сумма, СС, размещение" onclick="window.exportDebtOrders(${escapeHtml(JSON.stringify(String(inn)))})">${cell}</a>`);
+        } },
       { name:'Стоимость размещения, ₽', width:'130px', formatter:(cell)=>fmtMoney(cell)+' ₽' },
       { name:'Оплачено, ₽', width:'120px', formatter:(cell)=>fmtMoney(cell)+' ₽' },
       { name:'ДП, ₽', width:'120px', formatter:(cell)=> gridjs.html(`<strong style="color:${cell>0?'var(--danger)':'var(--success)'}">${fmtMoney(cell)} ₽</strong>`) },
