@@ -75,6 +75,24 @@
   .status-list-row { display:flex; align-items:center; gap:8px; padding:6px 0; border-bottom:1px solid var(--border); }
   .status-list-row:last-child { border-bottom:none; }
   .swatch { width:16px; height:16px; border-radius:4px; flex:0 0 auto; }
+  .ofilters { margin-bottom:12px; }
+  .ofrow { display:flex; gap:8px; align-items:flex-end; flex-wrap:wrap; }
+  .of { display:flex; flex-direction:column; min-width:0; }
+  .of label { font-size:12px; margin:0 0 3px; }
+  .of select, .of input { height:32px; box-sizing:border-box; font-size:13px; padding:0 8px; margin:0; }
+  .of select { width:160px; }
+  .ofdates { display:flex; align-items:center; gap:4px; color:var(--muted); }
+  .ofdates input { width:132px; }
+  .ofgrow { flex:1; min-width:180px; }
+  .ofgrow input { width:100%; }
+  .ofrow > .btn { height:32px; padding:0 14px; font-size:13px; }
+  .ofnoise { display:flex; align-items:center; gap:6px; flex-wrap:wrap; margin-top:8px; font-size:12px; }
+  .ofnl { color:var(--muted); }
+  .ofchips { display:inline-flex; gap:6px; flex-wrap:wrap; }
+  .nchip { display:inline-flex; align-items:center; gap:4px; height:26px; padding:0 11px; border:1px solid var(--border); border-radius:13px; background:#fff; font-size:12px; color:var(--muted); cursor:pointer; }
+  .nchip:hover { border-color:#cbd5e1; }
+  .nchip.on { background:#dbeafe; color:#1d4ed8; border-color:#93c5fd; }
+  .ofinfo { margin-left:auto; color:var(--muted); }
   .filters { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:12px; }
   .filters > div { min-width:160px; flex:1; }
   a.link { color:var(--accent); text-decoration:none; }
@@ -212,34 +230,25 @@
 
     <div class="card">
       <h2>Список заявок</h2>
-      <div class="filters">
-        <div>
-          <label>Статус</label>
-          <select id="filterStatus" onchange="window.onOrdersFilterChange()"><option value="">Все статусы</option></select>
-        </div>
-        <div>
-          <label>Служебные статусы (по умолчанию скрыты)</label>
-          <div id="filterNoise" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;min-height:34px;"></div>
-        </div>
-        <div>
-          <label>Дата заявки с</label>
-          <input type="date" id="filterDateFrom" onchange="window.onOrdersFilterChange()">
-        </div>
-        <div>
-          <label>Дата заявки по</label>
-          <input type="date" id="filterDateTo" onchange="window.onOrdersFilterChange()">
-        </div>
-        <div>
-          <label>Поиск (№ заявки, контрагент, клиент, артикул, телефон)</label>
-          <input type="text" id="filterSearch" placeholder="Начните вводить…" oninput="window.onOrdersFilterChange()" onkeydown="if(event.key==='Enter') applyOrdersFilter()">
-        </div>
-        <div>
-          <label>&nbsp;</label>
+      <div class="ofilters">
+        <div class="ofrow">
+          <div class="of"><label>Статус</label>
+            <select id="filterStatus" onchange="window.onOrdersFilterChange()"><option value="">Все статусы</option></select></div>
+          <div class="of"><label>Дата заявки</label>
+            <div class="ofdates">
+              <input type="date" id="filterDateFrom" onchange="window.onOrdersFilterChange()" aria-label="Дата заявки с">
+              <span>—</span>
+              <input type="date" id="filterDateTo" onchange="window.onOrdersFilterChange()" aria-label="Дата заявки по">
+            </div></div>
+          <div class="of ofgrow"><label>Поиск</label>
+            <input type="text" id="filterSearch" placeholder="№ заявки, клиент, артикул, телефон" oninput="window.onOrdersFilterChange()" onkeydown="if(event.key==='Enter') applyOrdersFilter()"></div>
           <button class="btn" type="button" onclick="applyOrdersFilter()">Искать</button>
+          <button class="btn secondary" type="button" onclick="window.resetOrdersFilter()" title="Сбросить все фильтры">Сбросить фильтры</button>
         </div>
-        <div>
-          <label>&nbsp;</label>
-          <button class="btn secondary" type="button" onclick="window.resetOrdersFilter()">Сбросить фильтры</button>
+        <div class="ofnoise">
+          <span class="ofnl">Служебные:</span>
+          <span id="filterNoise" class="ofchips"></span>
+          <span class="ofinfo" id="ordersFilterInfo"></span>
         </div>
       </div>
       <div id="ordersGrid"></div>
@@ -641,7 +650,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.70';
+const APP_VERSION = '2026-08-08.71';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -4112,11 +4121,24 @@ function renderNoiseFilter(){
   const list = noiseStatuses();
   // убираем из запомненного то, чего больше нет
   ORDERS_SHOW_NOISE = new Set(Array.from(ORDERS_SHOW_NOISE).filter(id=>list.some(st=>st.id===id)));
-  el.innerHTML = list.length ? list.map(st=>`<label style="display:flex;align-items:center;gap:4px;font-size:13px;font-weight:400;"><input type="checkbox" ${ORDERS_SHOW_NOISE.has(st.id)?'checked':''} style="width:auto;" onchange="window.toggleNoiseStatus('${st.id}', this.checked)"> ${escapeHtml(st.label)}</label>`).join('') : '<span class="hint">Нет статусов Фрод / Тест / Дубль</span>';
+  el.innerHTML = list.length ? list.map(st=>{
+    const on = ORDERS_SHOW_NOISE.has(st.id);
+    return `<button type="button" class="nchip${on?' on':''}" aria-pressed="${on}" title="${on?'Скрыть':'Показать'} заявки в статусе «${escapeHtml(st.label)}»" onclick="window.toggleNoiseStatus('${st.id}', ${!on})">${on?'✓ ':''}${escapeHtml(st.label)}</button>`;
+  }).join('') : '<span class="hint">нет статусов Фрод / Тест / Дубль</span>';
+}
+// Постоянный счётчик под фильтрами: сколько показано, сколько всего и сколько служебных скрыто.
+function updateOrdersFilterInfo(){
+  const el = document.getElementById('ordersFilterInfo'); if(!el) return;
+  const sv = document.getElementById('filterStatus').value;
+  const total = STATE.orders.filter(o=>!noiseHidden(o, sv)).length;
+  const shown = getFilteredOrders().length;
+  const hidden = STATE.orders.filter(o=>noiseHidden(o, sv)).length;
+  el.textContent = `Показано ${shown.toLocaleString('ru-RU')} из ${total.toLocaleString('ru-RU')}` + (hidden ? ` · скрыто служебных: ${hidden.toLocaleString('ru-RU')}` : '');
 }
 window.toggleNoiseStatus = function(id, on){
   if(on) ORDERS_SHOW_NOISE.add(id); else ORDERS_SHOW_NOISE.delete(id);
   try { localStorage.setItem(NOISE_SHOW_KEY, JSON.stringify(Array.from(ORDERS_SHOW_NOISE))); } catch(_e){}
+  renderNoiseFilter();
   ordersPage = 0;
   renderOrdersGrid();
 };
@@ -4149,6 +4171,7 @@ function getFilteredOrders(){
 // entirely on request -- the product link is still reachable from the order details popup.
 function renderOrdersGrid(){
   const filtered = getFilteredOrders();
+  updateOrdersFilterInfo();
   const el = document.getElementById('ordersGrid');
   const totalPages = Math.max(1, Math.ceil(filtered.length / ORDERS_PAGE_SIZE));
   if(ordersPage > totalPages - 1) ordersPage = totalPages - 1;
