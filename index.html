@@ -654,7 +654,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.72';
+const APP_VERSION = '2026-08-08.73';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -1734,6 +1734,7 @@ async function refreshAll(){
       if(o.address === undefined) o.address = '';
       if(o.bitrixId === undefined) o.bitrixId = null;
       if(o.managerComment === undefined) o.managerComment = '';
+      if(!Array.isArray(o.log)) o.log = [];
       if(o.delivery === undefined) o.delivery = null;
       if(o.email === undefined) o.email = '';
       if(o.serialNumber === undefined) o.serialNumber = '';
@@ -3425,6 +3426,32 @@ window.setOrderPlacementOverride = function(id, val){
   markOrdersDirty();
   renderOrdersGrid();
 };
+// ---- Журнал изменений заявки: статус и селлер (+ комментарий менеджера на момент смены статуса) ----
+// Хранится в самой заявке (o.log), поэтому едет вместе с ней на Диск. Записи только добавляются.
+const ORDER_LOG_MAX = 200;
+function logOrderChange(o, type, from, to, extra){
+  if(!o) return;
+  if(!Array.isArray(o.log)) o.log = [];
+  const e = { at: new Date().toISOString(), by: (typeof currentUserEmail!=='undefined' && currentUserEmail) || '', type, from: from||'', to: to||'' };
+  if(type==='status') e.comment = String(o.managerComment||'').trim();
+  if(extra) Object.assign(e, extra);
+  o.log.push(e);
+  if(o.log.length > ORDER_LOG_MAX) o.log = o.log.slice(-ORDER_LOG_MAX);
+}
+function orderLogHtml(o){
+  const log = Array.isArray(o.log) ? o.log.slice().reverse() : [];
+  const kind = { status:'Статус', seller:'Селлер заявки', item_add:'Товар добавлен (селлер)', item_remove:'Товар убран (селлер)' };
+  const rows = log.map(e=>{
+    const d = new Date(e.at);
+    const when = isNaN(d) ? '' : d.toLocaleString('ru-RU', { day:'2-digit', month:'2-digit', year:'2-digit', hour:'2-digit', minute:'2-digit' });
+    const chg = (e.type==='item_add'||e.type==='item_remove') ? escapeHtml((e.article||'')+' · '+(e.to||e.from||'—')) : `${escapeHtml(e.from||'—')} → <strong>${escapeHtml(e.to||'—')}</strong>`;
+    const cm = e.type==='status' ? (e.comment ? escapeHtml(e.comment) : '<span class="hint">нет комментария</span>') : '';
+    return `<tr><td style="white-space:nowrap;">${when}</td><td>${escapeHtml(e.by||'—')}</td><td>${kind[e.type]||escapeHtml(e.type)}</td><td>${chg}</td><td>${cm}</td></tr>`;
+  }).join('');
+  return `<h4 style="margin:14px 0 6px;">История изменений</h4>` + (rows
+    ? `<div style="max-height:220px;overflow:auto;"><table class="preview"><tr><th>Когда</th><th>Кто</th><th>Что</th><th>Было → стало</th><th>Комментарий менеджера</th></tr>${rows}</table></div>`
+    : '<p class="hint">Изменений статуса и селлера пока не записано.</p>');
+}
 window.changeOrderStatus = async function(id, statusId){
   const o = STATE.orders.find(x=>x.id===id);
   if(!o) return;
@@ -3436,6 +3463,7 @@ window.changeOrderStatus = async function(id, statusId){
     renderOrdersGrid();
     return;
   }
+  if(o.statusId !== statusId) logOrderChange(o, 'status', statusOf(o.statusId).label, statusOf(statusId).label);
   o.statusId = statusId; o.updatedAt = new Date().toISOString();
   renderOrderStats();
   // This used to skip renderOrdersGrid() entirely: the native <select> visually showed the just-
@@ -3485,6 +3513,7 @@ function contragentOptionsHtml(selectedName){
 // вкладки.
 window.setOrderContragent = async function(id, name){
   const o = STATE.orders.find(x=>x.id===id); if(!o) return;
+  if((o.contragent||'') !== (name||'')) logOrderChange(o, 'seller', o.contragent||'', name||'');
   o.contragent = name;
   // ИНН больше не показывается в этой карточке (убрано по запросу), но по-прежнему хранится в
   // заявке и используется в Долге продавца/Отчётах/экспорте -- держим его в паре с продавцом.
@@ -3638,6 +3667,8 @@ window.viewOrderDetails = function(id){
     </table>
 
     ${clientHistoryHtml(o)}
+
+    ${orderLogHtml(o)}
 
     <p class="hint">Все правки в этой карточке (статус, товары, имя, email, продавец, комментарий менеджера, серийный номер, ссылка на товар) сохраняются на Диск сразу же, без отдельной кнопки. Логистика и Размещение здесь не показываются — эти поля доступны только на главном экране списка заявок.</p>
   `;
@@ -3921,6 +3952,7 @@ window.addOrderItem = async function(id, upsell){
       item.upsellBy = currentUserEmail || '';
     }
     o.extraItems.push(item);
+    if(cross) logOrderChange(o, 'item_add', '', sellerName, { article });
     o.updatedAt = new Date().toISOString();
     if(input) input.value = '';
     markOrdersDirty();
@@ -3974,6 +4006,8 @@ window.replaceOrderExtraItem = async function(id, itemId){
 window.removeOrderItem = async function(id, itemId){
   const o = STATE.orders.find(x=>x.id===id); if(!o) return;
   if(!(o.extraItems||[]).some(it=>it.id===itemId)) return;
+  const removed = o.extraItems.find(it=>it.id===itemId);
+  if(removed && removed.contragent) logOrderChange(o, 'item_remove', removed.contragent, '', { article: removed.article });
   o.extraItems = o.extraItems.filter(it=>it.id!==itemId);
   o.updatedAt = new Date().toISOString();
   markOrdersDirty();
@@ -5034,6 +5068,7 @@ window.applyBulkStatusFromLookup = async function(){
   ids.forEach(id=>{
     const o = STATE.orders.find(x=>x.id===id);
     if(!o || !allowedNextStatusIds(o).includes(newStatusId)){ skipped++; return; }
+    if(o.statusId !== newStatusId) logOrderChange(o, 'status', statusOf(o.statusId).label, st.label);
     o.statusId = newStatusId;
     o.updatedAt = now;
     applied++;
