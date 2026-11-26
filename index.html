@@ -656,7 +656,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.79';
+const APP_VERSION = '2026-08-08.80';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -5611,6 +5611,10 @@ window.renderPriceHistory = function(){
           const d = JSON.parse(cell);
           let btns = `<button class="btn secondary" style="padding:4px 8px;font-size:11px;" onclick="viewPriceSnapshot('${d.id}')">Просмотр</button> <button class="btn secondary" style="padding:4px 8px;font-size:11px;" onclick="exportPriceSnapshot('${d.id}','csv')">CSV</button> <button class="btn secondary" style="padding:4px 8px;font-size:11px;" onclick="exportPriceSnapshot('${d.id}','json')">JSON</button>`;
           if(d.isUpload) btns += ` <button class="btn secondary" style="padding:4px 8px;font-size:11px;" onclick="loadUploadIntoCalculator('${d.id}')">В наценку</button>`;
+          if(isAdmin()){
+            if(d.isUpload) btns += ` <button class="btn secondary" style="padding:4px 8px;font-size:11px;" title="Найти заявки, у которых СС взята из этой загрузки" onclick="openCcAudit('${d.id}')">Заявки с этой СС</button>`;
+            btns += ` <button class="btn secondary" style="padding:4px 8px;font-size:11px;color:#dc2626;" title="Переместить файл в корзину Диска" onclick="deletePriceFile('${d.id}')">Удалить</button>`;
+          }
           return gridjs.html(btns);
         }},
     ],
@@ -5648,6 +5652,78 @@ async function similarityReportHtml(snap, fileId){
   rows.sort((a,b)=>b.pct-a.pct);
   return `<h4 style="margin:10px 0 4px;">Сходство с прайсами других продавцов</h4><table class="preview"><tr><th>Продавец</th><th>Загрузка</th><th>Общих артикулов</th><th>Цена совпала</th></tr>${rows.map(r=>`<tr${r.pct>=90&&r.common>=20?' style="background:#fef2f2;"':''}><td>${escapeHtml(r.name)}</td><td>${fmtDate(r.when)}</td><td>${r.common}</td><td><strong>${r.pct}%</strong> (${r.same})</td></tr>`).join('')}</table><p class="hint">≥90% по 20+ артикулам (красным) — вероятно, один и тот же файл загружен под разными продавцами.</p>`;
 }
+// Удаление ошибочной загрузки/расчёта: файл уходит в КОРЗИНУ Диска (его можно восстановить), из истории и
+// из подбора СС/цен он пропадает сразу. Только админ.
+window.deletePriceFile = async function(fileId){
+  if(!isAdmin()){ toast('Недостаточно прав', 'err'); return; }
+  const f = PRICE_HIST_FILES.find(x=>x.id===fileId); if(!f) return;
+  const who = priceFileSeller(f.title).name;
+  if(!confirm(`Удалить в корзину Диска?\n\n${f.title}\nПродавец: ${who}\nСохранён: ${fmtDate(f.createdTime)}\n\nФайл пропадёт из истории и из автоподбора СС/цен. Восстановить можно из корзины Google Диска.`)) return;
+  try {
+    await driveTrashFile(fileId);
+    PRICE_HIST_FILES = PRICE_HIST_FILES.filter(x=>x.id!==fileId);
+    if(typeof ARTICLE_OPTIONS_CACHE !== 'undefined') ARTICLE_OPTIONS_CACHE.clear();
+    window.renderPriceHistory();
+    toast('Файл перемещён в корзину Диска', 'ok');
+  } catch(e){ toast('Не удалось удалить: ' + e.message + (/403|permission/i.test(e.message) ? ' (файл загружен другим пользователем)' : ''), 'err'); }
+};
+// Аудит СС: заявки продавца с датой не раньше загрузки, у которых СС равна цене из ЭТОЙ загрузки, и
+// какая СС получилась бы из остальных файлов (без этой загрузки).
+let CC_AUDIT = [];
+window.openCcAudit = async function(fileId){
+  if(!isAdmin()){ toast('Недостаточно прав', 'err'); return; }
+  const f = PRICE_HIST_FILES.find(x=>x.id===fileId); if(!f) return;
+  const modalBg = document.getElementById('modalBg'), modalBody = document.getElementById('modalBody');
+  modalBody.innerHTML = '<button class="close" onclick="closeModal()">✕</button><div class="loading">Ищу заявки…</div>';
+  modalBg.classList.add('show');
+  try {
+    const parsed = parsePriceUploadFilename(f.title); if(!parsed || !parsed.ipSlug) throw new Error('У файла не указан продавец');
+    const slug = parsed.ipSlug, snap = await driveDownloadJSON(fileId);
+    const cache = new Map(); cache.set(fileId, snap);
+    const uploads = (await loadAllPriceUploadDates()).filter(u=>u.fileId!==fileId);
+    const found = [];
+    for(const o of STATE.orders){
+      if(!o.orderDate || o.orderDate < parsed.date) continue;
+      for(const it of orderItems(o)){
+        if(it.cc==null || !it.article) continue;
+        const seller = itemSellerName(o, it);
+        if(!seller || slugify(seller) !== slug) continue;
+        const v = costFromSnapshot(snap, it.article);
+        if(v==null || Math.abs(v - it.cc) > 0.005) continue;
+        const cands = await candidatesForOrderDate(uploads, o.orderDate, slug, cache);
+        const hit = await firstHitAcrossCandidates(cands, it.article, costFromSnapshot, cache);
+        found.push({ orderId:o.id, itemId:it.id, num:o.orderNumber, date:o.orderDate, status:statusOf(o.statusId).label, article:it.article, cc:it.cc, newVal: hit?hit.value:null, newFile: hit?hit.file:null });
+      }
+    }
+    CC_AUDIT = found;
+    const who = priceFileSeller(f.title).name;
+    modalBody.innerHTML = `<button class="close" onclick="closeModal()">✕</button>
+      <h2>Заявки с СС из загрузки</h2>
+      <p class="muted">${escapeHtml(who)} · ${fmtDate(f.createdTime)}. Найдено: ${found.length}. Справа — СС, которая получилась бы из остальных файлов продавца (этот файл исключён). Если файл ошибочный, сначала удалите его в истории, затем исправьте отмеченные.</p>` +
+      (found.length ? `<table class="preview"><tr><th></th><th>Заявка</th><th>Дата</th><th>Статус</th><th>Артикул</th><th>СС сейчас</th><th>СС из других файлов</th></tr>${found.map((r,i)=>`<tr><td><input type="checkbox" class="ccAuditChk" data-i="${i}" ${r.newVal!=null && r.newVal!==r.cc ? 'checked' : ''}></td><td>${escapeHtml(String(r.num||''))}</td><td>${fmtDateLabel(r.date)}</td><td>${escapeHtml(r.status)}</td><td>${escapeHtml(r.article)}</td><td>${fmtMoney(r.cc)}</td><td>${r.newVal!=null ? '<strong>'+fmtMoney(r.newVal)+'</strong> <span class="hint">(прайс от '+fmtDateLabel(r.newFile.date)+')</span>' : '<span class="hint">не найдена — СС будет очищена</span>'}</td></tr>`).join('')}</table>
+        <div class="btn-row" style="margin-top:10px;"><button class="btn" type="button" onclick="applyCcAudit()">Исправить отмеченные</button></div>` : '<div class="empty">Заявок с СС из этой загрузки не найдено.</div>');
+  } catch(e){
+    console.error(e);
+    modalBody.innerHTML = '<button class="close" onclick="closeModal()">✕</button><div class="empty">Ошибка: ' + escapeHtml(e.message) + '</div>';
+  }
+};
+window.applyCcAudit = async function(){
+  const idx = Array.from(document.querySelectorAll('.ccAuditChk:checked')).map(c=>Number(c.dataset.i));
+  if(!idx.length){ toast('Отметьте заявки', 'err'); return; }
+  let n = 0;
+  idx.forEach(i=>{
+    const r = CC_AUDIT[i]; if(!r) return;
+    const o = STATE.orders.find(x=>x.id===r.orderId); if(!o) return;
+    const target = r.itemId==='primary' ? o : (o.extraItems||[]).find(it=>it.id===r.itemId); if(!target) return;
+    if(r.newVal!=null){ target.cc = r.newVal; setCcSrc(target, 'auto', r.newFile, r.itemId==='primary' ? o.contragent : (target.contragent||o.contragent)); }
+    else { target.cc = null; delete target.ccSrc; }
+    o.updatedAt = new Date().toISOString();
+    n++;
+  });
+  renderOrdersGrid(); renderOrderStats();
+  try { await saveState(); toast(`СС исправлена у ${n} позиций`, 'ok'); closeModal(); }
+  catch(e){ markOrdersDirty(); toast('Не удалось сохранить сразу: ' + e.message, 'err'); }
+};
 window.filterSnapRows = function(q){
   q = String(q||'').trim().toLowerCase();
   const rows = document.querySelectorAll('#snapTable tr[data-q]');
