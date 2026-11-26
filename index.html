@@ -656,7 +656,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.80';
+const APP_VERSION = '2026-08-08.81';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -5670,7 +5670,8 @@ window.deletePriceFile = async function(fileId){
 // Аудит СС: заявки продавца с датой не раньше загрузки, у которых СС равна цене из ЭТОЙ загрузки, и
 // какая СС получилась бы из остальных файлов (без этой загрузки).
 let CC_AUDIT = [];
-window.openCcAudit = async function(fileId){
+let CC_AUDIT_CTX = null;
+window.openCcAudit = async function(fileId, wide){
   if(!isAdmin()){ toast('Недостаточно прав', 'err'); return; }
   const f = PRICE_HIST_FILES.find(x=>x.id===fileId); if(!f) return;
   const modalBg = document.getElementById('modalBg'), modalBody = document.getElementById('modalBody');
@@ -5681,6 +5682,7 @@ window.openCcAudit = async function(fileId){
     const slug = parsed.ipSlug, snap = await driveDownloadJSON(fileId);
     const cache = new Map(); cache.set(fileId, snap);
     const uploads = (await loadAllPriceUploadDates()).filter(u=>u.fileId!==fileId);
+    CC_AUDIT_CTX = { fileId, slug, date: parsed.date, snap, uploads, cache, wide: !!wide };
     const found = [];
     for(const o of STATE.orders){
       if(!o.orderDate || o.orderDate < parsed.date) continue;
@@ -5689,10 +5691,12 @@ window.openCcAudit = async function(fileId){
         const seller = itemSellerName(o, it);
         if(!seller || slugify(seller) !== slug) continue;
         const v = costFromSnapshot(snap, it.article);
-        if(v==null || Math.abs(v - it.cc) > 0.005) continue;
+        const equal = v!=null && Math.abs(v - it.cc) <= 0.005;
+        if(!equal && !wide) continue;
         const cands = await candidatesForOrderDate(uploads, o.orderDate, slug, cache);
         const hit = await firstHitAcrossCandidates(cands, it.article, costFromSnapshot, cache);
-        found.push({ orderId:o.id, itemId:it.id, num:o.orderNumber, date:o.orderDate, status:statusOf(o.statusId).label, article:it.article, cc:it.cc, newVal: hit?hit.value:null, newFile: hit?hit.file:null });
+        if(!equal && !(hit && Math.abs(hit.value - it.cc) > 0.005)) continue; // расширенный поиск: только реально отличающиеся
+        found.push({ orderId:o.id, itemId:it.id, num:o.orderNumber, date:o.orderDate, status:statusOf(o.statusId).label, article:it.article, cc:it.cc, newVal: hit?hit.value:null, newFile: hit?hit.file:null, equal, src: it.ccSrc ? it.ccSrc.by : '' });
       }
     }
     CC_AUDIT = found;
@@ -5700,12 +5704,44 @@ window.openCcAudit = async function(fileId){
     modalBody.innerHTML = `<button class="close" onclick="closeModal()">✕</button>
       <h2>Заявки с СС из загрузки</h2>
       <p class="muted">${escapeHtml(who)} · ${fmtDate(f.createdTime)}. Найдено: ${found.length}. Справа — СС, которая получилась бы из остальных файлов продавца (этот файл исключён). Если файл ошибочный, сначала удалите его в истории, затем исправьте отмеченные.</p>` +
-      (found.length ? `<table class="preview"><tr><th></th><th>Заявка</th><th>Дата</th><th>Статус</th><th>Артикул</th><th>СС сейчас</th><th>СС из других файлов</th></tr>${found.map((r,i)=>`<tr><td><input type="checkbox" class="ccAuditChk" data-i="${i}" ${r.newVal!=null && r.newVal!==r.cc ? 'checked' : ''}></td><td>${escapeHtml(String(r.num||''))}</td><td>${fmtDateLabel(r.date)}</td><td>${escapeHtml(r.status)}</td><td>${escapeHtml(r.article)}</td><td>${fmtMoney(r.cc)}</td><td>${r.newVal!=null ? '<strong>'+fmtMoney(r.newVal)+'</strong> <span class="hint">(прайс от '+fmtDateLabel(r.newFile.date)+')</span>' : '<span class="hint">не найдена — СС будет очищена</span>'}</td></tr>`).join('')}</table>
+      `<label style="display:block;margin:6px 0;"><input type="checkbox" ${wide?'checked':''} onchange="openCcAudit('${fileId}', this.checked)"> Расширенный поиск: также заявки продавца с этой даты, у которых СС отличается от СС из других файлов (даже если не равна цене из этой загрузки)</label>
+      <div style="display:flex;gap:8px;align-items:center;margin:6px 0;"><input type="text" id="ccExplainNum" placeholder="№ заявки — почему её нет в списке?" style="max-width:260px;"><button class="btn secondary" type="button" onclick="explainCcOrder()">Объяснить</button></div><div id="ccExplain"></div>` +
+      (found.length ? `<table class="preview"><tr><th></th><th>Заявка</th><th>Дата</th><th>Статус</th><th>Артикул</th><th>Причина в списке</th><th>СС сейчас</th><th>СС из других файлов</th></tr>${found.map((r,i)=>`<tr><td><input type="checkbox" class="ccAuditChk" data-i="${i}" ${r.equal && r.newVal!=null && r.newVal!==r.cc ? 'checked' : ''}></td><td>${escapeHtml(String(r.num||''))}</td><td>${fmtDateLabel(r.date)}</td><td>${escapeHtml(r.status)}</td><td>${escapeHtml(r.article)}</td><td class="hint">${r.equal ? 'равна цене из этой загрузки' : 'отличается от других файлов'}${r.src==='manual' ? ' · введена вручную' : ''}</td><td>${fmtMoney(r.cc)}</td><td>${r.newVal!=null ? '<strong>'+fmtMoney(r.newVal)+'</strong> <span class="hint">(прайс от '+fmtDateLabel(r.newFile.date)+')</span>' : '<span class="hint">не найдена — СС будет очищена</span>'}</td></tr>`).join('')}</table>
         <div class="btn-row" style="margin-top:10px;"><button class="btn" type="button" onclick="applyCcAudit()">Исправить отмеченные</button></div>` : '<div class="empty">Заявок с СС из этой загрузки не найдено.</div>');
   } catch(e){
     console.error(e);
     modalBody.innerHTML = '<button class="close" onclick="closeModal()">✕</button><div class="empty">Ошибка: ' + escapeHtml(e.message) + '</div>';
   }
+};
+// Объясняет, почему конкретной заявки нет в списке аудита (или что именно с ней не так).
+window.explainCcOrder = async function(){
+  const c = CC_AUDIT_CTX, out = document.getElementById('ccExplain'), num = (document.getElementById('ccExplainNum')||{}).value.trim();
+  if(!c || !out || !num) return;
+  const orders = STATE.orders.filter(o=>String(o.orderNumber).trim()===num);
+  if(!orders.length){ out.innerHTML = `<p class="hint">Заявка №${escapeHtml(num)} не найдена в текущем списке (возможно, скрыта или удалена).</p>`; return; }
+  const fileSeller = sellerNameForSlug(c.slug);
+  const lines = [];
+  for(const o of orders){
+    for(const it of orderItems(o)){
+      const seller = itemSellerName(o, it), L = [];
+      const where = `№${escapeHtml(num)}, ${it.id==='primary'?'основной товар':'доп. товар'} «${escapeHtml(it.article||'—')}»`;
+      if(!seller) L.push('у товара не указан продавец (контрагент)');
+      else if(slugify(seller) !== c.slug) L.push(`продавец заявки «${escapeHtml(seller)}» ≠ продавец загрузки «${escapeHtml(fileSeller)}»`);
+      if(!o.orderDate) L.push('нет даты заявки'); else if(o.orderDate < c.date) L.push(`дата заявки ${fmtDateLabel(o.orderDate)} раньше даты загрузки ${fmtDateLabel(c.date)}`);
+      if(it.cc==null) L.push('СС в заявке пустая');
+      if(!it.article) L.push('нет артикула');
+      const v = it.article ? costFromSnapshot(c.snap, it.article) : null;
+      if(it.article && v==null) L.push('артикула нет в этой загрузке (или в ней нет цены)');
+      else if(v!=null && it.cc!=null && Math.abs(v - it.cc) > 0.005) L.push(`СС в заявке ${fmtMoney(it.cc)} ≠ цена в этой загрузке ${fmtMoney(v)} — значит, СС взята не из этого файла${it.ccSrc?` (источник: ${escapeHtml(it.ccSrc.by)}${it.ccSrc.file?', '+escapeHtml(it.ccSrc.file):''})`:''}`);
+      if(it.article && seller){
+        const cands = await candidatesForOrderDate(c.uploads, o.orderDate||'9999-12-31', slugify(seller), c.cache);
+        const hit = await firstHitAcrossCandidates(cands, it.article, costFromSnapshot, c.cache);
+        L.push(hit ? `по остальным файлам продавца «${escapeHtml(seller)}» СС была бы ${fmtMoney(hit.value)} (прайс от ${fmtDateLabel(hit.file.date)})` : `по остальным файлам продавца «${escapeHtml(seller)}» цены нет`);
+      }
+      lines.push(`<p style="margin:6px 0;"><strong>${where}:</strong><br>${L.map(x=>'• '+x).join('<br>')}</p>`);
+    }
+  }
+  out.innerHTML = lines.join('');
 };
 window.applyCcAudit = async function(){
   const idx = Array.from(document.querySelectorAll('.ccAuditChk:checked')).map(c=>Number(c.dataset.i));
