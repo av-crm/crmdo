@@ -285,6 +285,7 @@
       </div>
 
       <h3 style="margin-top:16px;">Шаг 2. Файл прайса</h3>
+      <div id="calc_ipBanner" style="margin:6px 0 10px;padding:8px 12px;border-radius:8px;background:#eff6ff;border:1px solid #bfdbfe;color:#1e3a8a;font-size:14px;"></div>
       <p class="hint">Формат «Наименование / Артикул / Код SAP + колонки-даты с ценой закупки» (как в примере). Колонки определятся автоматически. Каждая загрузка сохраняется на Диск с датой — история копится ниже, файл заново заливать не нужно.</p>
       <div class="drop" id="calc_drop">
         <input type="file" id="calc_file" accept=".xlsx,.xls">
@@ -379,6 +380,7 @@
 
       <h3 style="margin-top:20px;">История</h3>
       <p class="hint">Загрузки прайса (сохраняются автоматически) и сохранённые расчёты наценки по контрагентам.</p>
+      <div class="field" style="max-width:320px;"><label>Продавец</label><select id="priceHistorySeller" onchange="window.renderPriceHistory()"><option value="">Все продавцы</option></select></div>
       <div id="priceHistoryGrid"></div>
     </div>
   </div>
@@ -654,7 +656,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.76';
+const APP_VERSION = '2026-08-08.79';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -851,6 +853,7 @@ function boot(){
   setupCalcDropzone();
   document.getElementById('calc_search').addEventListener('input', renderCalcGrid);
   document.getElementById('calc_costCol').addEventListener('change', renderCalcGrid);
+  document.getElementById('calc_ip').addEventListener('change', updateCalcIpBanner);
   document.getElementById('calc_roundMode').addEventListener('change', renderCalcGrid);
   document.getElementById('calc_logisticsVal').addEventListener('input', renderCalcGrid);
   document.getElementById('calc_placementVal').addEventListener('input', renderCalcGrid);
@@ -1031,14 +1034,6 @@ function statusSelectOptionsHtml(order){
 let pickerLoaded = false;
 function savePickerApiKey(){
   const key = document.getElementById('pickerApiKeyInput').value.trim();
-  if(!key){ toast('Введите API Key', 'err'); return; }
-  localStorage.setItem(API_KEY_KEY, key);
-  toast('API Key сохранён', 'ok');
-}
-function ensurePickerLoaded(){
-  return new Promise((resolve, reject)=>{
-    if(pickerLoaded){ resolve(); return; }
-    if(typeof gapi === 'undefined'){ reject(new Error('Библиотека Google API не загрузилась (проверьте интернет-соединение и обновите стlue.trim();
   if(!key){ toast('Введите API Key', 'err'); return; }
   localStorage.setItem(API_KEY_KEY, key);
   toast('API Key сохранён', 'ok');
@@ -5626,6 +5621,40 @@ window.renderPriceHistory = function(){
     sort:true, pagination:{ limit:10, resetPageOnUpdate:true }, className:{ table:'gridjs-wrapper' },
   });
 };
+// Сходство загрузки с ближайшими по времени прайсами ДРУГИХ продавцов: помогает понять, не загружен ли
+// один и тот же файл под разными продавцами. Для каждого другого продавца берётся его загрузка,
+// ближайшая по времени к этой (в пределах 3 суток).
+async function similarityReportHtml(snap, fileId){
+  const me = PRICE_HIST_FILES.find(f=>f.id===fileId);
+  if(!me || !/^price_upload_/.test(me.title)) return '';
+  const lastVal = it => { const ps = it.prices||[]; for(let i=ps.length-1;i>=0;i--){ if(ps[i] && ps[i].value!=null) return ps[i].value; } return null; };
+  const mine = new Map();
+  (snap.items||[]).forEach(it=>{ const v = lastVal(it); if(it.article && v!=null) mine.set(normalizeArticleForMatch(it.article), v); });
+  const mySlug = priceFileSeller(me.title).slug, t0 = new Date(me.createdTime).getTime();
+  const best = new Map();
+  PRICE_HIST_FILES.filter(f=>/^price_upload_/.test(f.title) && f.id!==fileId).forEach(f=>{
+    const sl = priceFileSeller(f.title).slug; if(!sl || sl===mySlug) return;
+    const dt = Math.abs(new Date(f.createdTime).getTime() - t0); if(dt > 3*864e5) return;
+    const cur = best.get(sl); if(!cur || dt < cur.dt) best.set(sl, { f, dt });
+  });
+  if(!best.size) return '<p class="hint">Нет загрузок других продавцов рядом по времени для сравнения.</p>';
+  const rows = [];
+  for(const [sl, {f}] of best){
+    let o = null; try { o = await driveDownloadJSON(f.id); } catch(e){ continue; }
+    let common = 0, same = 0;
+    (o && o.items || []).forEach(it=>{ const k = it.article ? normalizeArticleForMatch(it.article) : null; if(!k || !mine.has(k)) return; const v = lastVal(it); if(v==null) return; common++; if(Math.abs(v-mine.get(k))<0.005) same++; });
+    rows.push({ name: sellerNameForSlug(sl), when: f.createdTime, common, same, pct: common ? Math.round(same/common*100) : 0, nOther: (o&&o.items||[]).length });
+  }
+  rows.sort((a,b)=>b.pct-a.pct);
+  return `<h4 style="margin:10px 0 4px;">Сходство с прайсами других продавцов</h4><table class="preview"><tr><th>Продавец</th><th>Загрузка</th><th>Общих артикулов</th><th>Цена совпала</th></tr>${rows.map(r=>`<tr${r.pct>=90&&r.common>=20?' style="background:#fef2f2;"':''}><td>${escapeHtml(r.name)}</td><td>${fmtDate(r.when)}</td><td>${r.common}</td><td><strong>${r.pct}%</strong> (${r.same})</td></tr>`).join('')}</table><p class="hint">≥90% по 20+ артикулам (красным) — вероятно, один и тот же файл загружен под разными продавцами.</p>`;
+}
+window.filterSnapRows = function(q){
+  q = String(q||'').trim().toLowerCase();
+  const rows = document.querySelectorAll('#snapTable tr[data-q]');
+  let n = 0;
+  rows.forEach(r=>{ const show = !q || r.dataset.q.includes(q); r.style.display = show ? '' : 'none'; if(show) n++; });
+  const c = document.getElementById('snapCount'); if(c) c.textContent = q ? `Найдено: ${n} из ${rows.length}` : `Показано позиций: ${rows.length}`;
+};
 window.viewPriceSnapshot = async function(fileId){
   const modalBg = document.getElementById('modalBg'), modalBody = document.getElementById('modalBody');
   modalBody.innerHTML = '<div class="loading">Загрузка…</div>';
@@ -5633,27 +5662,34 @@ window.viewPriceSnapshot = async function(fileId){
   try {
     const snap = await driveDownloadJSON(fileId);
     if(snap.type==='price_upload'){
-      const rowsHtml = (snap.items||[]).slice(0,300).map(it=>{
+      const rowsHtml = (snap.items||[]).slice(0,5000).map(it=>{
         const last = it.prices && it.prices.length ? it.prices[it.prices.length-1] : null;
-        return `<tr><td>${escapeHtml(it.article)}</td><td>${escapeHtml(it.name)}</td><td>${last&&last.value!=null?fmtMoney(last.value)+' ₽ ('+escapeHtml(last.label)+')':'—'}</td></tr>`;
+        return `<tr data-q="${escapeHtml((String(it.article||'')+' '+String(it.name||'')).toLowerCase())}"><td>${escapeHtml(it.article)}</td><td>${escapeHtml(it.name)}</td><td>${last&&last.value!=null?fmtMoney(last.value)+' ₽ ('+escapeHtml(last.label)+')':'—'}</td></tr>`;
       }).join('');
       modalBody.innerHTML = `
         <button class="close" onclick="closeModal()">✕</button>
         <h2>Загрузка прайса — ${fmtDate(snap.uploadedAt)}</h2>
         <p><strong>${escapeHtml(snap.ip ? snap.ip.name : 'продавец не указан')}</strong></p>
         <p class="muted">Позиций: ${snap.itemsCount}. Колонок с датами закупки: ${(snap.priceCols||[]).length}.</p>
-        <table class="preview"><tr><th>Артикул</th><th>Наименование</th><th>Последняя цена</th></tr>${rowsHtml || '<tr><td colspan=3 class="empty">Пусто</td></tr>'}</table>
+        <input type="text" placeholder="Поиск по артикулу или названию (показаны все позиции)" oninput="window.filterSnapRows(this.value)" style="width:100%;box-sizing:border-box;margin-bottom:8px;">
+        <div id="snapSim"><p class="hint">Сравниваю с другими продавцами…</p></div>
+        <div id="snapCount" class="hint"></div>
+        <table class="preview" id="snapTable"><tr><th>Артикул</th><th>Наименование</th><th>Последняя цена</th></tr>${rowsHtml || '<tr><td colspan=3 class="empty">Пусто</td></tr>'}</table>
       `;
     } else {
-      const rowsHtml = (snap.items||[]).slice(0,300).map(it=>`
-        <tr><td>${escapeHtml(it.article)}</td><td>${escapeHtml(it.name)}</td><td>${fmtMoney(it.cost)} ₽</td><td>${fmtMoney(it.sell)} ₽</td><td>${it.markupPct}%</td></tr>`).join('');
+      const rowsHtml = (snap.items||[]).slice(0,5000).map(it=>`
+        <tr data-q="${escapeHtml((String(it.article||'')+' '+String(it.name||'')).toLowerCase())}"><td>${escapeHtml(it.article)}</td><td>${escapeHtml(it.name)}</td><td>${fmtMoney(it.cost)} ₽</td><td>${fmtMoney(it.sell)} ₽</td><td>${it.markupPct}%</td></tr>`).join('');
       modalBody.innerHTML = `
         <button class="close" onclick="closeModal()">✕</button>
         <h2>Расчёт для ${escapeHtml(snap.ip?snap.ip.name:'—')} — ${fmtDate(snap.savedAt)}</h2>
         <p class="muted">ИНН: ${escapeHtml(snap.ip?snap.ip.inn:'—')}. Позиций: ${(snap.items||[]).length}.</p>
-        <table class="preview"><tr><th>Артикул</th><th>Наименование</th><th>Закупка</th><th>Продажа</th><th>Наценка</th></tr>${rowsHtml || '<tr><td colspan=5 class="empty">Пусто</td></tr>'}</table>
+        <input type="text" placeholder="Поиск по артикулу или названию (показаны все позиции)" oninput="window.filterSnapRows(this.value)" style="width:100%;box-sizing:border-box;margin-bottom:8px;">
+        <div id="snapCount" class="hint"></div>
+        <table class="preview" id="snapTable"><tr><th>Артикул</th><th>Наименование</th><th>Закупка</th><th>Продажа</th><th>Наценка</th></tr>${rowsHtml || '<tr><td colspan=5 class="empty">Пусто</td></tr>'}</table>
       `;
     }
+    window.filterSnapRows('');
+    if(snap.type==='price_upload') similarityReportHtml(snap, fileId).then(h=>{ const el = document.getElementById('snapSim'); if(el) el.innerHTML = h; }).catch(e=>{ console.error(e); const el = document.getElementById('snapSim'); if(el) el.innerHTML = ''; });
   } catch(e){
     modalBody.innerHTML = '<button class="close" onclick="closeModal()">✕</button><div class="empty">Ошибка: ' + escapeHtml(e.message) + '</div>';
   }
@@ -6312,4 +6348,48 @@ function exportCalcForSite(){
   if(!rows.length){ toast('Нет товаров с рассчитанной ценой продажи для выгрузки', 'err'); return; }
   const ip = currentCalcIp();
   const stamp = new Date().toISOString().slice(0,10);
-  downloadBlob(`price_site_${ip.name.replace(/\s+
+  downloadBlob(`price_site_${ip.name.replace(/\s+/g,'_')}_${stamp}.csv`, toCSV(rows, ['articul','inn','price','seller']), 'text/csv;charset=utf-8');
+}
+async function saveCalcSnapshotToDrive(){
+  const ip = currentCalcIp();
+  const costIdx = Number(document.getElementById('calc_costCol').value);
+  const costLabel = CALC_PRICE_COLS[costIdx] ? CALC_PRICE_COLS[costIdx].label : null;
+  const items = CALC_ITEMS.map(item=>{
+    const c = computeCalcRow(item);
+    return { article:item.article, sap:item.sap, name:item.name, cost:c.cost,
+      logistics:{ value:c.logVal, unit:c.logUnit, amount:c.logAmount },
+      placement:{ value:c.plVal, unit:c.plUnit, amount:c.plAmount },
+      markupPct:c.markupPct, sell:c.sell, margin:c.margin, costDate:c.costDate };
+  }).filter(r=>r.cost!=null);
+  if(!items.length){ toast('Нет данных для сохранения', 'err'); return; }
+  const activeLadder = CALC_LADDER_ID ? (STATE.priceLadders||[]).find(l=>l.id===CALC_LADDER_ID) : null;
+  const snapshot = {
+    type:'sell_price_snapshot', ip, costColumnLabel: costLabel,
+    // Если применялась лестница -- фиксируем имя/пороги как они были на момент расчёта (не ссылку
+    // на id лестницы, которую потом можно переименовать/удалить) для истории.
+    ladder: activeLadder ? { name: activeLadder.name, tiers: activeLadder.tiers } : null,
+    logisticsDefault: { value: parseFloat(document.getElementById('calc_logisticsVal').value||0), unit: document.getElementById('calc_logisticsUnit').value },
+    placementDefault: { value: parseFloat(document.getElementById('calc_placementVal').value||0), unit: document.getElementById('calc_placementUnit').value },
+    roundStep: Number(document.getElementById('calc_roundMode').value),
+    savedAt: new Date().toISOString(), items,
+  };
+  const hint = document.getElementById('calc_hint');
+  hint.textContent = 'Сохраняем в Google Диск…';
+  try {
+    const now = new Date();
+    const dateStr = todayStr(), timeStr = now.toISOString().slice(11,19).replace(/:/g,'');
+    await driveCreateJSON(`sellprice_${slugify(ip.name)}_${dateStr}_${timeStr}.json`, FOLDERS.prices, snapshot);
+    hint.textContent = '';
+    toast('Сохранено в историю на Диске', 'ok');
+    await loadPriceHistory();
+  } catch(e){
+    hint.textContent = 'Ошибка: ' + e.message;
+    toast('Ошибка сохранения', 'err');
+  }
+}
+
+/* ================= START ================= */
+window.addEventListener('load', boot);
+</script>
+</body>
+</html>
