@@ -583,6 +583,12 @@
       </div>
     </div>
     <div class="card">
+      <h2>Количество активных SKU</h2>
+      <p class="hint">Для каждого продавца берётся его самый свежий загруженный прайс; активным считается артикул с непустой ценой (последняя заполненная цена закупки больше нуля). Повторы артикула внутри одного прайса считаются один раз. Итог — сумма по всем актуальным прайсам.</p>
+      <div class="btn-row"><button class="btn secondary" type="button" onclick="window.renderActiveSkuReport(true)">Пересчитать</button></div>
+      <div id="activeSkuResult"></div>
+    </div>
+    <div class="card">
       <h2>Отчёт по продажам</h2>
       <p class="hint">Номер заявки, артикул, сумма заказа, СС, логистика, стоимость размещения, ИНН.</p>
       <div class="field" style="margin-bottom:10px;">
@@ -656,7 +662,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.81';
+const APP_VERSION = '2026-08-08.82';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -1790,7 +1796,7 @@ function switchTab(name){
   document.getElementById('panel-'+name).classList.add('active');
   // Lazily (re)render on open so these always reflect the latest STATE.orders/sellerPayments,
   // without needing every single order-mutating function to know about these tabs.
-  if(name==='reports'){ renderReportContragentFilter(); renderSalesReportGrid(); }
+  if(name==='reports'){ renderReportContragentFilter(); renderSalesReportGrid(); window.renderActiveSkuReport(false); }
   if(name==='debt'){ renderDebtGrid(); renderDebtPaymentsGrid(); }
   if(name==='priceanalysis'){ window.openPriceAnalysis(); }
   if(name==='stock'){ if(!STOCK.loaded && !STOCK.loading){ window.refreshStock(); } else window.renderStockTable(); }
@@ -4968,6 +4974,47 @@ function ensureReportContragentFilter(){
       REPORT_CONTRAGENT_KNOWN.add(c);
     }
   });
+}
+// Активные SKU: по каждому продавцу -- последний price_upload; считаем уникальные артикулы с непустой ценой.
+let ACTIVE_SKU = null;
+async function computeActiveSku(){
+  const uploads = await loadAllPriceUploadDates();
+  const latest = new Map();
+  uploads.filter(u=>u.ipSlug).forEach(u=>{
+    const cur = latest.get(u.ipSlug);
+    if(!cur || u.date > cur.date || (u.date===cur.date && new Date(u.createdTime) > new Date(cur.createdTime))) latest.set(u.ipSlug, u);
+  });
+  const rows = [], all = new Set();
+  for(const [slug, u] of latest){
+    let snap = null;
+    try { snap = await driveDownloadJSON(u.fileId); } catch(e){ console.error(e); }
+    const uniq = new Set();
+    (snap && snap.items || []).forEach(it=>{
+      if(!it.article || !String(it.article).trim()) return;
+      const ps = it.prices||[]; let v = null;
+      for(let i=ps.length-1;i>=0;i--){ if(ps[i] && ps[i].value!=null && isFinite(Number(ps[i].value)) && Number(ps[i].value)>0){ v = Number(ps[i].value); break; } }
+      if(v==null) return;
+      const k = normalizeArticleForMatch(it.article); uniq.add(k); all.add(k);
+    });
+    rows.push({ seller: sellerNameForSlug(slug), date: u.date, total: snap ? (snap.items||[]).length : 0, active: uniq.size, error: !snap });
+  }
+  rows.sort((a,b)=>String(a.seller).localeCompare(String(b.seller),'ru'));
+  return { rows, sum: rows.reduce((t,r)=>t+r.active,0), unique: all.size };
+}
+window.renderActiveSkuReport = async function(force){
+  const el = document.getElementById('activeSkuResult'); if(!el) return;
+  if(ACTIVE_SKU && !force){ paintActiveSku(ACTIVE_SKU); return; }
+  el.innerHTML = '<div class="loading">Считаю по актуальным прайсам…</div>';
+  try { ACTIVE_SKU = await computeActiveSku(); paintActiveSku(ACTIVE_SKU); }
+  catch(e){ console.error(e); el.innerHTML = '<div class="empty">Ошибка: ' + escapeHtml(e.message) + '</div>'; }
+};
+function paintActiveSku(d){
+  const el = document.getElementById('activeSkuResult'); if(!el) return;
+  if(!d.rows.length){ el.innerHTML = '<div class="empty">Нет загруженных прайсов с указанным продавцом.</div>'; return; }
+  el.innerHTML = `<p style="font-size:15px;margin:8px 0;">Активных SKU = <strong style="font-size:26px;">${d.sum.toLocaleString('ru-RU')}</strong> <span class="hint">(сумма по ${d.rows.length} прайсам; уникальных артикулов среди всех прайсов: ${d.unique.toLocaleString('ru-RU')})</span></p>
+    <table class="preview"><tr><th>Продавец</th><th>Актуальный прайс от</th><th>Позиций в файле</th><th>Активных SKU</th></tr>
+    ${d.rows.map(r=>`<tr><td>${escapeHtml(r.seller)}</td><td>${fmtDateLabel(r.date)}</td><td>${r.error?'<span class="hint">не загрузился</span>':r.total}</td><td><strong>${r.active}</strong></td></tr>`).join('')}
+    <tr><td><strong>Итого</strong></td><td></td><td>${d.rows.reduce((t,r)=>t+r.total,0)}</td><td><strong>${d.sum}</strong></td></tr></table>`;
 }
 function renderReportContragentFilter(){
   const el = document.getElementById('reportContragentFilter');
