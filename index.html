@@ -387,7 +387,7 @@
   <div class="panel" id="panel-reconcile">
     <div class="card">
       <h2>Сверка</h2>
-      <p class="hint">Укажите артикул и дату — система найдёт самый свежий прайс закупки и расчёт цены продажи, действовавшие не позже этой даты (среди всех продавцов), и покажет название документа, продавца и цену.</p>
+      <p class="hint">Укажите артикул и дату — система найдёт самый свежий прайс закупки и расчёт цены продажи, действовавшие не позже этой даты у КАЖДОГО продавца отдельно, и покажет по каждому название документа и цены.</p>
       <div class="btn-row" style="align-items:flex-end;">
         <div class="field" style="max-width:220px;">
           <label>Артикул</label>
@@ -654,7 +654,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.73';
+const APP_VERSION = '2026-08-08.74';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -1850,6 +1850,38 @@ async function reconcileArticleAtDate(articleRaw, dateStr){
   }
   return result;
 }
+// Для каждого продавца отдельно: самый свежий прайс закупки и расчёт цены продажи не позже dateStr,
+// где встречается артикул. Файлы с известным продавцом (slug в имени) группируются без скачивания;
+// безымянные (старые) файлы определяются по содержимому -- не больше 20 самых свежих.
+async function reconcileAllAtDate(articleRaw, dateStr){
+  const [uploads, sellSnaps] = await Promise.all([loadAllPriceUploadDates(), loadAllSellPriceSnapshotDates()]);
+  const cache = new Map();
+  async function scan(files, extractFn){
+    const cands = files.filter(u=>u.date <= dateStr)
+      .sort((a,b)=> b.date.localeCompare(a.date) || new Date(b.createdTime) - new Date(a.createdTime));
+    const hits = new Map(), tried = new Map();
+    let anon = 0;
+    for(const c of cands){
+      let slug = c.ipSlug;
+      if(slug == null){ if(anon >= 20) continue; anon++; slug = await resolveUploadSellerSlug(c, cache); }
+      if(hits.has(slug)) continue;
+      const n = tried.get(slug) || 0; if(n >= 6) continue; tried.set(slug, n+1);
+      let snap = cache.get(c.fileId);
+      if(snap === undefined){
+        try { snap = await driveDownloadJSON(c.fileId); } catch(e){ console.error(e); snap = null; }
+        cache.set(c.fileId, snap);
+      }
+      const value = extractFn(snap, articleRaw);
+      if(value != null) hits.set(slug, { value, file:c });
+    }
+    return hits;
+  }
+  const cc = await scan(uploads, costFromSnapshot);
+  const sell = await scan(sellSnaps, priceFromSnapshot);
+  const slugs = new Set([...cc.keys(), ...sell.keys()]);
+  return Array.from(slugs).map(slug=>({ slug, seller: sellerNameForSlug(slug), cc: cc.get(slug)||null, sell: sell.get(slug)||null }))
+    .sort((a,b)=> String(a.seller).localeCompare(String(b.seller), 'ru'));
+}
 window.runReconcile = async function(){
   const articleEl = document.getElementById('reconcile_article');
   const dateEl = document.getElementById('reconcile_date');
@@ -1860,29 +1892,20 @@ window.runReconcile = async function(){
     if(resultEl) resultEl.innerHTML = '<p class="hint">Укажите артикул и дату.</p>';
     return;
   }
-  if(resultEl) resultEl.innerHTML = '<p class="hint">Ищу…</p>';
+  if(resultEl) resultEl.innerHTML = '<p class="hint">Ищу по всем продавцам…</p>';
   try {
-    const r = await reconcileArticleAtDate(article, dateStr);
-    if(!r.ccFile && !r.priceFile){
+    const rows = await reconcileAllAtDate(article, dateStr);
+    if(!rows.length){
       resultEl.innerHTML = `<p class="hint">Ничего не нашлось — нет ни одного прайса/расчёта не позже ${fmtDateLabel(dateStr)}, где встречается артикул «${escapeHtml(article)}».</p>`;
       return;
     }
-    const rows = [];
-    if(r.ccFile){
-      rows.push(`<tr><th>Закупочная цена (СС)</th><td><strong>${fmtMoney(r.cc)} ₽</strong></td></tr>`);
-      rows.push(`<tr><th>Документ (закупка)</th><td>${escapeHtml(r.ccFile.title || '—')} <span class="hint">(от ${fmtDateLabel(r.ccFile.date)})</span></td></tr>`);
-      rows.push(`<tr><th>Продавец (закупка)</th><td>${escapeHtml(r.ccSeller)}</td></tr>`);
-    } else {
-      rows.push(`<tr><th>Закупочная цена (СС)</th><td class="hint">не найдена</td></tr>`);
-    }
-    if(r.priceFile){
-      rows.push(`<tr><th>Цена продажи</th><td><strong>${fmtMoney(r.price)} ₽</strong></td></tr>`);
-      rows.push(`<tr><th>Документ (продажа)</th><td>${escapeHtml(r.priceFile.title || '—')} <span class="hint">(от ${fmtDateLabel(r.priceFile.date)})</span></td></tr>`);
-      rows.push(`<tr><th>Продавец (продажа)</th><td>${escapeHtml(r.priceSeller)}</td></tr>`);
-    } else {
-      rows.push(`<tr><th>Цена продажи</th><td class="hint">не найдена</td></tr>`);
-    }
-    resultEl.innerHTML = `<table class="preview">${rows.join('')}</table>`;
+    const ccVals = rows.filter(r=>r.cc).map(r=>r.cc.value), minCC = ccVals.length ? Math.min(...ccVals) : null;
+    const doc = h => h ? `<div class="hint" style="margin:0;" title="${escapeHtml(h.file.title||'')}">${escapeHtml(h.file.title||'—')} (от ${fmtDateLabel(h.file.date)})</div>` : '';
+    resultEl.innerHTML = `<p class="hint">Для каждого продавца — самый свежий документ не позже ${fmtDateLabel(dateStr)}. Зелёным выделена минимальная СС. Продавцов: ${rows.length}.</p>
+      <table class="preview"><tr><th>Продавец</th><th>СС</th><th>Документ (закупка)</th><th>Цена продажи</th><th>Документ (продажа)</th></tr>
+      ${rows.map(r=>`<tr><td>${escapeHtml(r.seller)}</td>
+        <td style="${r.cc && r.cc.value===minCC && rows.length>1 ? 'color:#16a34a;font-weight:600;' : ''}">${r.cc ? '<strong>'+fmtMoney(r.cc.value)+' ₽</strong>' : '<span class="hint">—</span>'}</td><td>${doc(r.cc)}</td>
+        <td>${r.sell ? '<strong>'+fmtMoney(r.sell.value)+' ₽</strong>' : '<span class="hint">—</span>'}</td><td>${doc(r.sell)}</td></tr>`).join('')}</table>`;
   } catch(e){
     resultEl.innerHTML = '';
     toast('Ошибка сверки: ' + e.message, 'err');
@@ -2860,7 +2883,7 @@ function todayStr(){
 // остаётся единым значением заявки (o.logistics), как и раньше. upsell -- отметка для расчёта
 // мотивации менеджера.
 function orderItems(o){
-  const primary = { id:'primary', article:o.article, price:o.price, cc:o.cc, logistics:o.logistics };
+  const primary = { id:'primary', article:o.article, price:o.price, cc:o.cc, ccSrc:o.ccSrc, logistics:o.logistics };
   return [primary, ...((o.extraItems||[]))];
 }
 function orderTotalLogistics(o){
@@ -3221,6 +3244,30 @@ async function latestUploadForSeller(uploads, sellerSlug, snapshotCache){
 // пусто (см. большой комментарий у loadAllPriceUploadDates: ровно так терялась корректная утренняя
 // загрузка прайса из-за неполной дневной перезагрузки). snapshotCache передаётся снаружи, чтобы один
 // и тот же файл не скачивался повторно для разных заявок в одном батче.
+function setCcSrc(target, by, file, seller){
+  target.ccSrc = { by, file: file ? (file.title||'') : '', date: file ? (file.date||'') : '', seller: seller||'', at: new Date().toISOString(), user: (typeof currentUserEmail!=='undefined' && currentUserEmail) || '' };
+}
+function ccSrcHtml(it){
+  const x = it.ccSrc;
+  if(it.cc == null) return '';
+  if(!x) return '<div class="hint" style="margin:2px 0 0;font-size:11px;">источник СС не записан</div>';
+  const how = { auto:'авто из прайса на дату заявки', manual:'введена вручную', replace:'замена артикула (самый свежий прайс)', add:'добавление товара (самый свежий прайс)' }[x.by] || x.by;
+  const d = new Date(x.at), when = isNaN(d) ? '' : d.toLocaleString('ru-RU',{day:'2-digit',month:'2-digit',year:'2-digit',hour:'2-digit',minute:'2-digit'});
+  const doc = x.file ? ` · ${escapeHtml(x.seller||'')} · прайс от ${fmtDateLabel(x.date)}` : '';
+  return `<div class="hint" style="margin:2px 0 0;font-size:11px;max-width:200px;" title="${escapeHtml((x.file||'')+' | '+(x.user||'')+' '+when)}">${escapeHtml(how)}${doc}<br>${escapeHtml(x.user||'')} ${when}</div>`;
+}
+async function firstHitAcrossCandidates(candidates, article, extractFn, snapshotCache){
+  for(const c of candidates){
+    let snap = snapshotCache.get(c.fileId);
+    if(snap === undefined){
+      try { snap = await driveDownloadJSON(c.fileId); } catch(e){ console.error(e); snap = null; }
+      snapshotCache.set(c.fileId, snap);
+    }
+    const value = extractFn(snap, article);
+    if(value != null) return { value, file:c };
+  }
+  return null;
+}
 async function firstMatchAcrossCandidates(candidates, article, extractFn, snapshotCache){
   for(const c of candidates){
     let snap = snapshotCache.get(c.fileId);
@@ -3244,10 +3291,10 @@ async function autofillOrdersCC(orders){
   // что проверялся и раньше -- поведение для них не меняется.
   const tasks = [];
   orders.forEach(o=>{
-    if(o.cc==null) tasks.push({ order:o, seller:o.contragent, article:o.article, orderDate:o.orderDate, apply:(cost)=>{ o.cc = cost; } });
+    if(o.cc==null) tasks.push({ order:o, seller:o.contragent, article:o.article, orderDate:o.orderDate, apply:(cost,file)=>{ o.cc = cost; setCcSrc(o,'auto',file,o.contragent); } });
     (o.extraItems||[]).forEach(it=>{
       // у товара другого селлера (допродажа) СС ищется в прайсе ЕГО селлера, а не селлера заявки
-      if(it.cc==null) tasks.push({ order:o, seller:(it.contragent || o.contragent), article:it.article, orderDate:o.orderDate, apply:(cost)=>{ it.cc = cost; } });
+      if(it.cc==null) tasks.push({ order:o, seller:(it.contragent || o.contragent), article:it.article, orderDate:o.orderDate, apply:(cost,file)=>{ it.cc = cost; setCcSrc(it,'auto',file,it.contragent||o.contragent); } });
     });
   });
   stats.skippedNoArticle = tasks.filter(t=>!t.article).length;
@@ -3263,8 +3310,8 @@ async function autofillOrdersCC(orders){
     const sellerSlug = t.seller ? slugify(t.seller) : null;
     const candidates = await candidatesForOrderDate(uploads, t.orderDate, sellerSlug, snapshotCache);
     if(!candidates.length){ stats.skippedNoUpload++; continue; }
-    const cost = await firstMatchAcrossCandidates(candidates, t.article, costFromSnapshot, snapshotCache);
-    if(cost != null){ t.apply(cost); stats.filled++; } else { stats.skippedNoMatch++; }
+    const hit = await firstHitAcrossCandidates(candidates, t.article, costFromSnapshot, snapshotCache);
+    if(hit){ t.apply(hit.value, hit.file); stats.filled++; } else { stats.skippedNoMatch++; }
   }
   return stats;
 }
@@ -3387,6 +3434,7 @@ window.setOrderCC = function(id, val){
   const o = STATE.orders.find(x=>x.id===id); if(!o) return;
   const v = parseFloat(val);
   o.cc = isNaN(v) ? null : v;
+  if(o.cc==null) delete o.ccSrc; else setCcSrc(o,'manual');
   o.updatedAt = new Date().toISOString();
   markOrdersDirty();
   renderOrdersGrid();
@@ -3557,7 +3605,7 @@ window.viewOrderDetails = function(id){
       <tr>
         <td>${escapeHtml(it.article)||'—'}${badges}</td>
         <td><input type="number" step="0.01" value="${it.price!=null?it.price:''}" style="width:100px;" onchange="window.setOrderItemField('${o.id}','${it.id}','price', this.value)"></td>
-        <td><input type="number" step="0.01" value="${it.cc!=null?it.cc:''}" style="width:100px;" onchange="window.setOrderItemField('${o.id}','${it.id}','cc', this.value)"></td>
+        <td><input type="number" step="0.01" value="${it.cc!=null?it.cc:''}" style="width:100px;" onchange="window.setOrderItemField('${o.id}','${it.id}','cc', this.value)">${ccSrcHtml(it)}</td>
         ${hasExtras ? (isPrimary ? '<td class="hint">1</td>' : `<td><input type="number" min="1" step="1" value="${Number(it.qty)||1}" style="width:60px;" title="Количество штук (цена, СС и логистика пересчитываются пропорционально)" onchange="window.setOrderItemQty('${o.id}','${it.id}', this.value)"></td>`) : ''}
         ${hasCrossItems ? '<td class="hint">—</td>' : ''}
         <td style="white-space:nowrap;">
@@ -3800,8 +3848,9 @@ window.replaceOrderArticle = async function(id){
     o.price = null;
     if(!logisticsLocked) o.logistics = null;
     let foundCC = false, foundLog = false, foundPrice = false;
-    const cost = await firstMatchAcrossCandidates(uploadCandidates, newArticle, costFromSnapshot, snapshotCache);
-    if(cost != null){ o.cc = cost; foundCC = true; }
+    delete o.ccSrc;
+    const ccHit = await firstHitAcrossCandidates(uploadCandidates, newArticle, costFromSnapshot, snapshotCache);
+    if(ccHit){ o.cc = ccHit.value; setCcSrc(o,'replace',ccHit.file,o.contragent); foundCC = true; }
     if(!logisticsLocked){
       const log = await firstMatchAcrossCandidates(sellCandidates, newArticle, logisticsFromSnapshot, snapshotCache);
       if(log != null){ o.logistics = log; foundLog = true; }
@@ -3833,12 +3882,13 @@ async function lookupArticlePriceForSeller(article, sellerSlug){
   const snapshotCache = new Map();
   const uploadCandidates = await latestCandidatesForSeller(uploads, sellerSlug, snapshotCache);
   const sellCandidates = await latestCandidatesForSeller(sellSnaps, sellerSlug, snapshotCache);
-  const cc = await firstMatchAcrossCandidates(uploadCandidates, article, costFromSnapshot, snapshotCache);
+  const ccHit = await firstHitAcrossCandidates(uploadCandidates, article, costFromSnapshot, snapshotCache);
+  const cc = ccHit ? ccHit.value : null, ccFile = ccHit ? ccHit.file : null;
   const price = await firstMatchAcrossCandidates(sellCandidates, article, priceFromSnapshot, snapshotCache);
   // Логистика нужна только для товара ДРУГОГО селлера (допродажа): у него вся "дельта" лежит в
   // поле логистики расчёта, размещение 0. Для обычного товара того же селлера не используется.
   const logistics = await firstMatchAcrossCandidates(sellCandidates, article, logisticsFromSnapshot, snapshotCache);
-  return { cc, price, logistics };
+  return { cc, price, logistics, ccFile };
 }
 function renderUpsellSettings(){
   const sel = document.getElementById('upsellSellerSelect');
@@ -3937,9 +3987,10 @@ window.addOrderItem = async function(id, upsell){
   if(hint) hint.textContent = 'Ищу цену закупки и цену продажи в последнем загруженном прайсе…';
   try {
     const sellerSlug = sellerName ? slugify(sellerName) : null;
-    const { cc, price, logistics } = await lookupArticlePriceForSeller(article, sellerSlug);
+    const { cc, price, logistics, ccFile } = await lookupArticlePriceForSeller(article, sellerSlug);
     if(!o.extraItems) o.extraItems = [];
     const item = { id: uuid(), article, cc: cc!=null?cc:null, price: price!=null?price:null };
+    if(ccFile) setCcSrc(item,'add',ccFile,sellerName);
     if(cross){
       const ip = (CALC_IP_LIST||[]).find(x=>x.name===sellerName);
       item.contragent = sellerName;
@@ -3981,9 +4032,10 @@ window.replaceOrderExtraItem = async function(id, itemId){
   try {
     const itemSeller = item.contragent || o.contragent;
     const sellerSlug = itemSeller ? slugify(itemSeller) : null;
-    const { cc, price, logistics } = await lookupArticlePriceForSeller(newArticle, sellerSlug);
+    const { cc, price, logistics, ccFile } = await lookupArticlePriceForSeller(newArticle, sellerSlug);
     item.article = newArticle;
     item.cc = cc!=null ? cc : null;
+    if(ccFile) setCcSrc(item,'replace',ccFile,itemSeller); else delete item.ccSrc;
     item.price = price!=null ? price : null;
     if(item.contragent) item.logistics = logistics!=null ? logistics : null; // товар другого селлера
     o.updatedAt = new Date().toISOString();
@@ -4030,9 +4082,11 @@ window.setOrderItemField = async function(id, itemId, field, val){
   const parsed = isNaN(v) ? null : v;
   if(itemId==='primary'){
     o[field] = parsed;
+    if(field==='cc'){ if(parsed==null) delete o.ccSrc; else setCcSrc(o,'manual'); }
   } else {
     const item = (o.extraItems||[]).find(it=>it.id===itemId); if(!item) return;
     item[field] = parsed;
+    if(field==='cc'){ if(parsed==null) delete item.ccSrc; else setCcSrc(item,'manual'); }
   }
   o.updatedAt = new Date().toISOString();
   try {
