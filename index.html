@@ -654,7 +654,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.75';
+const APP_VERSION = '2026-08-08.76';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -1031,6 +1031,14 @@ function statusSelectOptionsHtml(order){
 let pickerLoaded = false;
 function savePickerApiKey(){
   const key = document.getElementById('pickerApiKeyInput').value.trim();
+  if(!key){ toast('Введите API Key', 'err'); return; }
+  localStorage.setItem(API_KEY_KEY, key);
+  toast('API Key сохранён', 'ok');
+}
+function ensurePickerLoaded(){
+  return new Promise((resolve, reject)=>{
+    if(pickerLoaded){ resolve(); return; }
+    if(typeof gapi === 'undefined'){ reject(new Error('Библиотека Google API не загрузилась (проверьте интернет-соединение и обновите стlue.trim();
   if(!key){ toast('Введите API Key', 'err'); return; }
   localStorage.setItem(API_KEY_KEY, key);
   toast('API Key сохранён', 'ok');
@@ -5497,8 +5505,43 @@ function renderDebtPaymentsGrid(){
 // findUploadForOrderDate) сначала ищет прайс именно этого продавца, и только если для него ничего
 // не загружали -- падает назад на старые "общие" файлы без продавца в имени (ipSlug: null),
 // чтобы данные, загруженные до этого разделения, не потерялись.
+// Защита от загрузки прайса «не тому продавцу»: сравниваем новый файл с последним прайсом каждого ДРУГОГО
+// продавца. Если по >=20 общим артикулам совпало >=90% последних цен -- скорее всего, это тот же файл.
+// Это только предупреждение (у разных продавцов цены законно могут совпадать), решает человек.
+async function findSimilarUploadsOfOthers(parsed, ip){
+  const lastVal = it => { const ps = it.prices||[]; for(let i=ps.length-1;i>=0;i--){ if(ps[i] && ps[i].value!=null) return ps[i].value; } return null; };
+  const mine = new Map();
+  (parsed.items||[]).forEach(it=>{ const v = lastVal(it); if(it.article && v!=null) mine.set(normalizeArticleForMatch(it.article), v); });
+  if(!mine.size) return [];
+  const mySlug = slugify(ip.name);
+  const uploads = await loadAllPriceUploadDates();
+  const latest = new Map();
+  uploads.filter(u=>u.ipSlug && u.ipSlug!==mySlug).forEach(u=>{
+    const cur = latest.get(u.ipSlug);
+    if(!cur || u.date > cur.date || (u.date===cur.date && new Date(u.createdTime) > new Date(cur.createdTime))) latest.set(u.ipSlug, u);
+  });
+  const out = [];
+  for(const [slug, u] of latest){
+    let snap = null;
+    try { snap = await driveDownloadJSON(u.fileId); } catch(e){ console.error(e); continue; }
+    let common = 0, same = 0;
+    (snap && snap.items || []).forEach(it=>{
+      const k = it.article ? normalizeArticleForMatch(it.article) : null; if(!k || !mine.has(k)) return;
+      const v = lastVal(it); if(v==null) return;
+      common++; if(Math.abs(v - mine.get(k)) < 0.005) same++;
+    });
+    if(common >= 20 && same/common >= 0.9) out.push({ seller: sellerNameForSlug(slug), date: u.date, common, pct: Math.round(same/common*100) });
+  }
+  return out;
+}
 async function saveRawUploadSnapshot(parsed){
   const ip = currentCalcIp();
+  let similar = [];
+  try { similar = await findSimilarUploadsOfOthers(parsed, ip); } catch(e){ console.error(e); }
+  const msg = `Сохранить прайс в историю для продавца:\n${ip.name}\nПозиций: ${(parsed.items||[]).length}` +
+    similar.map(x=>`\n\n⚠ Файл почти идентичен последнему прайсу «${x.seller}» от ${fmtDateLabel(x.date)} (совпало ${x.pct}% цен по ${x.common} артикулам). Проверьте, что выбран нужный продавец.`).join('') +
+    '\n\nОК — сохранить, Отмена — не сохранять (расчёт на экране останется).';
+  if(!confirm(msg)){ toast('Прайс не сохранён в историю: загрузка отменена', 'err'); return; }
   const now = new Date();
   // The calendar date must be the person's LOCAL day (todayStr()), matching how orderDate is
   // stored everywhere else. Using now.toISOString()'s UTC date here used to shift it back a day
@@ -5525,6 +5568,14 @@ async function saveRawUploadSnapshot(parsed){
     toast('Не удалось сохранить историю загрузки: ' + e.message, 'err');
   }
 }
+let PRICE_HIST_FILES = [];
+function priceFileSeller(title){
+  let slug = null;
+  const m1 = title.match(/^price_upload_(.+)_\d{4}-\d{2}-\d{2}_\d{6}\.json$/);
+  const m2 = title.match(/^sellprice_(.+)_\d{4}-\d{2}-\d{2}_\d{6}\.json$/);
+  if(m1) slug = m1[1]; else if(m2) slug = m2[1];
+  return slug ? { slug, name: sellerNameForSlug(slug) } : { slug:'', name:'не указан (старый файл)' };
+}
 async function loadPriceHistory(){
   const el = document.getElementById('priceHistoryGrid');
   el.innerHTML = '<div class="loading">Загрузка истории…</div>';
@@ -5532,34 +5583,49 @@ async function loadPriceHistory(){
     const r = await driveSearch(`'${FOLDERS.prices}' in parents and (name contains 'price_upload_' or name contains 'sellprice_')`, 300);
     let files = (r.files||[]).filter(f=>/^(price_upload_|sellprice_).+\.json$/.test(f.title));
     files.sort((a,b)=> new Date(b.createdTime) - new Date(a.createdTime));
-    if(!files.length){
-      destroyGrid(PRICE_GRID); PRICE_GRID = null;
-      el.innerHTML = '<div class="empty">Загрузок ещё не было</div>';
-      return;
+    PRICE_HIST_FILES = files;
+    const sel = document.getElementById('priceHistorySeller');
+    if(sel){
+      const cur = sel.value, seen = new Map();
+      files.forEach(f=>{ const s = priceFileSeller(f.title); if(!seen.has(s.slug)) seen.set(s.slug, s.name); });
+      sel.innerHTML = '<option value="">Все продавцы</option>' + Array.from(seen).sort((a,b)=>a[1].localeCompare(b[1],'ru')).map(([slug,name])=>`<option value="${escapeHtml(slug||'__none')}">${escapeHtml(name)}</option>`).join('');
+      if(cur && Array.from(sel.options).some(o=>o.value===cur)) sel.value = cur;
     }
-    PRICE_GRID = renderGridInto(PRICE_GRID, el, {
-      columns: [
-        { name:'Дата', formatter:(cell)=>fmtDate(cell) },
-        { name:'Тип' },
-        { name:'Действия', width:'260px', sort:false, formatter:(cell)=>{
-            const d = JSON.parse(cell);
-            let btns = `<button class="btn secondary" style="padding:4px 8px;font-size:11px;" onclick="viewPriceSnapshot('${d.id}')">Просмотр</button> <button class="btn secondary" style="padding:4px 8px;font-size:11px;" onclick="exportPriceSnapshot('${d.id}','csv')">CSV</button> <button class="btn secondary" style="padding:4px 8px;font-size:11px;" onclick="exportPriceSnapshot('${d.id}','json')">JSON</button>`;
-            if(d.isUpload) btns += ` <button class="btn secondary" style="padding:4px 8px;font-size:11px;" onclick="loadUploadIntoCalculator('${d.id}')">В наценку</button>`;
-            return gridjs.html(btns);
-          }},
-      ],
-      data: files.map(f=>{
-        const isUpload = f.title.startsWith('price_upload_');
-        return [ f.createdTime, isUpload ? 'Загрузка прайса' : 'Расчёт наценки', JSON.stringify({ id:f.id, isUpload }) ];
-      }),
-      sort:true, pagination:{ limit:10, resetPageOnUpdate:false }, className:{ table:'gridjs-wrapper' },
-    });
+    window.renderPriceHistory();
   } catch(e){
     console.error(e);
     PRICE_GRID = null;
     el.innerHTML = '<div class="empty">Ошибка загрузки истории: ' + escapeHtml(e.message) + '</div>';
   }
 }
+window.renderPriceHistory = function(){
+  const el = document.getElementById('priceHistoryGrid'); if(!el) return;
+  const want = (document.getElementById('priceHistorySeller')||{}).value || '';
+  const files = PRICE_HIST_FILES.filter(f=>{ if(!want) return true; const s = priceFileSeller(f.title).slug; return want==='__none' ? !s : s===want; });
+  if(!files.length){
+    destroyGrid(PRICE_GRID); PRICE_GRID = null;
+    el.innerHTML = '<div class="empty">Загрузок ещё не было</div>';
+    return;
+  }
+  PRICE_GRID = renderGridInto(PRICE_GRID, el, {
+    columns: [
+      { name:'Дата', formatter:(cell)=>fmtDate(cell) },
+      { name:'Продавец' },
+      { name:'Тип' },
+      { name:'Действия', width:'260px', sort:false, formatter:(cell)=>{
+          const d = JSON.parse(cell);
+          let btns = `<button class="btn secondary" style="padding:4px 8px;font-size:11px;" onclick="viewPriceSnapshot('${d.id}')">Просмотр</button> <button class="btn secondary" style="padding:4px 8px;font-size:11px;" onclick="exportPriceSnapshot('${d.id}','csv')">CSV</button> <button class="btn secondary" style="padding:4px 8px;font-size:11px;" onclick="exportPriceSnapshot('${d.id}','json')">JSON</button>`;
+          if(d.isUpload) btns += ` <button class="btn secondary" style="padding:4px 8px;font-size:11px;" onclick="loadUploadIntoCalculator('${d.id}')">В наценку</button>`;
+          return gridjs.html(btns);
+        }},
+    ],
+    data: files.map(f=>{
+      const isUpload = f.title.startsWith('price_upload_');
+      return [ f.createdTime, priceFileSeller(f.title).name, isUpload ? 'Загрузка прайса' : 'Расчёт наценки', JSON.stringify({ id:f.id, isUpload }) ];
+    }),
+    sort:true, pagination:{ limit:10, resetPageOnUpdate:true }, className:{ table:'gridjs-wrapper' },
+  });
+};
 window.viewPriceSnapshot = async function(fileId){
   const modalBg = document.getElementById('modalBg'), modalBody = document.getElementById('modalBody');
   modalBody.innerHTML = '<div class="loading">Загрузка…</div>';
@@ -5574,6 +5640,7 @@ window.viewPriceSnapshot = async function(fileId){
       modalBody.innerHTML = `
         <button class="close" onclick="closeModal()">✕</button>
         <h2>Загрузка прайса — ${fmtDate(snap.uploadedAt)}</h2>
+        <p><strong>${escapeHtml(snap.ip ? snap.ip.name : 'продавец не указан')}</strong></p>
         <p class="muted">Позиций: ${snap.itemsCount}. Колонок с датами закупки: ${(snap.priceCols||[]).length}.</p>
         <table class="preview"><tr><th>Артикул</th><th>Наименование</th><th>Последняя цена</th></tr>${rowsHtml || '<tr><td colspan=3 class="empty">Пусто</td></tr>'}</table>
       `;
@@ -5868,6 +5935,12 @@ async function loadIpList(){
   } catch(e){ console.error(e); CALC_IP_LIST = JSON.parse(JSON.stringify(DEFAULT_IP_LIST)); }
   renderCalcIpSelect();
 }
+function updateCalcIpBanner(){
+  const el = document.getElementById('calc_ipBanner'); if(!el) return;
+  const id = document.getElementById('calc_ip').value;
+  const ip = (CALC_IP_LIST||[]).find(x=>x.id===id);
+  el.innerHTML = ip ? `Прайс и расчёт будут сохранены для продавца: <strong>${escapeHtml(ip.name)}</strong> (ИНН ${escapeHtml(ip.inn)}). Если это не тот продавец — выберите другого в Шаге 1 <em>до</em> загрузки файла.` : 'Выберите продавца в Шаге 1.';
+}
 function renderCalcIpSelect(){
   const sel = document.getElementById('calc_ip');
   const current = sel.value;
@@ -5878,6 +5951,7 @@ function renderCalcIpSelect(){
   // отдельных списков, которые бы неизбежно разошлись.
   renderOrderContragentSelect();
   renderDebtInnSelect();
+  updateCalcIpBanner();
 }
 // "Наименование контрагента" в форме "Новая заявка" -- выпадающий список из CALC_IP_LIST
 // (значение опции = имя, как и раньше хранилось в order.contragent, чтобы addOrder() не менять).
@@ -6238,48 +6312,4 @@ function exportCalcForSite(){
   if(!rows.length){ toast('Нет товаров с рассчитанной ценой продажи для выгрузки', 'err'); return; }
   const ip = currentCalcIp();
   const stamp = new Date().toISOString().slice(0,10);
-  downloadBlob(`price_site_${ip.name.replace(/\s+/g,'_')}_${stamp}.csv`, toCSV(rows, ['articul','inn','price','seller']), 'text/csv;charset=utf-8');
-}
-async function saveCalcSnapshotToDrive(){
-  const ip = currentCalcIp();
-  const costIdx = Number(document.getElementById('calc_costCol').value);
-  const costLabel = CALC_PRICE_COLS[costIdx] ? CALC_PRICE_COLS[costIdx].label : null;
-  const items = CALC_ITEMS.map(item=>{
-    const c = computeCalcRow(item);
-    return { article:item.article, sap:item.sap, name:item.name, cost:c.cost,
-      logistics:{ value:c.logVal, unit:c.logUnit, amount:c.logAmount },
-      placement:{ value:c.plVal, unit:c.plUnit, amount:c.plAmount },
-      markupPct:c.markupPct, sell:c.sell, margin:c.margin, costDate:c.costDate };
-  }).filter(r=>r.cost!=null);
-  if(!items.length){ toast('Нет данных для сохранения', 'err'); return; }
-  const activeLadder = CALC_LADDER_ID ? (STATE.priceLadders||[]).find(l=>l.id===CALC_LADDER_ID) : null;
-  const snapshot = {
-    type:'sell_price_snapshot', ip, costColumnLabel: costLabel,
-    // Если применялась лестница -- фиксируем имя/пороги как они были на момент расчёта (не ссылку
-    // на id лестницы, которую потом можно переименовать/удалить) для истории.
-    ladder: activeLadder ? { name: activeLadder.name, tiers: activeLadder.tiers } : null,
-    logisticsDefault: { value: parseFloat(document.getElementById('calc_logisticsVal').value||0), unit: document.getElementById('calc_logisticsUnit').value },
-    placementDefault: { value: parseFloat(document.getElementById('calc_placementVal').value||0), unit: document.getElementById('calc_placementUnit').value },
-    roundStep: Number(document.getElementById('calc_roundMode').value),
-    savedAt: new Date().toISOString(), items,
-  };
-  const hint = document.getElementById('calc_hint');
-  hint.textContent = 'Сохраняем в Google Диск…';
-  try {
-    const now = new Date();
-    const dateStr = todayStr(), timeStr = now.toISOString().slice(11,19).replace(/:/g,'');
-    await driveCreateJSON(`sellprice_${slugify(ip.name)}_${dateStr}_${timeStr}.json`, FOLDERS.prices, snapshot);
-    hint.textContent = '';
-    toast('Сохранено в историю на Диске', 'ok');
-    await loadPriceHistory();
-  } catch(e){
-    hint.textContent = 'Ошибка: ' + e.message;
-    toast('Ошибка сохранения', 'err');
-  }
-}
-
-/* ================= START ================= */
-window.addEventListener('load', boot);
-</script>
-</body>
-</html>
+  downloadBlob(`price_site_${ip.name.replace(/\s+
