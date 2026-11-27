@@ -584,9 +584,10 @@
     </div>
     <div class="card">
       <h2>Количество активных SKU</h2>
-      <p class="hint">На выбранную дату (по умолчанию сегодня) у каждого продавца берётся его последний прайс с датой не позже этой. Активным считается артикул с непустой ценой (последняя заполненная цена закупки больше нуля). Итог — число УНИКАЛЬНЫХ артикулов: если артикул есть у нескольких продавцов, он считается один раз.</p>
+      <p class="hint">На выбранную дату (по умолчанию сегодня) у каждого продавца берётся его последний прайс с датой не позже этой — и только если он загружен в том же месяце, что и дата отчёта (продавцы со старыми прайсами не учитываются). Активным считается артикул с непустой ценой (последняя заполненная цена закупки больше нуля). Итог — число УНИКАЛЬНЫХ артикулов: если артикул есть у нескольких продавцов, он считается один раз.</p>
       <div class="btn-row" style="align-items:flex-end;"><div class="field" style="max-width:180px;"><label>Дата отчёта</label><input type="date" id="activeSkuDate" onchange="window.renderActiveSkuReport(false)"></div>
-        <button class="btn secondary" type="button" onclick="window.renderActiveSkuReport(true)">Пересчитать</button></div>
+        <button class="btn secondary" type="button" onclick="window.renderActiveSkuReport(true)">Пересчитать</button>
+        <button class="btn" type="button" onclick="window.exportActiveSku()">Выгрузить артикулы (CSV)</button></div>
       <div id="activeSkuResult"></div>
     </div>
     <div class="card">
@@ -663,7 +664,7 @@
 // без логина, сразу после жёсткой перезагрузки), и в шапке после входа. Единственный надёжный
 // способ на глаз убедиться, что открытая страница -- это действительно последняя версия, а не
 // закэшированная браузером/GitHub Pages старая копия, без необходимости лезть в DevTools.
-const APP_VERSION = '2026-08-08.83';
+const APP_VERSION = '2026-08-08.85';
 // orders/prices/config/settings map to real, separate Drive folders now (see ensureDataFolders):
 // Заявки only ever contains order records; Прайсы is untouched; Долг продавца (sellerPayments) got
 // its own new folder instead of living inside the orders file; Настройки (statuses + the
@@ -4987,24 +4988,36 @@ async function computeActiveSku(dateStr){
     const cur = latest.get(u.ipSlug);
     if(!cur || u.date > cur.date || (u.date===cur.date && new Date(u.createdTime) > new Date(cur.createdTime))) latest.set(u.ipSlug, u);
   });
-  const rows = [], owners = new Map(); // артикул -> сколько продавцов его имеют
+  const rows = [], owners = new Map(), skipped = [], items = new Map(); // owners: артикул -> сколько продавцов его имеют
+  const sellerName = new Map();
+  const month = dateStr.slice(0,7);
   for(const [slug, u] of latest){
+    // Только продавцы, чей прайс обновлялся в месяце даты отчёта: старые прайсы в расчёт не попадают.
+    if(u.date.slice(0,7) !== month){ skipped.push({ seller: sellerNameForSlug(slug), date: u.date }); continue; }
     let snap = null;
     try { snap = await driveDownloadJSON(u.fileId); } catch(e){ console.error(e); }
     const uniq = new Set();
+    const sName = sellerNameForSlug(slug);
     (snap && snap.items || []).forEach(it=>{
       if(!it.article || !String(it.article).trim()) return;
       const ps = it.prices||[]; let v = null;
       for(let i=ps.length-1;i>=0;i--){ if(ps[i] && ps[i].value!=null && isFinite(Number(ps[i].value)) && Number(ps[i].value)>0){ v = Number(ps[i].value); break; } }
       if(v==null) return;
-      uniq.add(normalizeArticleForMatch(it.article));
+      const k = normalizeArticleForMatch(it.article);
+      if(uniq.has(k)) return;
+      uniq.add(k);
+      let rec = items.get(k);
+      if(!rec){ rec = { article: String(it.article).trim(), name: it.name||'', sellers: [], min: v, max: v }; items.set(k, rec); }
+      if(!rec.name && it.name) rec.name = it.name;
+      rec.sellers.push(sName); rec.min = Math.min(rec.min, v); rec.max = Math.max(rec.max, v);
     });
     uniq.forEach(k=>owners.set(k, (owners.get(k)||0)+1));
     rows.push({ seller: sellerNameForSlug(slug), date: u.date, total: snap ? (snap.items||[]).length : 0, active: uniq.size, keys: uniq, error: !snap });
   }
   rows.forEach(r=>{ r.only = Array.from(r.keys).filter(k=>owners.get(k)===1).length; delete r.keys; });
   rows.sort((a,b)=>String(a.seller).localeCompare(String(b.seller),'ru'));
-  return { dateStr, rows, unique: owners.size, sum: rows.reduce((t,r)=>t+r.active,0) };
+  skipped.sort((a,b)=>String(a.seller).localeCompare(String(b.seller),'ru'));
+  return { dateStr, rows, skipped, items: Array.from(items.values()), unique: owners.size, sum: rows.reduce((t,r)=>t+r.active,0) };
 }
 window.renderActiveSkuReport = async function(force){
   const el = document.getElementById('activeSkuResult'); if(!el) return;
@@ -5016,10 +5029,29 @@ window.renderActiveSkuReport = async function(force){
   try { ACTIVE_SKU = await computeActiveSku(dateStr); paintActiveSku(ACTIVE_SKU); }
   catch(e){ console.error(e); el.innerHTML = '<div class="empty">Ошибка: ' + escapeHtml(e.message) + '</div>'; }
 };
+// Выгрузка списка активных артикулов (уникальных) на дату отчёта: артикул, название, у скольких продавцов,
+// у каких, мин./макс. цена закупки. Берёт текущий посчитанный отчёт; если даты не совпадают -- пересчитывает.
+window.exportActiveSku = async function(){
+  const inp = document.getElementById('activeSkuDate');
+  const dateStr = (inp && inp.value) || todayStr();
+  try {
+    if(!ACTIVE_SKU || ACTIVE_SKU.dateStr !== dateStr){ toast('Считаю…', 'ok'); ACTIVE_SKU = await computeActiveSku(dateStr); paintActiveSku(ACTIVE_SKU); }
+    const d = ACTIVE_SKU;
+    if(!d.items || !d.items.length){ toast('Нет артикулов для выгрузки', 'err'); return; }
+    const rows = d.items.slice().sort((a,b)=>a.article.localeCompare(b.article,'ru',{numeric:true})).map(r=>({
+      article: r.article, name: r.name, count: r.sellers.length, sellers: r.sellers.join(', '),
+      min: r.min, max: r.max,
+    }));
+    const csv = toCSV(rows, ['article','name','count','sellers','min','max'], ['Артикул','Наименование','Продавцов','Продавцы','Мин. цена закупки, ₽','Макс. цена закупки, ₽']);
+    downloadBlob(`active_sku_${dateStr}.csv`, csv, 'text/csv;charset=utf-8');
+    toast(`Выгружено артикулов: ${rows.length}`, 'ok');
+  } catch(e){ console.error(e); toast('Ошибка выгрузки: ' + e.message, 'err'); }
+};
 function paintActiveSku(d){
   const el = document.getElementById('activeSkuResult'); if(!el) return;
-  if(!d.rows.length){ el.innerHTML = `<div class="empty">На ${fmtDateLabel(d.dateStr)} нет загруженных прайсов с указанным продавцом.</div>`; return; }
-  el.innerHTML = `<p style="font-size:15px;margin:8px 0;">Активных SKU на ${fmtDateLabel(d.dateStr)} = <strong style="font-size:26px;">${d.unique.toLocaleString('ru-RU')}</strong> <span class="hint">(уникальных артикулов; пересекающиеся у разных продавцов считаются один раз. Прайсов: ${d.rows.length}, сумма без учёта пересечений: ${d.sum.toLocaleString('ru-RU')})</span></p>
+  const skippedHtml = (d.skipped||[]).length ? `<p class="hint">Не учтены (прайс не обновлялся в месяце отчёта): ${d.skipped.map(x=>escapeHtml(x.seller)+' — последний от '+fmtDateLabel(x.date)).join('; ')}.</p>` : '';
+  if(!d.rows.length){ el.innerHTML = `<div class="empty">На ${fmtDateLabel(d.dateStr)} нет продавцов с прайсом, загруженным в этом месяце.</div>` + skippedHtml; return; }
+  el.innerHTML = `<p style="font-size:15px;margin:8px 0;">Активных SKU на ${fmtDateLabel(d.dateStr)} = <strong style="font-size:26px;">${d.unique.toLocaleString('ru-RU')}</strong> <span class="hint">(уникальных артикулов; пересекающиеся у разных продавцов считаются один раз. Прайсов: ${d.rows.length}, сумма без учёта пересечений: ${d.sum.toLocaleString('ru-RU')})</span></p>${skippedHtml}
     <table class="preview"><tr><th>Продавец</th><th>Прайс, действовавший на дату</th><th>Позиций в файле</th><th>Активных SKU у продавца</th><th>Из них только у него</th></tr>
     ${d.rows.map(r=>`<tr><td>${escapeHtml(r.seller)}</td><td>${fmtDateLabel(r.date)}</td><td>${r.error?'<span class="hint">не загрузился</span>':r.total}</td><td>${r.active}</td><td>${r.only}</td></tr>`).join('')}</table>`;
 }
